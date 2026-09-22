@@ -286,6 +286,10 @@ pub struct DecodedAuditV1 {
 }
 
 impl DecodedAuditV1 {
+    pub(crate) fn into_parts(self) -> (AuditEventV1, Timepoint) {
+        (self.event, self.recorded_at)
+    }
+
     pub(crate) const fn new(event: AuditEventV1, recorded_at: Timepoint) -> Self {
         Self { event, recorded_at }
     }

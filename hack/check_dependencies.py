@@ -8,13 +8,17 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 RSS_URL = "https://dev.azure.com/shengming0923/rss/_git/rss"
-RSS_REVISION = "c3fbd187b8d97ff25cc5968243062d1521714fb7"
+RSS_REVISION = "c752578e1b5e30724b8e81726a62553211b66dd5"
 RSS_ROOTS = {
     "rss-contract",
     "rss-diag-context",
     "rss-ledger",
     "rss-redact",
     "rss-request-context",
+    "rss-ledger-postgres",
+    "rss-transactional-messaging",
+    "rss-transactional-messaging-postgres",
+    "testkit",
 }
 
 
@@ -79,9 +83,13 @@ def main() -> None:
         for node in metadata["resolve"]["nodes"]
         if packages[node["id"]]["name"] in RSS_ROOTS
     }
-    expected_features = {name: set() for name in RSS_ROOTS}
-    expected_features["rss-contract"] = {"default"}
-    expected_features["rss-request-context"] = {"default"}
+    # Workspace T2 enables provider/test features. Isolated consumers separately assert
+    # that none of this closure leaks into core-only consumption.
+    expected_features = {name: {"default"} for name in RSS_ROOTS}
+    expected_features["rss-ledger-postgres"] = {"messaging"}
+    expected_features["rss-transactional-messaging"] = {"default", "producer", "consumer"}
+    expected_features["rss-transactional-messaging-postgres"] = {"default", "integration", "test-support"}
+    expected_features["testkit"] = {"containers"}
     require(
         feature_sets == expected_features,
         f"RSS feature closure drift: {feature_sets}",
