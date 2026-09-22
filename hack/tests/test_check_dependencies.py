@@ -32,6 +32,28 @@ class RssGitSourceTests(unittest.TestCase):
                 [{"name": "future-rss-package", "source": source}]
             )
 
+    def test_rejects_internal_package_from_registry(self) -> None:
+        with self.assertRaisesRegex(ValueError, "wrong RSS source"):
+            CHECKER.validate_rss_git_sources(
+                [
+                    {
+                        "name": "rss-future",
+                        "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    }
+                ]
+            )
+
+    def test_rejects_internal_package_from_alternate_git(self) -> None:
+        with self.assertRaisesRegex(ValueError, "wrong RSS source"):
+            CHECKER.validate_rss_git_sources(
+                [
+                    {
+                        "name": "rss-future",
+                        "source": "git+https://example.invalid/rss?rev=deadbeef#deadbeef",
+                    }
+                ]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

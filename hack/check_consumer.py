@@ -52,6 +52,7 @@ publish = false
 [dependencies]
 rss-audit-core = {{ {dependency} }}
 rss-contract = {{ git = "{RSS_URL}", rev = "{RSS_REVISION}", default-features = false }}
+rss-ledger = {{ git = "{RSS_URL}", rev = "{RSS_REVISION}", default-features = false }}
 rss-request-context = {{ git = "{RSS_URL}", rev = "{RSS_REVISION}", default-features = false }}
 '''
 
@@ -88,6 +89,17 @@ def check_metadata(metadata: dict, revision: str | None) -> None:
     require(not names.intersection(FORBIDDEN), f"forbidden consumer closure: {names & FORBIDDEN}")
 
 
+def execution_environment(fetch_environment: dict[str, str]) -> dict[str, str]:
+    """Remove repository credentials and force all build/run subprocesses offline."""
+    environment = {
+        key: value
+        for key, value in fetch_environment.items()
+        if key != "SYSTEM_ACCESSTOKEN" and not key.startswith("GIT_CONFIG_")
+    }
+    environment["CARGO_NET_OFFLINE"] = "true"
+    return environment
+
+
 def run(output: Path, revision: str | None) -> None:
     ensure_external(output)
     output.mkdir(mode=0o700)
@@ -102,20 +114,22 @@ def run(output: Path, revision: str | None) -> None:
     (output / ".cargo/config.toml").write_text("[net]\ngit-fetch-with-cli = true\n")
     shutil.copyfile(ROOT / "tests/consumers/core.rs", output / "src/main.rs")
 
-    env = dict(os.environ)
-    env["CARGO_TARGET_DIR"] = str(output / "target")
+    fetch_env = dict(os.environ)
+    fetch_env["CARGO_TARGET_DIR"] = str(output / "target")
     for key in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER"):
-        env.pop(key, None)
-    subprocess.run(["cargo", "generate-lockfile"], cwd=output, env=env, check=True)
+        fetch_env.pop(key, None)
+    subprocess.run(["cargo", "generate-lockfile"], cwd=output, env=fetch_env, check=True)
+    subprocess.run(["cargo", "fetch", "--locked"], cwd=output, env=fetch_env, check=True)
+    run_env = execution_environment(fetch_env)
     metadata = json.loads(
         subprocess.check_output(
             ["cargo", "metadata", "--locked", "--format-version", "1"],
             cwd=output,
-            env=env,
+            env=run_env,
         )
     )
     check_metadata(metadata, revision)
-    subprocess.run(["cargo", "run", "--locked"], cwd=output, env=env, check=True)
+    subprocess.run(["cargo", "run", "--locked"], cwd=output, env=run_env, check=True)
 
 
 def main() -> None:

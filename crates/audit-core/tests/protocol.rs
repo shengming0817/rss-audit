@@ -2,9 +2,9 @@
 
 use rss_audit_core::{
     Action, ActorId, ActorKind, ActorRef, AuditEventV1, AuditPayload, Coordinates, Error,
-    EventContext, EventFacts, EventId, Field, MAX_PAYLOAD_BYTES, OperationId, Outcome,
-    RecordIdentity, RecordVersion, ResourceId, ResourceKind, ResourceRef, SourceContract, SourceId,
-    SourceIdentity, decode_untrusted, prepare,
+    EventContext, EventFacts, EventId, Field, MAX_PAYLOAD_BYTES, MAX_RECORD_BYTES, OperationId,
+    Outcome, RecordIdentity, RecordVersion, ResourceId, ResourceKind, ResourceRef, SourceContract,
+    SourceId, SourceIdentity, decode_untrusted, prepare,
 };
 use rss_contract::{ContractId, ContractVersion, SchemaDigest, Timepoint};
 use rss_diag_context::CorrelationId;
@@ -255,6 +255,15 @@ fn payload_boundaries_are_exact_and_fail_closed() {
     assert!(matches!(
         AuditPayload::new(vec![0; MAX_PAYLOAD_BYTES + 1]),
         Err(Error::PayloadTooLarge)
+    ));
+}
+
+#[test]
+fn decoder_rejects_complete_records_over_the_v1_budget_first() {
+    let oversized = vec![0; MAX_RECORD_BYTES + 1];
+    assert!(matches!(
+        decode_untrusted(&oversized),
+        Err(Error::RecordTooLarge)
     ));
 }
 

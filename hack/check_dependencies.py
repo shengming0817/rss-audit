@@ -24,12 +24,15 @@ def require(condition: bool, message: str) -> None:
 
 
 def validate_rss_git_sources(packages: list[dict]) -> None:
-    """Reject every RSS Git package that is not resolved at the one accepted revision."""
+    """Require every non-workspace RSS package to use the one accepted Git source."""
     expected_source = f"git+{RSS_URL}?rev={RSS_REVISION}#{RSS_REVISION}"
     rss_git_prefix = f"git+{RSS_URL}"
     for package in packages:
         source = package["source"]
-        if source is not None and source.startswith(rss_git_prefix):
+        protected = package["name"].startswith("rss-") or (
+            source is not None and source.startswith(rss_git_prefix)
+        )
+        if protected and source is not None:
             require(source == expected_source, f"wrong RSS source for {package['name']}")
 
 

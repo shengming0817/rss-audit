@@ -1,9 +1,10 @@
 use rss_audit_core::{
     Action, ActorId, ActorKind, ActorRef, AuditEventV1, AuditPayload, Coordinates, EventContext,
     EventFacts, EventId, Outcome, RecordIdentity, ResourceId, ResourceKind, ResourceRef,
-    SourceContract, SourceId, SourceIdentity, decode_untrusted, prepare,
+    SourceContract, SourceId, SourceIdentity, decode_untrusted, prepare, verify_window,
 };
 use rss_contract::{ContractId, ContractVersion, SchemaDigest, Timepoint};
+use rss_ledger::{Authenticator, KeyId};
 use rss_request_context::TenantId;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -46,5 +47,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert_eq!(decoded.recorded_at().unix_seconds(), 2);
     assert_eq!(decoded.event().context().payload().as_bytes(), b"bounded");
+    let authenticator = Authenticator::new(KeyId::parse("consumer-key-v1")?, vec![0x5a; 32])?;
+    let entry = authenticator.append(prepared.append_request(), None)?;
+    assert!(prepared.matches_entry(&entry));
+    let verified = verify_window(&authenticator, tenant, None, std::slice::from_ref(&entry))?;
+    assert_eq!(verified.ledger_verification().count(), 1);
+    assert_eq!(verified.records()[0].record().event().identity().tenant(), tenant);
     Ok(())
 }
