@@ -88,9 +88,23 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
         )
         .await?;
         for entry in window.entries() {
-            let matches:bool=sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM rss_audit.records WHERE tenant_id=$1::uuid AND ledger_sequence=$2 AND canonical=$3)")
-                .bind(self.tenant.to_string()).bind(i64::try_from(entry.sequence().get()).map_err(|_|Error::StorageContract)?)
-                .bind(entry.payload()).fetch_one(&mut **self.tx).await?;
+            let decoded = rss_audit_core::decode_untrusted(entry.payload())?;
+            let identity = decoded.event().identity();
+            // Compare metadata in PostgreSQL without fetching a second payload: the
+            // ledger window has already charged these bytes against its read budget.
+            let matches: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM rss_audit.records WHERE tenant_id=$1::uuid \
+                 AND ledger_sequence=$2 AND canonical=$3 AND source_id=$4 \
+                 AND event_id=$5 AND recorded_at=$6)",
+            )
+            .bind(self.tenant.to_string())
+            .bind(i64::try_from(entry.sequence().get()).map_err(|_| Error::StorageContract)?)
+            .bind(entry.payload())
+            .bind(identity.source().source_id().as_str())
+            .bind(identity.event_id().as_str())
+            .bind(decoded.recorded_at().unix_seconds())
+            .fetch_one(&mut **self.tx)
+            .await?;
             if !matches {
                 return Err(Error::StorageContract);
             }

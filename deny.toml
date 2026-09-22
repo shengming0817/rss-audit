@@ -16,6 +16,9 @@ allow = [
   "ISC",
   "Unicode-3.0",
   "Zlib",
+  # webpki-roots bundles the Mozilla root CA data for sqlx rustls TLS.
+  # Its permissive data license matches the upstream RSS allowlist.
+  "CDLA-Permissive-2.0",
 ]
 private = { ignore = true }
 

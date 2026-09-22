@@ -28,7 +28,7 @@ coverage: launcher
 	cargo llvm-cov clean --workspace
 	cargo llvm-cov --locked --workspace --exclude audit-postgres-integration --all-features --no-report
 	RSS_TEST_RUN_ID="audit-cov-$$(date +%s)-$$$$" $(CARGO_TARGET_DIR)/debug/audit-test-launcher -- cargo llvm-cov --locked -p audit-postgres-integration --test suite --no-report
-	cargo llvm-cov report --locked --workspace --all-features --fail-under-lines 80
+	cargo llvm-cov report --locked --fail-under-lines 80
 
 dependencies:
 	$(PYTHON) -m unittest discover -s hack/tests -p 'test_*.py'

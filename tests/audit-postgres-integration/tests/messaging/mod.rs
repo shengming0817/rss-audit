@@ -87,7 +87,8 @@ fn message(id: &str, payload: Vec<u8>) -> anyhow::Result<MessageEnvelope<Vec<u8>
 }
 
 pub(super) async fn run(
-    store: &PgAudit,
+    plain: &PgAudit,
+    ledger: &PgAudit,
     admin: &PgPool,
     fixture: &testkit::PgTlsFixture,
     control: &Control<'_, TestClock>,
@@ -116,22 +117,25 @@ pub(super) async fn run(
         runtime.clone(),
         LeaseRenewalPolicy::from_ttl(Duration::from_secs(30))?,
     )?;
-    for (id, reject, unknown) in [
-        ("message-commit", false, false),
-        ("message-rollback", true, false),
-        ("message-unknown", false, true),
-    ] {
-        scenario(
-            store,
-            admin,
-            control,
-            &runtime,
-            &inbox,
-            (id, reject, unknown),
-        )
-        .await?;
+    for (mode, store) in [("plain", plain), ("ledger", ledger)] {
+        for (case, reject, unknown) in [
+            ("commit", false, false),
+            ("rollback", true, false),
+            ("unknown", false, true),
+        ] {
+            let id = format!("message-{mode}-{case}");
+            scenario(
+                store,
+                admin,
+                control,
+                &runtime,
+                &inbox,
+                (&id, reject, unknown),
+            )
+            .await?;
+        }
     }
-    fenced(store, admin, &runtime, control).await?;
+    fenced(ledger, admin, &runtime, control).await?;
     runtime.close().await;
     Ok(())
 }

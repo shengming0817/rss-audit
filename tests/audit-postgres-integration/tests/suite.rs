@@ -144,7 +144,7 @@ async fn run() -> anyhow::Result<()> {
     basic(&plain, &ledger, &control).await?;
     atomicity::run(&plain, &ledger, &admin, &control).await?;
     reads::run(&plain, &ledger, &admin, &control).await?;
-    messaging::run(&ledger, &admin, &fixture, &control).await?;
+    messaging::run(&plain, &ledger, &admin, &fixture, &control).await?;
     admission::run(&plain, &pool, &admin, &control).await?;
     pool.close().await;
     admin.close().await;

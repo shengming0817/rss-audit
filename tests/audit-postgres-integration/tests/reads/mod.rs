@@ -106,6 +106,7 @@ async fn corruption(
     control: &Control<'_, TestClock>,
     one: &PreparedAuditV1,
 ) -> anyhow::Result<()> {
+    ledger_metadata(ledger, admin, control).await?;
     let other = one.append_request().ledger().tenant();
     sqlx::query("UPDATE rss_audit.records SET recorded_at=0 WHERE tenant_id=$1::uuid")
         .bind(other.to_string())
@@ -159,5 +160,49 @@ async fn corruption(
             .await,
         |e| matches!(e, Error::StorageContract),
     );
+    Ok(())
+}
+
+async fn ledger_metadata(
+    ledger: &PgAudit,
+    admin: &PgPool,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let original: Vec<u8> = sqlx::query_scalar(
+        "SELECT canonical FROM rss_audit.records WHERE tenant_id=$1::uuid AND ledger_sequence=0",
+    )
+    .bind(tenant()?.to_string())
+    .fetch_one(admin)
+    .await?;
+    let decoded = decode_untrusted(&original)?;
+    let identity = decoded.event().identity();
+    for update in [
+        "UPDATE rss_audit.records SET source_id='corrupted' WHERE tenant_id=$1::uuid AND ledger_sequence=0",
+        "UPDATE rss_audit.records SET event_id='corrupted' WHERE tenant_id=$1::uuid AND ledger_sequence=0",
+        "UPDATE rss_audit.records SET recorded_at=0 WHERE tenant_id=$1::uuid AND ledger_sequence=0",
+    ] {
+        sqlx::query(update)
+            .bind(tenant()?.to_string())
+            .execute(admin)
+            .await?;
+        rolled_back(
+            ledger
+                .read_verified(
+                    tenant()?,
+                    Sequence::new(0),
+                    rss_ledger_postgres::ReadLimit::new(1, 10000)?,
+                    control,
+                )
+                .await,
+            |e| matches!(e, Error::StorageContract),
+        );
+        sqlx::query("UPDATE rss_audit.records SET source_id=$2,event_id=$3,recorded_at=$4 WHERE tenant_id=$1::uuid AND ledger_sequence=0")
+            .bind(tenant()?.to_string())
+            .bind(identity.source().source_id().as_str())
+            .bind(identity.event_id().as_str())
+            .bind(decoded.recorded_at().unix_seconds())
+            .execute(admin)
+            .await?;
+    }
     Ok(())
 }
