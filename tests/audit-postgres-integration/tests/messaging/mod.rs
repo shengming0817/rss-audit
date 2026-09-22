@@ -49,7 +49,9 @@ impl PgConsumerEffect<Vec<u8>> for Effect {
         .await
         .map_err(PgConsumerEffectFailure::infrastructure)?;
         if self.reject {
-            Err(PgConsumerEffectFailure::infrastructure(Error::Rejected))
+            Err(PgConsumerEffectFailure::infrastructure(
+                std::io::Error::other("fixture business rejection"),
+            ))
         } else {
             Ok(TerminalDisposition::Succeeded)
         }

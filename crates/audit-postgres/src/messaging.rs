@@ -60,7 +60,6 @@ impl From<Error> for PgError {
             | Error::InvalidBound
             | Error::ReadBudgetExceeded
             | Error::IntegrityRequired
-            | Error::Rejected
             | Error::Protocol(_) => MessagingErrorKind::Permanent,
         };
         Self::Operation {

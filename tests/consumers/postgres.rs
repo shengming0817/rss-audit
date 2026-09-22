@@ -1,6 +1,8 @@
 //! Standalone public consumer, copied only into an isolated candidate workspace.
 use rss_audit_core::*;
-use rss_audit_postgres::{Committed, Control, Cursor, Error, Integrity, PgAudit, ReadLimit};
+use rss_audit_postgres::{
+    Committed, Control, Cursor, Error, Integrity, PgAudit, ReadLimit, TransactionError,
+};
 use rss_contract::{ContractId, ContractVersion, SchemaDigest, Timepoint};
 use rss_request_context::{Clock, Deadline, ExecutionTimer, TenantId};
 use rss_transactional_messaging::transaction::LocalTxAttempt;
@@ -116,6 +118,7 @@ async fn run() -> anyhow::Result<()> {
     let store = PgAudit::new(pool.clone(), mode, &control).await?;
     let tenant = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d479")?;
     let request = store.prepare(event(tenant)?, &control).await?;
+    typed_business_error(&store, tenant, &control).await;
     assert!(committed(store.append(&request, &control).await)?.inserted());
     assert!(
         !committed(
@@ -164,6 +167,18 @@ async fn run() -> anyhow::Result<()> {
     drop(fixture);
     drop(network);
     Ok(())
+}
+
+async fn typed_business_error(store: &PgAudit, tenant: TenantId, control: &Control<'_, HostClock>) {
+    struct HostFailure(u32);
+    let attempt = store.local_tx(tenant, control, |tx| Box::pin(async move {
+        tx.with_connection(|_| Box::pin(async { Err::<(), _>(HostFailure(7)) })).await
+    })).await;
+    assert!(attempt.fold(
+        |_| false, |_| false,
+        |e| matches!(e, TransactionError::Operation(HostFailure(7))),
+        |_| false, |_| false, |_| false,
+    ));
 }
 async fn install(admin: &PgPool) -> anyhow::Result<()> {
     sqlx::raw_sql("CREATE ROLE audit_owner NOLOGIN NOSUPERUSER NOBYPASSRLS; CREATE ROLE audit_consumer LOGIN PASSWORD 'test-only' NOSUPERUSER NOBYPASSRLS; GRANT CREATE ON DATABASE rss_test TO audit_owner;").execute(admin).await?;

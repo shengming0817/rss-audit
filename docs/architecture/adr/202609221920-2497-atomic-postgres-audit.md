@@ -12,6 +12,12 @@
 原 `PgTransaction`，继承 tenant、剩余预算、Inbox 结算和 fencing，Audit 不改 GUC、不再开事务。
 两种路径共用 Audit 记录仓储和 schema 检查，不建立通用 transaction/provider 平台或错误旁路。
 
+独立业务回调保留宿主错误类型 `E`，返回 `LocalTxAttempt<Committed<R>, TransactionError<E>>`。
+Operation(E)、Audit(Error) 与未确认 rollback 的 operation/settlement 双重原因显式分开；
+with_connection 不抹去宿主错误。删除无载荷 Rejected，不保留旧签名、别名或兼容路径。
+错误格式化和 source 遍历不暴露 E；宿主通过类型匹配恢复原因与分类。操作错误后的取消不得覆盖
+该原因，未启动或未 ACK 的 rollback 均不假称已回滚，也不重置绝对预算。消息路径仍归原 owner。
+
 录制前用 PostgreSQL 时间生成 `PreparedAuditV1`。调用方保存其精确字节，commit unknown 时原样
 恢复并重试，不能重建 recorded_at。`Committed` 只能在 COMMIT ACK 后构造；staged 值没有 ACK 权限。
 未确认连接退役。借用 SQL 是可信基础设施接口，不是沙箱；生命周期 SQL、tenant 修改及吞错均禁止。
@@ -33,7 +39,10 @@ memory provider、HTTP 或来源产品改造。MDM #2498、Identity #2499、HTTP
 ## 验证边界
 
 本仓 T2 使用真实 TLS PostgreSQL，覆盖独立与消息事务、RLS/权限漂移、同 ID 并发、原字节恢复、
-真实提交后的 ACK 丢失、后端终止、损坏和有界读取。source 与固定 Git consumer 在仓库祖先之外
+COMMIT 发送前暂停、真实 COMMIT 执行中断及 ACK 后丢失、后端终止、损坏和有界读取。
+真实在途证据由延迟约束触发器阻塞 COMMIT，并核对 pg_stat_activity 与阻塞 PID 后才中断；
+中断后的数据库结果可以是提交或回滚，恢复必须原字节重试并保持业务/Audit 原子性。
+source 与固定 Git consumer 在仓库祖先之外
 创建 workspace/lock/target，分别执行 core、plain PG、ledger、messaging、ledger+messaging。
 固定候选依赖验证不是 registry 发布证明；本仓验证不是产品 T3。
 

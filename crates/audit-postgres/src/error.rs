@@ -42,9 +42,6 @@ pub enum Error {
     /// A ledger-only operation was requested from an explicitly plain owner.
     #[error("audit ledger integrity is not enabled")]
     IntegrityRequired,
-    /// Host business operation requests rollback.
-    #[error("audit operation rejected")]
-    Rejected,
     /// Absolute deadline expired at the named stage.
     #[error("audit deadline elapsed")]
     Deadline(LocalTxDeadlineStage),
@@ -65,7 +62,7 @@ pub enum Error {
     /// Provider error text is not exposed by formatting or source traversal.
     #[error("audit storage unavailable")]
     Storage(#[source] RedactedSource),
-    /// A rollback was attempted but not acknowledged; retain both failures.
+    /// Rollback was not acknowledged; retain the operation and settlement failures.
     #[error("audit rollback unconfirmed")]
     Rollback {
         /// Original operation failure.
@@ -73,6 +70,74 @@ pub enum Error {
         /// Rollback settlement failure.
         settlement: Box<Error>,
     },
+}
+
+/// Failure of an Audit-owned transaction with the host's original operation error.
+/// Settlement authority remains in `LocalTxAttempt`, never in this error value.
+/// Formatting and source traversal do not expose the host error; match `Operation`
+/// explicitly to recover its typed reason and host-owned retry classification.
+pub enum TransactionError<E> {
+    /// Audit admission, control or provider failure.
+    Audit(Error),
+    /// The callback's original error, without formatting or type erasure.
+    Operation(E),
+    /// Rollback was not acknowledged; preserve both the original cause and cleanup error.
+    Rollback {
+        /// Original callback or Audit failure.
+        operation: Box<Self>,
+        /// Rollback admission or execution failure.
+        settlement: Error,
+    },
+}
+
+impl<E> std::fmt::Display for TransactionError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Audit(_) => "audit transaction failed",
+            Self::Operation(_) => "host operation failed",
+            Self::Rollback { .. } => "audit rollback unconfirmed",
+        })
+    }
+}
+impl<E> std::fmt::Debug for TransactionError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Audit(error) => f.debug_tuple("Audit").field(error).finish(),
+            Self::Operation(_) => f.write_str("Operation([redacted])"),
+            Self::Rollback {
+                operation,
+                settlement,
+            } => f
+                .debug_struct("Rollback")
+                .field("operation", operation)
+                .field("settlement", settlement)
+                .finish(),
+        }
+    }
+}
+impl<E> std::error::Error for TransactionError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Audit(error) => Some(error),
+            Self::Operation(_) => None,
+            Self::Rollback { settlement, .. } => Some(settlement),
+        }
+    }
+}
+impl TransactionError<Error> {
+    // Standalone append/read callbacks contain only Audit errors, never host errors.
+    pub(crate) fn into_audit(self) -> Error {
+        match self {
+            Self::Audit(error) | Self::Operation(error) => error,
+            Self::Rollback {
+                operation,
+                settlement,
+            } => Error::Rollback {
+                operation: Box::new(operation.into_audit()),
+                settlement: Box::new(settlement),
+            },
+        }
+    }
 }
 
 impl From<sqlx::Error> for Error {

@@ -1,5 +1,6 @@
 use crate::{
-    AuditTransaction, Control, Cursor, Error, Page, ReadLimit, StagedAppend, probe, repository,
+    AuditTransaction, Control, Cursor, Error, Page, ReadLimit, StagedAppend, TransactionError,
+    probe, repository,
 };
 use futures::future::BoxFuture;
 use rss_audit_core::{AuditEventV1, PreparedAuditV1};
@@ -106,12 +107,14 @@ impl PgAudit {
         control: &Control<'_, T>,
     ) -> LocalTxAttempt<Committed<StagedAppend>, Error> {
         let request = request.clone();
-        self.local_tx(
-            request.append_request().ledger().tenant(),
-            control,
-            move |tx| Box::pin(async move { tx.append(&request).await }),
+        audit_only(
+            self.local_tx(
+                request.append_request().ledger().tenant(),
+                control,
+                move |tx| Box::pin(async move { tx.append(&request).await }),
+            )
+            .await,
         )
-        .await
     }
     /// Read a bounded ordinary page, explicitly without a ledger authentication claim.
     pub async fn read_page<T: ExecutionTimer>(
@@ -120,10 +123,12 @@ impl PgAudit {
         limit: ReadLimit,
         control: &Control<'_, T>,
     ) -> LocalTxAttempt<Committed<Page>, Error> {
-        self.local_tx(cursor.tenant(), control, move |tx| {
-            Box::pin(async move { repository::page(tx.tx, cursor, limit).await })
-        })
-        .await
+        audit_only(
+            self.local_tx(cursor.tenant(), control, move |tx| {
+                Box::pin(async move { repository::page(tx.tx, cursor, limit).await })
+            })
+            .await,
+        )
     }
     /// Authenticate a ledger window with its distinct sequence coordinate and encoded-byte budget.
     /// Same-database predecessors are not external checkpoints or proof against tail truncation.
@@ -135,31 +140,33 @@ impl PgAudit {
         limit: rss_ledger_postgres::ReadLimit,
         control: &Control<'_, T>,
     ) -> LocalTxAttempt<Committed<rss_audit_core::VerifiedAuditWindow>, Error> {
-        self.local_tx(tenant, control, move |tx| {
-            Box::pin(async move { tx.verified(start, limit).await })
-        })
-        .await
+        audit_only(
+            self.local_tx(tenant, control, move |tx| {
+                Box::pin(async move { tx.verified(start, limit).await })
+            })
+            .await,
+        )
     }
     /// Execute Audit and trusted business SQL in one tenant-bound transaction.
     /// Every stage inherits the same absolute deadline; unconfirmed leases are retired.
+    /// The callback's original error is retained in `TransactionError::Operation`.
+    /// An unacknowledged rollback additionally retains its separate settlement failure.
     ///
     /// ```compile_fail
     /// use rss_audit_postgres::{AuditTransaction, Error};
     /// use rss_request_context::ExecutionTimer;
     /// async fn escape<T: ExecutionTimer>(tx: &mut AuditTransaction<'_, '_, '_, T>) {
-    ///     let connection = tx.with_connection(|c| Box::pin(async move { Ok(c) })).await;
+    ///     let connection = tx.with_connection(|c| Box::pin(async move { Ok::<_, Error>(c) })).await;
     /// }
     /// ```
-    pub async fn local_tx<T: ExecutionTimer, R: Send, F>(
+    pub async fn local_tx<T: ExecutionTimer, R: Send, E: Send, F>(
         &self,
         tenant: TenantId,
         control: &Control<'_, T>,
         operation: F,
-    ) -> LocalTxAttempt<Committed<R>, Error>
+    ) -> LocalTxAttempt<Committed<R>, TransactionError<E>>
     where
-        F: for<'a> FnOnce(
-                &'a mut AuditTransaction<'_, '_, '_, T>,
-            ) -> BoxFuture<'a, Result<R, Error>>
+        F: for<'a> FnOnce(&'a mut AuditTransaction<'_, '_, '_, T>) -> BoxFuture<'a, Result<R, E>>
             + Send,
     {
         let connection = match control
@@ -167,7 +174,7 @@ impl PgAudit {
             .await
         {
             Ok(c) => c,
-            Err(e) => return LocalTxAttempt::not_started(e),
+            Err(e) => return LocalTxAttempt::not_started(TransactionError::Audit(e)),
         };
         let mut lease = Lease::new(connection);
         let mut tx = match control
@@ -175,7 +182,7 @@ impl PgAudit {
             .await
         {
             Ok(tx) => tx,
-            Err(e) => return LocalTxAttempt::not_started(e),
+            Err(e) => return LocalTxAttempt::not_started(TransactionError::Audit(e)),
         };
         let body=control.run(Stage::Setup,async {
             let millis=control.remaining().as_millis().clamp(1,i32::MAX as u128).to_string();
@@ -184,32 +191,29 @@ impl PgAudit {
             probe::validate(&mut tx).await
         }).await;
         let body = match body {
-            Ok(()) => {
-                control
-                    .run(Stage::Operation, async {
-                        operation(&mut AuditTransaction {
-                            tx: &mut tx,
-                            control,
-                            integrity: &self.integrity,
-                            tenant,
-                        })
-                        .await
+            Ok(()) => control
+                .run(Stage::Operation, async {
+                    Ok(operation(&mut AuditTransaction {
+                        tx: &mut tx,
+                        control,
+                        integrity: &self.integrity,
+                        tenant,
                     })
-                    .await
-            }
-            Err(e) => Err(e),
+                    .await)
+                })
+                .await
+                .map_err(TransactionError::Audit)
+                .and_then(|result| result.map_err(TransactionError::Operation)),
+            Err(e) => Err(TransactionError::Audit(e)),
         };
         #[cfg(feature = "integration")]
         let fault = self.fault.swap(0, std::sync::atomic::Ordering::SeqCst);
-        if let Err(e) = control.check(Stage::Operation) {
-            return LocalTxAttempt::commit_unknown(e);
-        }
         match body {
             Ok(value) => {
                 let settled = control
                     .run(Stage::Commit, async {
                         #[cfg(feature = "integration")]
-                        if fault == PgFault::CommitPending as u8 {
+                        if fault == PgFault::BeforeCommitPending as u8 {
                             std::future::pending::<()>().await;
                         }
                         tx.commit().await?;
@@ -225,7 +229,7 @@ impl PgAudit {
                         lease.confirmed = true;
                         LocalTxAttempt::committed(Committed(value))
                     }
-                    Err(e) => LocalTxAttempt::commit_unknown(e),
+                    Err(e) => LocalTxAttempt::commit_unknown(TransactionError::Audit(e)),
                 }
             }
             Err(operation) => {
@@ -247,9 +251,9 @@ impl PgAudit {
                         LocalTxAttempt::rolled_back(operation)
                     }
                     Err(settlement) => {
-                        let error = Error::Rollback {
+                        let error = TransactionError::Rollback {
                             operation: Box::new(operation),
-                            settlement: Box::new(settlement),
+                            settlement,
                         };
                         if started {
                             LocalTxAttempt::rollback_failed(error)
@@ -287,15 +291,28 @@ impl Drop for Lease {
         }
     }
 }
-/// Test-only faults after real protocol acknowledgements or during pending COMMIT.
+/// Test-only faults after real protocol acknowledgements or before sending COMMIT.
 #[cfg(feature = "integration")]
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum PgFault {
     /// Durable commit succeeded, but suppress its acknowledgement.
     CommitUnknownAfterAck = 1,
-    /// Leave COMMIT pending until interrupted by the host control.
-    CommitPending = 2,
+    /// Pause before sending COMMIT until interrupted by the host control.
+    BeforeCommitPending = 2,
     /// Rollback succeeded, but suppress its acknowledgement.
     RollbackFailedAfterAck = 3,
+}
+
+fn audit_only<R>(
+    attempt: LocalTxAttempt<Committed<R>, TransactionError<Error>>,
+) -> LocalTxAttempt<Committed<R>, Error> {
+    attempt.fold(
+        LocalTxAttempt::committed,
+        |e| LocalTxAttempt::not_started(e.into_audit()),
+        |e| LocalTxAttempt::rolled_back(e.into_audit()),
+        |e| LocalTxAttempt::rollback_failed(e.into_audit()),
+        |e| LocalTxAttempt::commit_unknown(e.into_audit()),
+        |e| LocalTxAttempt::fenced(e.into_audit()),
+    )
 }

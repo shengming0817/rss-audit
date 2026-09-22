@@ -20,10 +20,20 @@ an absent read, `CommitUnknown` and `RollbackFailed` are not rollback evidence. 
 unchanged prepared request to serialize recovery. Database errors remain redacted.
 
 `local_tx(tenant, control, callback)` combines Audit with trusted business SQL via
-`AuditTransaction::with_connection`. Errors must propagate. This is not a SQL sandbox:
+`AuditTransaction::with_connection`. A callback returning `Result<R, E>` produces
+`LocalTxAttempt<Committed<R>, TransactionError<E>>`: `Operation(E)` retains the original
+host reason/classification, `Audit(Error)` identifies adapter/control failures, and
+`Rollback { operation, settlement }` retains both causes when rollback is unconfirmed.
+`E` needs no formatting or error trait; diagnostics never render or traverse it. Match it
+explicitly to recover its typed value. `with_connection` likewise preserves its callback's
+error type. There is no untyped business-rejection sentinel or error side channel.
+Errors must propagate. This is not a SQL sandbox:
 do not issue transaction control, change role/tenant/session state, or swallow append errors.
 Lock order is Audit tenant head → ledger → business/outbox. One absolute budget covers
 acquisition, setup, operation and settlement. Unconfirmed connections are closed, never reused.
+Cancellation after the callback returns an error cannot overwrite that error. If cancellation
+prevents rollback from starting, the outcome remains unknown with both causes; only a real
+rollback ACK permits `RolledBack`. No fresh cleanup budget is minted.
 
 With `messaging`, `append_in(&mut PgTransaction, &prepared)` borrows the actual message connection,
 inherits its tenant and remaining budget, and changes no GUC, isolation level or lifecycle state.
@@ -73,3 +83,4 @@ bodies/configuration, durability and privileges. Unexpected drift fails closed. 
 operators can still alter storage; Audit provides no WORM, retention/hold, key custody or DR policy.
 
 ref: launchbadge/sqlx sqlx-core/src/transaction.rs@v0.9.0
+ref: sea-ql/sea-orm TransactionError<E>@2.0.2 (typed callback error, not settlement authority)

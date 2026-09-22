@@ -1,6 +1,8 @@
 //! Real TLS PostgreSQL acceptance through the public adapter API.
 use rss_audit_core::*;
-use rss_audit_postgres::{Committed, Control, Cursor, Error, Integrity, PgAudit, ReadLimit};
+use rss_audit_postgres::{
+    Committed, Control, Cursor, Error, Integrity, PgAudit, ReadLimit, TransactionError,
+};
 use rss_contract::{ContractId, ContractVersion, SchemaDigest, Timepoint};
 use rss_ledger::{Authenticator, KeyId};
 use rss_request_context::{Clock, Deadline, ExecutionTimer, TenantId};
@@ -76,7 +78,9 @@ fn event(
         ),
     ))
 }
-fn committed<R>(attempt: LocalTxAttempt<Committed<R>, Error>) -> anyhow::Result<R> {
+fn committed<R, E: std::error::Error + Send + Sync + 'static>(
+    attempt: LocalTxAttempt<Committed<R>, E>,
+) -> anyhow::Result<R> {
     attempt.fold(
         |v| Ok(v.into_value()),
         |e| Err(e.into()),
@@ -86,7 +90,7 @@ fn committed<R>(attempt: LocalTxAttempt<Committed<R>, Error>) -> anyhow::Result<
         |e| Err(e.into()),
     )
 }
-fn rolled_back<R>(attempt: LocalTxAttempt<Committed<R>, Error>, expected: fn(&Error) -> bool) {
+fn rolled_back<R, E>(attempt: LocalTxAttempt<Committed<R>, E>, expected: fn(&E) -> bool) {
     assert!(attempt.fold(
         |_| false,
         |_| false,

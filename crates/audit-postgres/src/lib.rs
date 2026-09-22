@@ -12,7 +12,7 @@ mod runtime;
 mod transaction;
 
 pub use control::Control;
-pub use error::{AdmissionViolation, Error};
+pub use error::{AdmissionViolation, Error, TransactionError};
 pub use model::{Cursor, Page, ReadLimit, Record, StagedAppend};
 #[cfg(feature = "integration")]
 pub use runtime::PgFault;

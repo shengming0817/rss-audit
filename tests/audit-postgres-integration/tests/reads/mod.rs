@@ -36,7 +36,7 @@ pub(super) async fn run(
                 Box::pin(async move { tx.append(&copy).await })
             })
             .await,
-        |e| matches!(e, Error::ScopeMismatch),
+        |e| matches!(e, TransactionError::Operation(Error::ScopeMismatch)),
     );
     let count = committed(
         plain
@@ -44,7 +44,7 @@ pub(super) async fn run(
                 Box::pin(async move {
                     tx.with_connection(move |c| {
                         Box::pin(async move {
-                            Ok(sqlx::query_scalar::<_, i64>(
+                            Ok::<_, Error>(sqlx::query_scalar::<_, i64>(
                                 "SELECT count(*) FROM rss_audit.records WHERE tenant_id=$1::uuid",
                             )
                             .bind(other.to_string())

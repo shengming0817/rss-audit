@@ -1,5 +1,13 @@
 use super::*;
 use rss_audit_postgres::PgFault;
+mod settlement;
+
+// Host-owned reason; it need not implement a formatting or standard error trait.
+pub(super) enum BusinessError {
+    Audit(Error),
+    Sql(sqlx::Error),
+    Declined(&'static str),
+}
 
 pub(super) async fn run(
     plain: &PgAudit,
@@ -9,6 +17,7 @@ pub(super) async fn run(
 ) -> anyhow::Result<()> {
     sqlx::raw_sql("CREATE TABLE public.business_changes(id text PRIMARY KEY); GRANT SELECT,INSERT ON public.business_changes TO audit_runtime;").execute(admin).await?;
     rollback(ledger, admin, control).await?;
+    settlement::run(plain, ledger, admin, control).await?;
     unknown(plain, "unknown-plain", control).await?;
     unknown(ledger, "unknown-ledger", control).await?;
     racing(ledger, control).await?;
@@ -30,7 +39,7 @@ async fn rollback(
         store
             .local_tx(t, control, move |tx| {
                 Box::pin(async move {
-                    tx.append(&staged).await?;
+                    tx.append(&staged).await.map_err(BusinessError::Audit)?;
                     tx.with_connection(|c| {
                         Box::pin(async move {
                             sqlx::query(
@@ -38,15 +47,21 @@ async fn rollback(
                             )
                             .execute(c)
                             .await?;
-                            Ok(())
+                            Ok::<(), sqlx::Error>(())
                         })
                     })
-                    .await?;
-                    Err::<(), Error>(Error::Rejected)
+                    .await
+                    .map_err(BusinessError::Sql)?;
+                    Err::<(), BusinessError>(BusinessError::Declined("business-rule"))
                 })
             })
             .await,
-        |e| matches!(e, Error::Rejected),
+        |e| {
+            matches!(
+                e,
+                TransactionError::Operation(BusinessError::Declined("business-rule"))
+            )
+        },
     );
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM public.business_changes")
         .fetch_one(admin)
@@ -61,8 +76,8 @@ async fn rollback(
     let attempt = store
         .local_tx(t, control, move |tx| {
             Box::pin(async move {
-                tx.append(&staged).await?;
-                Err::<(), Error>(Error::Rejected)
+                tx.append(&staged).await.map_err(BusinessError::Audit)?;
+                Err::<(), BusinessError>(BusinessError::Declined("rollback-ack-loss"))
             })
         })
         .await;
@@ -70,7 +85,8 @@ async fn rollback(
         |_| false,
         |_| false,
         |_| false,
-        |e| matches!(e,Error::Rollback {operation,..} if matches!(*operation,Error::Rejected)),
+        |e| matches!(e,TransactionError::Rollback {operation,..}
+            if matches!(*operation,TransactionError::Operation(BusinessError::Declined("rollback-ack-loss")))),
         |_| false,
         |_| false
     ));
@@ -117,9 +133,9 @@ async fn unknown(
         &cancel,
     );
     let pending = store
-        .prepare(event(tenant()?, id, "pending", vec![])?, control)
+        .prepare(event(tenant()?, id, "before-commit", vec![])?, control)
         .await?;
-    store.inject_next_fault(PgFault::CommitPending);
+    store.inject_next_fault(PgFault::BeforeCommitPending);
     assert!(store.append(&pending, &short).await.fold(
         |_| false,
         |_| false,
@@ -191,7 +207,7 @@ async fn termination(store: &PgAudit, control: &Control<'_, TestClock>) -> anyho
                         sqlx::query("SELECT pg_terminate_backend(pg_backend_pid())")
                             .execute(c)
                             .await?;
-                        Ok(())
+                        Ok::<(), Error>(())
                     })
                 })
                 .await

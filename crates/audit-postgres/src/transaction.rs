@@ -53,9 +53,10 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
     }
     /// Borrow trusted SQL; transaction control and tenant/session mutation are forbidden.
     /// The connection cannot escape the callback. This is not a SQL sandbox.
-    pub async fn with_connection<R: Send, F>(&mut self, operation: F) -> Result<R, Error>
+    /// The callback's error type is returned unchanged, without formatting bounds.
+    pub async fn with_connection<R: Send, E: Send, F>(&mut self, operation: F) -> Result<R, E>
     where
-        F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<R, Error>> + Send,
+        F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<R, E>> + Send,
     {
         operation(self.tx).await
     }
