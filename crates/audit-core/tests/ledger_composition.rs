@@ -142,3 +142,28 @@ fn empty_window_is_limited_evidence() -> Result<(), Box<dyn std::error::Error>> 
     assert!(verified.records().is_empty());
     Ok(())
 }
+
+#[test]
+fn recovery_preserves_the_exact_request_and_rejects_unknown_fields()
+-> Result<(), Box<dyn std::error::Error>> {
+    let prepared = prepare(
+        event(
+            tenant("018f47c2-8bd8-7f21-a52b-8d4f6ee2b203")?,
+            "device_enrolled",
+        )?,
+        Timepoint::try_from(1_726_000_001_i64)?,
+    )?;
+    let restored =
+        rss_audit_core::PreparedAuditV1::from_canonical_bytes(prepared.canonical_bytes())?;
+    assert_eq!(restored.canonical_bytes(), prepared.canonical_bytes());
+    assert_eq!(restored.append_request(), prepared.append_request());
+    let clone = restored.clone();
+    assert_eq!(clone.canonical_bytes(), prepared.canonical_bytes());
+    let mut unknown = prepared.canonical_bytes().to_vec();
+    unknown.push(0);
+    assert!(matches!(
+        rss_audit_core::PreparedAuditV1::from_canonical_bytes(&unknown),
+        Err(Error::UnknownField)
+    ));
+    Ok(())
+}

@@ -20,4 +20,4 @@ rss-audit 提供可嵌入 Rust 产品的审计记录协议及后续 PostgreSQL�
 ## 验证
 
 本仓检查入口为 `make ci`。独立 consumer 必须使用仓库祖先之外的 workspace、lock 和 target。
-PostgreSQL T2 与产品 T3 只能由其对应后续任务声明。
+PostgreSQL T2 由本仓 provider 集成测试验证；产品 T3 仍由消费产品独立持有。

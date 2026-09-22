@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/audit-core"]
+members = ["crates/audit-core", "crates/audit-postgres", "tests/audit-postgres-integration"]
 resolver = "3"
 
 [workspace.package]
@@ -10,12 +10,22 @@ publish = false
 
 [workspace.dependencies]
 rss-audit-core = { path = "crates/audit-core" }
-rss-contract = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c3fbd187b8d97ff25cc5968243062d1521714fb7", default-features = false }
-rss-diag-context = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c3fbd187b8d97ff25cc5968243062d1521714fb7", default-features = false }
-rss-ledger = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c3fbd187b8d97ff25cc5968243062d1521714fb7", default-features = false }
-rss-redact = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c3fbd187b8d97ff25cc5968243062d1521714fb7", default-features = false }
-rss-request-context = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c3fbd187b8d97ff25cc5968243062d1521714fb7", default-features = false }
+rss-contract = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c752578e1b5e30724b8e81726a62553211b66dd5", default-features = false }
+rss-diag-context = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c752578e1b5e30724b8e81726a62553211b66dd5", default-features = false }
+rss-ledger = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c752578e1b5e30724b8e81726a62553211b66dd5", default-features = false }
+rss-redact = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c752578e1b5e30724b8e81726a62553211b66dd5", default-features = false }
+rss-request-context = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c752578e1b5e30724b8e81726a62553211b66dd5", default-features = false }
 thiserror = "2"
+rss-audit-postgres = { path = "crates/audit-postgres" }
+rss-ledger-postgres = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c752578e1b5e30724b8e81726a62553211b66dd5", default-features = false }
+rss-transactional-messaging = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c752578e1b5e30724b8e81726a62553211b66dd5", default-features = false }
+rss-transactional-messaging-postgres = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c752578e1b5e30724b8e81726a62553211b66dd5", default-features = false }
+testkit = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "c752578e1b5e30724b8e81726a62553211b66dd5", default-features = false }
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
+tokio = { version = "1", default-features = false }
+tokio-util = "0.7"
+futures = "0.3"
+anyhow = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

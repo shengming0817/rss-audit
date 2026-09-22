@@ -19,11 +19,23 @@ fn audit_record_id(source: &SourceId, event: &EventId) -> Result<RecordId, Error
 /// Canonical Audit V1 bytes lowered to a ledger append request.
 ///
 /// Preparation performs no provider I/O and is never durable-commit evidence.
+#[derive(Clone)]
 pub struct PreparedAuditV1 {
     request: AppendRequest,
 }
 
 impl PreparedAuditV1 {
+    /// Restore an exact V1 request after applying the existing structural decoder.
+    /// This does not authenticate the bytes, their recording time or a previous commit.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let (event, recorded_at) = codec::decode_untrusted(bytes)?.into_parts();
+        let prepared = prepare(event, recorded_at)?;
+        if prepared.canonical_bytes() != bytes {
+            return Err(Error::MalformedEncoding);
+        }
+        Ok(prepared)
+    }
+
     /// Exact ledger request to stage. Preserve it unchanged after commit-unknown.
     #[must_use]
     pub const fn append_request(&self) -> &AppendRequest {

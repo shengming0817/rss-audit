@@ -24,6 +24,7 @@ class ConsumerEnvironmentTests(unittest.TestCase):
             {
                 "PATH": "/usr/bin",
                 "SYSTEM_ACCESSTOKEN": "secret",
+                "AZURE_DEVOPS_EXT_PAT": "secret",
                 "GIT_CONFIG_COUNT": "1",
                 "GIT_CONFIG_KEY_0": "http.example.extraheader",
                 "GIT_CONFIG_VALUE_0": "AUTHORIZATION: bearer secret",
@@ -33,6 +34,7 @@ class ConsumerEnvironmentTests(unittest.TestCase):
         self.assertEqual(execution["CARGO_NET_OFFLINE"], "true")
         self.assertEqual(execution["PATH"], "/usr/bin")
         self.assertNotIn("SYSTEM_ACCESSTOKEN", execution)
+        self.assertNotIn("AZURE_DEVOPS_EXT_PAT", execution)
         self.assertFalse(any(key.startswith("GIT_CONFIG_") for key in execution))
 
         visible = json.loads(
@@ -48,6 +50,15 @@ class ConsumerEnvironmentTests(unittest.TestCase):
         )
         self.assertNotIn("SYSTEM_ACCESSTOKEN", visible)
         self.assertFalse(any(key.startswith("GIT_CONFIG_") for key in visible))
+
+    def test_adapter_features_are_explicit_and_independent(self) -> None:
+        import tomllib
+        for scenario, expected in (("pg", []), ("ledger", ["ledger"]), ("messaging", ["messaging"]), ("ledger-messaging", ["ledger", "messaging"])):
+            manifest = tomllib.loads(CHECKER.manifest('path = "/tmp/core"', scenario, 'path = "/tmp/adapter", default-features = false'))
+            self.assertEqual(manifest["dependencies"]["rss-audit-postgres"]["features"], expected)
+            self.assertFalse(manifest["dependencies"]["rss-audit-postgres"]["default-features"])
+            self.assertEqual("rss-ledger-postgres" in manifest["dependencies"], "ledger" in expected)
+            self.assertEqual("rss-transactional-messaging-postgres" in manifest["dependencies"], "messaging" in expected)
 
 
 if __name__ == "__main__":

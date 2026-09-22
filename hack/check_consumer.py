@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run an isolated source or fixed-revision consumer of rss-audit-core."""
+"""Run isolated core and PostgreSQL feature consumers from source or a fixed revision."""
 
 import argparse
 import json
@@ -9,11 +9,12 @@ import shutil
 import subprocess
 import tempfile
 import tomllib
+import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
 AUDIT_URL = "https://dev.azure.com/shengming0923/rss/_git/rss-audit"
 RSS_URL = "https://dev.azure.com/shengming0923/rss/_git/rss"
-RSS_REVISION = "c3fbd187b8d97ff25cc5968243062d1521714fb7"
+RSS_REVISION = "c752578e1b5e30724b8e81726a62553211b66dd5"
 FORBIDDEN = {
     "axum",
     "sqlx",
@@ -39,8 +40,8 @@ def ensure_external(path: Path) -> None:
     require(ROOT not in resolved.parents, "consumer output must be outside the repository")
 
 
-def manifest(dependency: str) -> str:
-    return f'''[workspace]
+def manifest(dependency: str, scenario: str = "core", adapter: str = "") -> str:
+    result = f'''[workspace]
 resolver = "3"
 
 [package]
@@ -55,9 +56,25 @@ rss-contract = {{ git = "{RSS_URL}", rev = "{RSS_REVISION}", default-features = 
 rss-ledger = {{ git = "{RSS_URL}", rev = "{RSS_REVISION}", default-features = false }}
 rss-request-context = {{ git = "{RSS_URL}", rev = "{RSS_REVISION}", default-features = false }}
 '''
+    if scenario == "core":
+        return result
+    features = [name for name in ("ledger", "messaging") if name in scenario]
+    result += f'''rss-audit-postgres = {{ {adapter}, features = {json.dumps(features)} }}
+rss-transactional-messaging = {{ git = "{RSS_URL}", rev = "{RSS_REVISION}", default-features = false }}
+testkit = {{ git = "{RSS_URL}", rev = "{RSS_REVISION}", default-features = false, features = ["containers"] }}
+sqlx = {{ version = "=0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }}
+tokio = {{ version = "1", features = ["rt-multi-thread", "macros", "time"] }}
+tokio-util = "0.7"
+anyhow = "1"
+'''
+    for feature in features:
+        package = "rss-ledger-postgres" if feature == "ledger" else "rss-transactional-messaging-postgres"
+        result += f'{package} = {{ git = "{RSS_URL}", rev = "{RSS_REVISION}", default-features = false }}\n'
+    result += '\n[features]\nledger = []\nmessaging = []\n'
+    return result
 
 
-def check_metadata(metadata: dict, revision: str | None) -> None:
+def check_metadata(metadata: dict, revision: str | None, scenario: str = "core") -> None:
     require(len(metadata["workspace_members"]) == 1, "consumer workspace must have one member")
     packages = metadata["packages"]
     audit = [package for package in packages if package["name"] == "rss-audit-core"]
@@ -80,13 +97,30 @@ def check_metadata(metadata: dict, revision: str | None) -> None:
     require(expected_rss_revision == RSS_REVISION, "consumer RSS revision drift")
     expected_rss = f"git+{RSS_URL}?rev={expected_rss_revision}#{expected_rss_revision}"
     workspace_members = set(metadata["workspace_members"])
-    rss_packages = [package for package in packages if package["name"].startswith("rss-")]
+    rss_packages = [package for package in packages if package["name"].startswith("rss-") or package["name"] == "testkit"]
     for package in rss_packages:
-        if package["name"] == "rss-audit-core" or package["id"] in workspace_members:
+        if package["name"] in ("rss-audit-core", "rss-audit-postgres"):
+            if revision:
+                require(package["source"] == f"git+{AUDIT_URL}?rev={revision}#{revision}", "mixed Audit source")
+            else:
+                expected = ROOT / "crates" / package["name"].removeprefix("rss-") / "Cargo.toml"
+                require(package["source"] is None and Path(package["manifest_path"]).resolve() == expected, "wrong Audit checkout")
+            continue
+        if package["id"] in workspace_members:
             continue
         require(package["source"] == expected_rss, f"wrong RSS source: {package['name']}")
     names = {package["name"] for package in packages}
-    require(not names.intersection(FORBIDDEN), f"forbidden consumer closure: {names & FORBIDDEN}")
+    if scenario == "core":
+        require(not names.intersection(FORBIDDEN), f"forbidden consumer closure: {names & FORBIDDEN}")
+    else:
+        require("rss-audit-postgres" in names, "missing Audit adapter")
+        nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
+        adapter = next(package for package in packages if package["name"] == "rss-audit-postgres")
+        expected = {name for name in ("ledger", "messaging") if name in scenario}
+        require(set(nodes[adapter["id"]]["features"]) == expected, "Audit adapter feature drift")
+    for package in packages:
+        if package["source"] is None and package["id"] not in workspace_members:
+            require(package["name"] in ("rss-audit-core", "rss-audit-postgres") and not revision, "unexpected external path")
 
 
 def execution_environment(fetch_environment: dict[str, str]) -> dict[str, str]:
@@ -94,13 +128,14 @@ def execution_environment(fetch_environment: dict[str, str]) -> dict[str, str]:
     environment = {
         key: value
         for key, value in fetch_environment.items()
-        if key != "SYSTEM_ACCESSTOKEN" and not key.startswith("GIT_CONFIG_")
+        if key not in ("SYSTEM_ACCESSTOKEN", "AZURE_DEVOPS_EXT_PAT", "ADO_PAT", "GH_TOKEN", "GITHUB_TOKEN")
+        and not key.startswith("GIT_CONFIG_")
     }
     environment["CARGO_NET_OFFLINE"] = "true"
     return environment
 
 
-def run(output: Path, revision: str | None) -> None:
+def run_case(output: Path, revision: str | None, scenario: str, target: Path) -> None:
     ensure_external(output)
     output.mkdir(mode=0o700)
     (output / "src").mkdir()
@@ -110,26 +145,41 @@ def run(output: Path, revision: str | None) -> None:
         if revision
         else f'path = "{ROOT / "crates/audit-core"}", default-features = false'
     )
-    (output / "Cargo.toml").write_text(manifest(dependency))
+    adapter = (
+        f'git = "{AUDIT_URL}", rev = "{revision}", default-features = false'
+        if revision else f'path = "{ROOT / "crates/audit-postgres"}", default-features = false'
+    )
+    (output / "Cargo.toml").write_text(manifest(dependency, scenario, adapter))
     (output / ".cargo/config.toml").write_text("[net]\ngit-fetch-with-cli = true\n")
-    shutil.copyfile(ROOT / "tests/consumers/core.rs", output / "src/main.rs")
+    shutil.copyfile(ROOT / "tests/consumers" / ("core.rs" if scenario == "core" else "postgres.rs"), output / "src/main.rs")
 
     fetch_env = dict(os.environ)
-    fetch_env["CARGO_TARGET_DIR"] = str(output / "target")
+    fetch_env["CARGO_TARGET_DIR"] = str(target)
+    fetch_env["RSS_TEST_RUN_ID"] = f"audit-consumer-{uuid.uuid4().hex}"
     for key in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER"):
         fetch_env.pop(key, None)
     subprocess.run(["cargo", "generate-lockfile"], cwd=output, env=fetch_env, check=True)
     subprocess.run(["cargo", "fetch", "--locked"], cwd=output, env=fetch_env, check=True)
     run_env = execution_environment(fetch_env)
+    features = [name for name in ("ledger", "messaging") if name in scenario]
+    arguments = ["--features", ",".join(features)] if features else []
     metadata = json.loads(
         subprocess.check_output(
-            ["cargo", "metadata", "--locked", "--format-version", "1"],
+            ["cargo", "metadata", "--locked", "--format-version", "1", *arguments],
             cwd=output,
             env=run_env,
         )
     )
-    check_metadata(metadata, revision)
-    subprocess.run(["cargo", "run", "--locked"], cwd=output, env=run_env, check=True)
+    check_metadata(metadata, revision, scenario)
+    subprocess.run(["cargo", "run", "--locked", *arguments], cwd=output, env=run_env, check=True)
+    print(json.dumps({"scenario": scenario, "revision": revision, "result": "passed"}), flush=True)
+
+
+def run(output: Path, revision: str | None) -> None:
+    ensure_external(output)
+    output.mkdir(mode=0o700)
+    for scenario in ("core", "pg", "ledger", "messaging", "ledger-messaging"):
+        run_case(output / scenario, revision, scenario, output / "target")
 
 
 def main() -> None:
