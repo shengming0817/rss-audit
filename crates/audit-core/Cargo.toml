@@ -1,0 +1,22 @@
+[package]
+name = "rss-audit-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Provider-free canonical audit record protocol"
+
+[dependencies]
+rss-contract.workspace = true
+rss-diag-context.workspace = true
+rss-ledger.workspace = true
+rss-redact.workspace = true
+rss-request-context.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
+trybuild = "1"
+
+[lints]
+workspace = true
