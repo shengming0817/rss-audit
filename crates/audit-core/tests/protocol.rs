@@ -15,6 +15,26 @@ fn event_with(
     resource_kind: &str,
     payload: Vec<u8>,
 ) -> Result<AuditEventV1, Box<dyn std::error::Error>> {
+    event_with_details(
+        action,
+        resource_kind,
+        payload,
+        Outcome::Succeeded,
+        Coordinates::new(
+            Some(CorrelationId::parse("corr-42")?),
+            Some(RequestId::parse("request-42")?),
+            Some(OperationId::parse("operation-42")?),
+        ),
+    )
+}
+
+fn event_with_details(
+    action: &str,
+    resource_kind: &str,
+    payload: Vec<u8>,
+    outcome: Outcome,
+    coordinates: Coordinates,
+) -> Result<AuditEventV1, Box<dyn std::error::Error>> {
     let tenant = TenantId::parse("018f47c2-8bd8-7f21-a52b-8d4f6ee2b203")?;
     let source = SourceIdentity::new(
         SourceId::parse("rss-identity")?,
@@ -37,17 +57,10 @@ fn event_with(
             ResourceKind::parse(resource_kind)?,
             ResourceId::parse("session-sensitive")?,
         ),
-        Outcome::Succeeded,
+        outcome,
         Timepoint::try_from(1_726_000_000_i64)?,
     );
-    let context = EventContext::new(
-        Coordinates::new(
-            Some(CorrelationId::parse("corr-42")?),
-            Some(RequestId::parse("request-42")?),
-            Some(OperationId::parse("operation-42")?),
-        ),
-        AuditPayload::new(payload)?,
-    );
+    let context = EventContext::new(coordinates, AuditPayload::new(payload)?);
     Ok(AuditEventV1::new(identity, facts, context))
 }
 
@@ -73,6 +86,21 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         .collect()
 }
 
+fn golden_v1() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    decode_hex(concat!(
+        "7273732e61756469742e7265636f7264000001018f47c28bd87f21a52b8d4f6ee2b203",
+        "0000000c7273732d6964656e74697479000000086576656e742d3432000000176964656e",
+        "746974792e73656375726974792d6576656e7400000003000000477368613235363a3031",
+        "32333435363738396162636465663031323334353637383961626364656630313233343536",
+        "37383961626364656630313233343536373839616263646566000000047573657200000013",
+        "7072696e636970616c2d73656e7369746976650000000f73657373696f6e5f7265766f6b",
+        "65640000000773657373696f6e0000001173657373696f6e2d73656e7369746976650100",
+        "00000066e0ab800000000066e0ab810100000007636f72722d3432010000000a72657175",
+        "6573742d3432010000000c6f7065726174696f6e2d3432000000157b22726561736f6e22",
+        "3a226f70657261746f72227d"
+    ))
+}
+
 #[test]
 fn prepares_exact_ledger_identity_and_bytes() -> Result<(), Box<dyn std::error::Error>> {
     let prepared = prepare(event()?, Timepoint::try_from(1_726_000_001_i64)?)?;
@@ -94,18 +122,7 @@ fn prepares_exact_ledger_identity_and_bytes() -> Result<(), Box<dyn std::error::
 #[test]
 fn canonical_v1_matches_independent_golden_bytes() -> Result<(), Box<dyn std::error::Error>> {
     let prepared = prepare(event()?, Timepoint::try_from(1_726_000_001_i64)?)?;
-    let golden = decode_hex(concat!(
-        "7273732e61756469742e7265636f7264000001018f47c28bd87f21a52b8d4f6ee2b203",
-        "0000000c7273732d6964656e74697479000000086576656e742d3432000000176964656e",
-        "746974792e73656375726974792d6576656e7400000003000000477368613235363a3031",
-        "32333435363738396162636465663031323334353637383961626364656630313233343536",
-        "37383961626364656630313233343536373839616263646566000000047573657200000013",
-        "7072696e636970616c2d73656e7369746976650000000f73657373696f6e5f7265766f6b",
-        "65640000000773657373696f6e0000001173657373696f6e2d73656e7369746976650100",
-        "00000066e0ab800000000066e0ab810100000007636f72722d3432010000000a72657175",
-        "6573742d3432010000000c6f7065726174696f6e2d3432000000157b22726561736f6e22",
-        "3a226f70657261746f72227d"
-    ))?;
+    let golden = golden_v1()?;
     assert_eq!(prepared.canonical_bytes(), golden);
     let decoded = decode_untrusted(&golden)?;
     assert_eq!(decoded.version(), RecordVersion::V1);
@@ -119,6 +136,68 @@ fn canonical_v1_matches_independent_golden_bytes() -> Result<(), Box<dyn std::er
         decoded.event().context().payload().as_bytes(),
         br#"{"reason":"operator"}"#
     );
+    Ok(())
+}
+
+#[test]
+fn golden_v1_fixes_every_outcome_tag() -> Result<(), Box<dyn std::error::Error>> {
+    const OUTCOME_OFFSET: usize = 251;
+    for (outcome, expected_tag) in [(Outcome::Denied, 2), (Outcome::Failed, 3)] {
+        let mut expected = golden_v1()?;
+        expected[OUTCOME_OFFSET] = expected_tag;
+        let prepared = prepare(
+            event_with_details(
+                "session_revoked",
+                "session",
+                br#"{"reason":"operator"}"#.to_vec(),
+                outcome,
+                Coordinates::new(
+                    Some(CorrelationId::parse("corr-42")?),
+                    Some(RequestId::parse("request-42")?),
+                    Some(OperationId::parse("operation-42")?),
+                ),
+            )?,
+            Timepoint::try_from(1_726_000_001_i64)?,
+        )?;
+        assert_eq!(prepared.canonical_bytes(), expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn golden_v1_fixes_absent_and_mixed_optional_tags() -> Result<(), Box<dyn std::error::Error>> {
+    const OPTIONALS_OFFSET: usize = 268;
+    let payload_suffix = decode_hex("000000157b22726561736f6e223a226f70657261746f72227d")?;
+
+    let mut absent = golden_v1()?[..OPTIONALS_OFFSET].to_vec();
+    absent.extend_from_slice(&[0, 0, 0]);
+    absent.extend_from_slice(&payload_suffix);
+    let absent_record = prepare(
+        event_with_details(
+            "session_revoked",
+            "session",
+            br#"{"reason":"operator"}"#.to_vec(),
+            Outcome::Succeeded,
+            Coordinates::new(None, None, None),
+        )?,
+        Timepoint::try_from(1_726_000_001_i64)?,
+    )?;
+    assert_eq!(absent_record.canonical_bytes(), absent);
+
+    let mut mixed = golden_v1()?[..OPTIONALS_OFFSET].to_vec();
+    mixed.extend_from_slice(&decode_hex("00010000000a726571756573742d343200")?);
+    mixed.extend_from_slice(&payload_suffix);
+    let mixed_record = prepare(
+        event_with_details(
+            "session_revoked",
+            "session",
+            br#"{"reason":"operator"}"#.to_vec(),
+            Outcome::Succeeded,
+            Coordinates::new(None, Some(RequestId::parse("request-42")?), None),
+        )?,
+        Timepoint::try_from(1_726_000_001_i64)?,
+    )?;
+    assert_eq!(mixed_record.canonical_bytes(), mixed);
     Ok(())
 }
 
@@ -242,6 +321,33 @@ fn decoder_rejects_version_tags_truncation_and_unknown_fields()
     assert!(matches!(
         decode_untrusted(&trailing),
         Err(Error::UnknownField)
+    ));
+    Ok(())
+}
+
+#[test]
+fn decoder_preserves_empty_source_contract_diagnostics() -> Result<(), Box<dyn std::error::Error>> {
+    const CONTRACT_LENGTH_OFFSET: usize = 63;
+    const CONTRACT_BYTES: usize = 23;
+    const DIGEST_LENGTH_OFFSET: usize = 94;
+    const DIGEST_BYTES: usize = 71;
+
+    let mut empty_contract = golden_v1()?;
+    empty_contract[CONTRACT_LENGTH_OFFSET..CONTRACT_LENGTH_OFFSET + 4]
+        .copy_from_slice(&0_u32.to_be_bytes());
+    empty_contract.drain(CONTRACT_LENGTH_OFFSET + 4..CONTRACT_LENGTH_OFFSET + 4 + CONTRACT_BYTES);
+    assert!(matches!(
+        decode_untrusted(&empty_contract),
+        Err(Error::Empty(Field::SourceContract))
+    ));
+
+    let mut empty_digest = golden_v1()?;
+    empty_digest[DIGEST_LENGTH_OFFSET..DIGEST_LENGTH_OFFSET + 4]
+        .copy_from_slice(&0_u32.to_be_bytes());
+    empty_digest.drain(DIGEST_LENGTH_OFFSET + 4..DIGEST_LENGTH_OFFSET + 4 + DIGEST_BYTES);
+    assert!(matches!(
+        decode_untrusted(&empty_digest),
+        Err(Error::Empty(Field::SourceContract))
     ));
     Ok(())
 }

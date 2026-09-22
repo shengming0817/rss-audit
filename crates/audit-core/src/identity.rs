@@ -56,9 +56,12 @@ macro_rules! token_type {
         pub struct $name(Box<str>);
 
         impl $name {
+            /// Maximum accepted token length in bytes.
+            pub const MAX_BYTES: usize = $max;
+
             /// Parse a canonical bounded token without normalization.
             pub fn parse(value: &str) -> Result<Self, Error> {
-                validate_token(value, $field, $max, $lower).map(Self)
+                validate_token(value, $field, Self::MAX_BYTES, $lower).map(Self)
             }
 
             /// Borrow the exact validated token.
@@ -82,6 +85,9 @@ macro_rules! reference_type {
         pub struct $name(Box<str>);
 
         impl $name {
+            /// Maximum accepted reference length in bytes.
+            pub const MAX_BYTES: usize = REFERENCE_MAX_BYTES;
+
             /// Parse a nonempty UTF-8 reference of at most 512 bytes without control characters.
             pub fn parse(value: &str) -> Result<Self, Error> {
                 validate_reference(value, $field).map(Self)

@@ -6,8 +6,8 @@ export PYTHONDONTWRITEBYTECODE := 1
 CARGO_TARGET_DIR ?= $(REPOSITORY_ROOT)/target
 export CARGO_TARGET_DIR
 
-.PHONY: ci check test dependencies licenses test-consumers
-ci: check test dependencies licenses test-consumers
+.PHONY: ci check test coverage dependencies licenses test-consumers
+ci: check test coverage dependencies licenses test-consumers
 
 check:
 	cargo fmt --all -- --check
@@ -17,7 +17,11 @@ check:
 test:
 	cargo test --locked --workspace --all-features
 
+coverage:
+	cargo llvm-cov --locked --workspace --all-features --fail-under-lines 80
+
 dependencies:
+	$(PYTHON) -m unittest discover -s hack/tests -p 'test_*.py'
 	$(PYTHON) hack/check_dependencies.py
 
 licenses:

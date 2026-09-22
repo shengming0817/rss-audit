@@ -23,6 +23,16 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def validate_rss_git_sources(packages: list[dict]) -> None:
+    """Reject every RSS Git package that is not resolved at the one accepted revision."""
+    expected_source = f"git+{RSS_URL}?rev={RSS_REVISION}#{RSS_REVISION}"
+    rss_git_prefix = f"git+{RSS_URL}"
+    for package in packages:
+        source = package["source"]
+        if source is not None and source.startswith(rss_git_prefix):
+            require(source == expected_source, f"wrong RSS source for {package['name']}")
+
+
 def main() -> None:
     manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
     declarations = manifest["workspace"]["dependencies"]
@@ -50,12 +60,11 @@ def main() -> None:
         )
     )
     workspace = set(metadata["workspace_members"])
-    expected_source = f"git+{RSS_URL}?rev={RSS_REVISION}#{RSS_REVISION}"
     found = set()
     packages = {package["id"]: package for package in metadata["packages"]}
+    validate_rss_git_sources(list(packages.values()))
     for package in metadata["packages"]:
         if package["name"] in RSS_ROOTS:
-            require(package["source"] == expected_source, f"wrong source for {package['name']}")
             found.add(package["name"])
         if package["source"] is None:
             require(package["id"] in workspace, "external path dependency forbidden")

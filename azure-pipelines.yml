@@ -11,6 +11,7 @@ steps:
       set -euo pipefail
       rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
       cargo +1.96.0 install cargo-deny --version 0.19.9 --locked
+      cargo +1.96.0 install cargo-llvm-cov --version 0.8.7 --locked
     displayName: Install pinned Rust tooling
   - bash: python3 hack/ci.py
     displayName: Audit T1 and isolated consumer

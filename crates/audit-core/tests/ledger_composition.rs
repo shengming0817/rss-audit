@@ -115,6 +115,22 @@ fn verified_window_rechecks_audit_identity() -> Result<(), Box<dyn std::error::E
         verify_window(&auth, tenant, None, &[wrong_entry]),
         Err(Error::IdentityMismatch)
     ));
+
+    let other_tenant = TenantId::parse("018f47c2-8bd8-7f21-a52b-8d4f6ee2b204")?;
+    let other_prepared = prepare(
+        event(other_tenant, "device_enrolled")?,
+        Timepoint::try_from(1_726_000_001_i64)?,
+    )?;
+    let cross_tenant_request = AppendRequest::new(
+        LedgerId::new(tenant, entry.ledger().chain().clone()),
+        other_prepared.append_request().record_id().clone(),
+        other_prepared.canonical_bytes().to_vec(),
+    )?;
+    let cross_tenant_entry = auth.append(&cross_tenant_request, None)?;
+    assert!(matches!(
+        verify_window(&auth, tenant, None, &[cross_tenant_entry]),
+        Err(Error::IdentityMismatch)
+    ));
     Ok(())
 }
 

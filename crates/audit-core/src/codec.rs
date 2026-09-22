@@ -8,6 +8,9 @@ use rss_diag_context::CorrelationId;
 use rss_request_context::{RequestId, TenantId};
 
 const DOMAIN: &[u8] = b"rss.audit.record\0";
+const CONTRACT_ID_MAX_BYTES: usize = 255;
+const SCHEMA_DIGEST_BYTES: usize = 71;
+const REQUEST_ID_MAX_BYTES: usize = 128;
 /// Maximum exact source payload bytes in Audit V1.
 pub const MAX_PAYLOAD_BYTES: usize = 65_536;
 /// Maximum complete canonical Audit V1 bytes.
@@ -92,34 +95,43 @@ pub fn decode_untrusted(bytes: &[u8]) -> Result<DecodedAuditV1, Error> {
         return Err(Error::UnsupportedVersion);
     }
     let tenant = decode_tenant(reader.take(16)?)?;
-    let source_id = SourceId::parse(reader.text(Field::SourceId, 64)?)?;
-    let event_id = EventId::parse(reader.text(Field::EventId, 128)?)?;
-    let contract_id = ContractId::parse(reader.text(Field::SourceContract, 255)?)
+    let source_id = SourceId::parse(reader.text(Field::SourceId, SourceId::MAX_BYTES)?)?;
+    let event_id = EventId::parse(reader.text(Field::EventId, EventId::MAX_BYTES)?)?;
+    let contract_id_text = reader.text(Field::SourceContract, CONTRACT_ID_MAX_BYTES)?;
+    if contract_id_text.is_empty() {
+        return Err(Error::Empty(Field::SourceContract));
+    }
+    let contract_id = ContractId::parse(contract_id_text)
         .map_err(|_| Error::InvalidCharacter(Field::SourceContract))?;
     let contract_version =
         ContractVersion::from_major(reader.u32()?).map_err(|_| Error::MalformedEncoding)?;
-    let schema_digest = SchemaDigest::parse(reader.text(Field::SourceContract, 71)?)
+    let schema_digest_text = reader.text(Field::SourceContract, SCHEMA_DIGEST_BYTES)?;
+    if schema_digest_text.is_empty() {
+        return Err(Error::Empty(Field::SourceContract));
+    }
+    let schema_digest = SchemaDigest::parse(schema_digest_text)
         .map_err(|_| Error::InvalidCharacter(Field::SourceContract))?;
-    let actor_kind = ActorKind::parse(reader.text(Field::ActorKind, 64)?)?;
-    let actor_id = ActorId::parse(reader.text(Field::ActorId, 512)?)?;
-    let action = Action::parse(reader.text(Field::Action, 128)?)?;
-    let resource_kind = ResourceKind::parse(reader.text(Field::ResourceKind, 64)?)?;
-    let resource_id = ResourceId::parse(reader.text(Field::ResourceId, 512)?)?;
+    let actor_kind = ActorKind::parse(reader.text(Field::ActorKind, ActorKind::MAX_BYTES)?)?;
+    let actor_id = ActorId::parse(reader.text(Field::ActorId, ActorId::MAX_BYTES)?)?;
+    let action = Action::parse(reader.text(Field::Action, Action::MAX_BYTES)?)?;
+    let resource_kind =
+        ResourceKind::parse(reader.text(Field::ResourceKind, ResourceKind::MAX_BYTES)?)?;
+    let resource_id = ResourceId::parse(reader.text(Field::ResourceId, ResourceId::MAX_BYTES)?)?;
     let outcome = Outcome::from_tag(reader.u8()?).ok_or(Error::UnsupportedTag)?;
     let occurred_at = Timepoint::try_from(reader.i64()?).map_err(|_| Error::MalformedEncoding)?;
     let recorded_at = Timepoint::try_from(reader.i64()?).map_err(|_| Error::MalformedEncoding)?;
     let correlation_id = reader
-        .optional_text(Field::CorrelationId, 128)?
+        .optional_text(Field::CorrelationId, CorrelationId::MAX_LEN)?
         .map(CorrelationId::parse)
         .transpose()
         .map_err(|_| Error::InvalidCharacter(Field::CorrelationId))?;
     let request_id = reader
-        .optional_text(Field::RequestId, 128)?
+        .optional_text(Field::RequestId, REQUEST_ID_MAX_BYTES)?
         .map(RequestId::parse)
         .transpose()
         .map_err(|_| Error::InvalidCharacter(Field::RequestId))?;
     let operation_id = reader
-        .optional_text(Field::OperationId, 128)?
+        .optional_text(Field::OperationId, OperationId::MAX_BYTES)?
         .map(OperationId::parse)
         .transpose()?;
     let payload = AuditPayload::new(reader.bytes(Field::Payload, MAX_PAYLOAD_BYTES)?.to_vec())?;
