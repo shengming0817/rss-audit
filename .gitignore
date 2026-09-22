@@ -1,0 +1,5 @@
+/target/
+/.cache/
+/.local-ci-runs/
+/.codex-tmp/
+**/__pycache__/
