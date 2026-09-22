@@ -16,7 +16,8 @@
 Operation(E)、Audit(Error) 与未确认 rollback 的 operation/settlement 双重原因显式分开；
 with_connection 不抹去宿主错误。删除无载荷 Rejected，不保留旧签名、别名或兼容路径。
 错误格式化和 source 遍历不暴露 E；宿主通过类型匹配恢复原因与分类。操作错误后的取消不得覆盖
-该原因，未启动或未 ACK 的 rollback 均不假称已回滚，也不重置绝对预算。消息路径仍归原 owner。
+该原因，未启动或未 ACK 的 rollback 均为 RollbackFailed，不假称已回滚，也不重置绝对预算。
+该失败分支未尝试 COMMIT，不返回 CommitUnknown。消息路径仍归原 owner。
 
 录制前用 PostgreSQL 时间生成 `PreparedAuditV1`。调用方保存其精确字节，commit unknown 时原样
 恢复并重试，不能重建 recorded_at。`Committed` 只能在 COMMIT ACK 后构造；staged 值没有 ACK 权限。

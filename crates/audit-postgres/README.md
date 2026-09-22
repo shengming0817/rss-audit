@@ -32,8 +32,9 @@ do not issue transaction control, change role/tenant/session state, or swallow a
 Lock order is Audit tenant head → ledger → business/outbox. One absolute budget covers
 acquisition, setup, operation and settlement. Unconfirmed connections are closed, never reused.
 Cancellation after the callback returns an error cannot overwrite that error. If cancellation
-prevents rollback from starting, the outcome remains unknown with both causes; only a real
-rollback ACK permits `RolledBack`. No fresh cleanup budget is minted.
+prevents rollback from starting, the result is `RollbackFailed` with both causes, not
+`CommitUnknown`: this branch never attempted commit. Only a real rollback ACK permits
+`RolledBack`. No fresh cleanup budget is minted.
 
 With `messaging`, `append_in(&mut PgTransaction, &prepared)` borrows the actual message connection,
 inherits its tenant and remaining budget, and changes no GUC, isolation level or lifecycle state.

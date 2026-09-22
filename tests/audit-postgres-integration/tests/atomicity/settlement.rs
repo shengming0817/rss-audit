@@ -95,9 +95,9 @@ async fn cancelled_operation(
         |_| false,
         |_| false,
         |_| false,
-        |_| false,
         |error| matches!(error, TransactionError::Rollback { operation, settlement: Error::Cancelled(Stage::Rollback) }
             if matches!(*operation, TransactionError::Operation(BusinessError::Declined("cancelled-business-rule")))),
+        |_| false,
         |_| false,
     ));
     // No rollback ACK was claimed. Original bytes serialize recovery after lease retirement.

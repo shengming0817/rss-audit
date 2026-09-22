@@ -233,10 +233,8 @@ impl PgAudit {
                 }
             }
             Err(operation) => {
-                let mut started = false;
                 let settled = control
                     .run(Stage::Rollback, async {
-                        started = true;
                         tx.rollback().await?;
                         #[cfg(feature = "integration")]
                         if fault == PgFault::RollbackFailedAfterAck as u8 {
@@ -251,15 +249,10 @@ impl PgAudit {
                         LocalTxAttempt::rolled_back(operation)
                     }
                     Err(settlement) => {
-                        let error = TransactionError::Rollback {
+                        LocalTxAttempt::rollback_failed(TransactionError::Rollback {
                             operation: Box::new(operation),
                             settlement,
-                        };
-                        if started {
-                            LocalTxAttempt::rollback_failed(error)
-                        } else {
-                            LocalTxAttempt::commit_unknown(error)
-                        }
+                        })
                     }
                 }
             }
