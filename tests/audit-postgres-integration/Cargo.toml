@@ -23,6 +23,7 @@ rss-ledger-postgres.workspace = true
 rss-transactional-messaging = { workspace = true, features = ["consumer", "producer"] }
 rss-transactional-messaging-postgres = { workspace = true, features = ["integration"] }
 rss-contract.workspace = true
+rss-diag-context.workspace = true
 rss-request-context.workspace = true
 sqlx.workspace = true
 tokio-util.workspace = true

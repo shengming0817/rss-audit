@@ -95,6 +95,9 @@ mod tests {
         let other = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d480")?;
         let cursor = Cursor::resume(tenant, 9_007_199_254_740_992, i64::MAX as u64)?;
         let token = encode(cursor)?;
+        const GOLDEN: &str = "AfR6wQtYzENypWcOArLD1HkAIAAAAAAAAH__________";
+        assert_eq!(token, GOLDEN);
+        assert_eq!(decode(GOLDEN)?, cursor);
         assert_eq!(decode(&token)?.continuation(), cursor.continuation());
         let q = AuditQuery::parse(Some(&format!("cursor={token}&limit=100")))?;
         assert!(q.is_continuation());

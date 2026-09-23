@@ -96,6 +96,9 @@ async fn inspect(mut response: Response) -> anyhow::Result<(u16, Value, Option<&
         "payload-secret",
         "actor-private",
         "resource-private",
+        "correlation-private",
+        "request-private",
+        "operation-private",
         "postgres://",
     ] {
         assert!(!raw.contains(secret));
@@ -269,12 +272,48 @@ async fn seed(
         (tenant, "three", pg),
         (other, "foreign", pg),
     ] {
-        let p = owner
-            .prepare(event(t, "http", id, b"payload-secret".to_vec())?, control)
-            .await?;
+        let p = owner.prepare(private_event(t, id)?, control).await?;
         committed(owner.append(&p, control).await)?;
     }
     Ok(())
+}
+fn private_event(tenant: TenantId, id: &str) -> anyhow::Result<AuditEventV1> {
+    Ok(AuditEventV1::new(
+        RecordIdentity::new(
+            tenant,
+            SourceIdentity::new(
+                SourceId::parse("http")?,
+                SourceContract::new(
+                    ContractId::parse("fixture.operation")?,
+                    ContractVersion::from_major(1)?,
+                    SchemaDigest::parse(
+                        "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                    )?,
+                ),
+            ),
+            EventId::parse(id)?,
+        ),
+        EventFacts::new(
+            ActorRef::new(ActorKind::parse("user")?, ActorId::parse("actor-private")?),
+            Action::parse("updated")?,
+            ResourceRef::new(
+                ResourceKind::parse("device")?,
+                ResourceId::parse("resource-private")?,
+            ),
+            Outcome::Succeeded,
+            Timepoint::try_from(123_i64)?,
+        ),
+        EventContext::new(
+            Coordinates::new(
+                Some(rss_diag_context::CorrelationId::parse(
+                    "correlation-private",
+                )?),
+                Some(rss_request_context::RequestId::parse("request-private")?),
+                Some(OperationId::parse("operation-private")?),
+            ),
+            AuditPayload::new(b"payload-secret".to_vec())?,
+        ),
+    ))
 }
 async fn boundary(
     app: &Router,
