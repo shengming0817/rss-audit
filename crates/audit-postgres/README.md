@@ -52,8 +52,13 @@ HMAC, chain ordering and key admission remain owned by RSS ledger.
 `read_page(Cursor, ReadLimit, control)` uses a separate monotonic Audit position. It structurally
 checks bytes and index metadata without authentication. Supply 1..=1024 rows and a positive
 canonical-byte budget. SQL preflights the complete selected page before returning payloads;
-oversized pages return no partial rows. The cursor advances after the final returned row;
-an empty page has no cursor. Appends between calls may appear: this is not a multi-page snapshot.
+oversized pages return no partial rows. The first statement captures the tenant head as a fixed inclusive upper bound. Continuations
+use `Cursor::resume(tenant, after, through)` with `after < through`; the last page has no cursor.
+New appends, including queries auditing themselves, cannot prolong that enumeration. A future
+upper bound is invalid input; missing records within the range fail closed. This is not a
+multi-page MVCC snapshot or an authenticated checkpoint. `AuditTransaction::read_page` uses
+this same implementation for atomic query/append composition. The uncommitted `Cursor::after`
+API is replaced without an alias.
 
 With `ledger`, `read_verified(tenant, Sequence, ledger::ReadLimit, control)` authenticates a window
 and checks its Audit-row association. Its budget charges ledger encoded bytes, including the

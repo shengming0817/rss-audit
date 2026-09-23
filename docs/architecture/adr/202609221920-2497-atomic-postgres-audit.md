@@ -28,6 +28,9 @@ Fresh schema 通过固定 definer 函数追加，runtime 只有 SELECT/EXECUTE�
 稳定文本 ID 使用 C collation。按 Audit → ledger → business/outbox 顺序加锁，避免循环等待。
 
 普通页按独立 Cursor 返回结构校验记录；SQL 在返回 payload 前检查整页行数及 canonical 字节预算。
+#2500 将普通分页统一为首屏固定上界：后续追加不延长本轮遍历，末页直接结束；这不是跨请求
+MVCC snapshot 或完整性证明。Cursor::resume 替换未承诺的 Cursor::after，不保留兼容入口。
+事务内 read_page 与独立读取共用唯一 SQL，支持同事务查询审计。
 账本页使用独立 Sequence/编码字节预算，包含 predecessor 开销，并组合 core 窗口验证。两个结果
 不共用 cursor 或完整性声明。窗口认证不代表全部 Audit 历史、未截尾、外部 checkpoint 或来源真实性。
 

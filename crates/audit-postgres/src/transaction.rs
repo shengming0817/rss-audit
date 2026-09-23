@@ -51,6 +51,19 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
         };
         repository::finish(self.tx, request, existing, ledger).await
     }
+    /// Read within this transaction's tenant and the first page's fixed upper bound.
+    pub async fn read_page(
+        &mut self,
+        cursor: crate::Cursor,
+        limit: crate::ReadLimit,
+    ) -> Result<crate::Page, Error> {
+        self.control
+            .check(rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation)?;
+        if cursor.tenant() != self.tenant {
+            return Err(Error::ScopeMismatch);
+        }
+        repository::page(self.tx, cursor, limit).await
+    }
     /// Borrow trusted SQL; transaction control and tenant/session mutation are forbidden.
     /// The connection cannot escape the callback. This is not a SQL sandbox.
     /// The callback's error type is returned unchanged, without formatting bounds.
