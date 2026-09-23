@@ -40,7 +40,7 @@ def ensure_external(path: Path) -> None:
     require(ROOT not in resolved.parents, "consumer output must be outside the repository")
 
 
-def manifest(dependency: str, scenario: str = "core", adapter: str = "") -> str:
+def manifest(dependency: str, scenario: str = "core", adapter: str = "", http: str = "") -> str:
     result = f'''[workspace]
 resolver = "3"
 
@@ -70,7 +70,14 @@ anyhow = "1"
     for feature in features:
         package = "rss-ledger-postgres" if feature == "ledger" else "rss-transactional-messaging-postgres"
         result += f'{package} = {{ git = "{RSS_URL}", rev = "{RSS_REVISION}", default-features = false }}\n'
-    result += '\n[features]\nledger = []\nmessaging = []\n'
+    if scenario == "http":
+        result += f'''rss-audit-http-axum = {{ {http} }}
+axum = {{ version = "=0.8.9", default-features = false, features = ["json", "query", "tokio", "http1"] }}
+serde_json = "1"
+reqwest = {{ version = "0.13", default-features = false, features = ["json"] }}
+'''
+        result = result.replace('"macros", "time"]', '"macros", "time", "net"]')
+    result += '\n[features]\nledger = []\nmessaging = []\nhttp = []\n'
     return result
 
 
@@ -99,7 +106,7 @@ def check_metadata(metadata: dict, revision: str | None, scenario: str = "core")
     workspace_members = set(metadata["workspace_members"])
     rss_packages = [package for package in packages if package["name"].startswith("rss-") or package["name"] == "testkit"]
     for package in rss_packages:
-        if package["name"] in ("rss-audit-core", "rss-audit-postgres"):
+        if package["name"] in ("rss-audit-core", "rss-audit-postgres", "rss-audit-http-axum"):
             if revision:
                 require(package["source"] == f"git+{AUDIT_URL}?rev={revision}#{revision}", "mixed Audit source")
             else:
@@ -118,9 +125,13 @@ def check_metadata(metadata: dict, revision: str | None, scenario: str = "core")
         adapter = next(package for package in packages if package["name"] == "rss-audit-postgres")
         expected = {name for name in ("ledger", "messaging") if name in scenario}
         require(set(nodes[adapter["id"]]["features"]) == expected, "Audit adapter feature drift")
+    if scenario == "http":
+        require("rss-audit-http-axum" in names, "missing HTTP adapter")
+        http_adapter = next(package for package in packages if package["name"] == "rss-axum")
+        require(not nodes[http_adapter["id"]]["features"], "HTTP consumer enabled managed serving")
     for package in packages:
         if package["source"] is None and package["id"] not in workspace_members:
-            require(package["name"] in ("rss-audit-core", "rss-audit-postgres") and not revision, "unexpected external path")
+            require(package["name"] in ("rss-audit-core", "rss-audit-postgres", "rss-audit-http-axum") and not revision, "unexpected external path")
 
 
 def execution_environment(fetch_environment: dict[str, str]) -> dict[str, str]:
@@ -149,10 +160,16 @@ def run_case(output: Path, revision: str | None, scenario: str, target: Path) ->
         f'git = "{AUDIT_URL}", rev = "{revision}", default-features = false'
         if revision else f'path = "{ROOT / "crates/audit-postgres"}", default-features = false'
     )
-    (output / "Cargo.toml").write_text(manifest(dependency, scenario, adapter))
+    http = (
+        f'git = "{AUDIT_URL}", rev = "{revision}", default-features = false'
+        if revision else f'path = "{ROOT / "crates/audit-http-axum"}", default-features = false'
+    )
+    (output / "Cargo.toml").write_text(manifest(dependency, scenario, adapter, http))
     (output / ".cargo/config.toml").write_text("[net]\ngit-fetch-with-cli = true\n")
     shutil.copyfile(ROOT / "tests/consumers" / ("core.rs" if scenario == "core" else "postgres.rs"), output / "src/main.rs")
 
+    if scenario == "http":
+        shutil.copytree(ROOT / "tests/consumers/http-host", output / "src/http-host")
     fetch_env = dict(os.environ)
     fetch_env["CARGO_TARGET_DIR"] = str(target)
     fetch_env["RSS_TEST_RUN_ID"] = f"audit-consumer-{uuid.uuid4().hex}"
@@ -162,6 +179,8 @@ def run_case(output: Path, revision: str | None, scenario: str, target: Path) ->
     subprocess.run(["cargo", "fetch", "--locked"], cwd=output, env=fetch_env, check=True)
     run_env = execution_environment(fetch_env)
     features = [name for name in ("ledger", "messaging") if name in scenario]
+    if scenario == "http":
+        features.append("http")
     arguments = ["--features", ",".join(features)] if features else []
     metadata = json.loads(
         subprocess.check_output(
@@ -178,7 +197,7 @@ def run_case(output: Path, revision: str | None, scenario: str, target: Path) ->
 def run(output: Path, revision: str | None) -> None:
     ensure_external(output)
     output.mkdir(mode=0o700)
-    for scenario in ("core", "pg", "ledger", "messaging", "ledger-messaging"):
+    for scenario in ("core", "pg", "ledger", "messaging", "ledger-messaging", "http"):
         run_case(output / scenario, revision, scenario, output / "target")
 
 

@@ -120,16 +120,20 @@ pub(crate) async fn page(
         .bind(cursor.after)
         .bind(limit.rows)
         .bind(limit.bytes)
+        .bind(cursor.through)
         .fetch_all(c)
         .await?;
+    let mut through = -1;
     let mut records = Vec::new();
     let mut bytes = 0_i64;
     for row in rows {
         match row.try_get::<i32, _>("status")? {
             0 => {}
             1 => return Err(Error::ReadBudgetExceeded),
+            3 => return Err(Error::InvalidBound),
             _ => return Err(Error::StorageContract),
         }
+        through = row.try_get("through")?;
         if row.try_get::<Option<i64>, _>("position")?.is_none() {
             continue;
         }
@@ -147,7 +151,8 @@ pub(crate) async fn page(
     }
     let next = records
         .last()
-        .map(|r| Cursor::after(cursor.tenant(), r.position()))
+        .filter(|r| r.position < through)
+        .map(|r| Cursor::resume(cursor.tenant(), r.position(), through as u64))
         .transpose()?;
     Ok(Page { records, next })
 }

@@ -7,18 +7,32 @@ use rss_request_context::TenantId;
 pub struct Cursor {
     tenant: TenantId,
     pub(crate) after: i64,
+    pub(crate) through: Option<i64>,
 }
 impl Cursor {
     /// Start before the first persisted record.
     pub const fn start(tenant: TenantId) -> Self {
-        Self { tenant, after: -1 }
+        Self {
+            tenant,
+            after: -1,
+            through: None,
+        }
     }
-    /// Resume strictly after an already observed position.
-    pub fn after(tenant: TenantId, position: u64) -> Result<Self, Error> {
+    /// Resume within the original inclusive upper bound. This is navigation, not evidence.
+    pub fn resume(tenant: TenantId, position: u64, through: u64) -> Result<Self, Error> {
+        if position >= through {
+            return Err(Error::InvalidBound);
+        }
         Ok(Self {
             tenant,
             after: i64::try_from(position).map_err(|_| Error::InvalidBound)?,
+            through: Some(i64::try_from(through).map_err(|_| Error::InvalidBound)?),
         })
+    }
+    /// Continuation coordinates, absent for a fresh first page.
+    pub fn continuation(self) -> Option<(u64, u64)> {
+        self.through
+            .map(|through| (self.after as u64, through as u64))
     }
     /// Tenant bound into this cursor.
     pub const fn tenant(self) -> TenantId {
@@ -84,7 +98,7 @@ impl StagedAppend {
     }
 }
 
-/// Complete bounded ordinary page. Appends between pages may be visible on the next page.
+/// Complete ordinary page within a fixed first-page upper bound; not an MVCC snapshot.
 #[derive(Debug)]
 pub struct Page {
     pub(crate) records: Vec<Record>,
@@ -95,7 +109,7 @@ impl Page {
     pub fn records(&self) -> &[Record] {
         &self.records
     }
-    /// Resume after the last returned row, or no advance for an empty page.
+    /// Resume within the fixed upper bound; absent on the final or empty page.
     pub const fn next(&self) -> Option<Cursor> {
         self.next
     }

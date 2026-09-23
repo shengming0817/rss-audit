@@ -13,6 +13,10 @@ use sqlx::{
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "http")]
+#[path = "http-host/mod.rs"]
+mod http_host;
+
 struct HostClock;
 impl Clock for HostClock {
     fn now(&self) -> Instant {
@@ -162,6 +166,8 @@ async fn run() -> anyhow::Result<()> {
     );
     #[cfg(feature = "messaging")]
     borrowed(&store, &request, &admin, &fixture).await?;
+    #[cfg(feature = "http")]
+    http_host::run(store.clone(), tenant).await?;
     pool.close().await;
     admin.close().await;
     drop(fixture);

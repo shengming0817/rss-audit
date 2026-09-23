@@ -1,6 +1,6 @@
 use crate::{
     AuditTransaction, Control, Cursor, Error, Page, ReadLimit, StagedAppend, TransactionError,
-    probe, repository,
+    probe,
 };
 use futures::future::BoxFuture;
 use rss_audit_core::{AuditEventV1, PreparedAuditV1};
@@ -125,7 +125,7 @@ impl PgAudit {
     ) -> LocalTxAttempt<Committed<Page>, Error> {
         audit_only(
             self.local_tx(cursor.tenant(), control, move |tx| {
-                Box::pin(async move { repository::page(tx.tx, cursor, limit).await })
+                Box::pin(async move { tx.read_page(cursor, limit).await })
             })
             .await,
         )

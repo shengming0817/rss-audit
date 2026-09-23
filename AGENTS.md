@@ -1,6 +1,6 @@
 # RSS Audit 协作说明
 
-rss-audit 提供可嵌入 Rust 产品的审计记录协议及后续 PostgreSQL、HTTP 适配。当前边界见
+rss-audit 提供可嵌入 Rust 产品的审计记录协议、PostgreSQL 持久化与租户内 HTTP 适配。当前边界见
 [#2495 ADR](docs/architecture/adr/202609220001-2495-embedded-audit.md)。
 
 ## 工作方式

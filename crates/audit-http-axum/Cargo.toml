@@ -1,0 +1,30 @@
+[package]
+name = "rss-audit-http-axum"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Tenant-scoped bounded audit queries for host-owned Axum applications"
+
+[dependencies]
+rss-audit-core.workspace = true
+rss-audit-postgres.workspace = true
+rss-axum.workspace = true
+rss-contract.workspace = true
+rss-request-context.workspace = true
+rss-transactional-messaging.workspace = true
+axum.workspace = true
+serde.workspace = true
+base64.workspace = true
+serde_urlencoded = "0.7"
+tokio-util.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tower.workspace = true
+sqlx.workspace = true
+
+[lints]
+workspace = true

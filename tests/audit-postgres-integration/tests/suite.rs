@@ -18,7 +18,9 @@ use std::{
 use tokio_util::sync::CancellationToken;
 mod admission;
 mod atomicity;
+mod http;
 mod messaging;
+mod paging;
 mod reads;
 
 struct TestClock;
@@ -145,15 +147,28 @@ async fn run() -> anyhow::Result<()> {
     );
     let plain = PgAudit::new(pool.clone(), Integrity::Plain, &control).await?;
     let ledger = PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), &control).await?;
-    basic(&plain, &ledger, &control).await?;
-    atomicity::run(&plain, &ledger, &admin, &control).await?;
-    reads::run(&plain, &ledger, &admin, &control).await?;
-    messaging::run(&plain, &ledger, &admin, &fixture, &control).await?;
-    admission::run(&plain, &pool, &admin, &control).await?;
+    exercise(&plain, &ledger, &pool, &admin, &fixture, &control).await?;
     pool.close().await;
     admin.close().await;
     drop(fixture);
     drop(network);
+    Ok(())
+}
+async fn exercise(
+    plain: &PgAudit,
+    ledger: &PgAudit,
+    pool: &PgPool,
+    admin: &PgPool,
+    fixture: &testkit::PgTlsFixture,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    basic(plain, ledger, control).await?;
+    atomicity::run(plain, ledger, admin, control).await?;
+    reads::run(plain, ledger, admin, control).await?;
+    paging::run(plain, admin, control).await?;
+    messaging::run(plain, ledger, admin, fixture, control).await?;
+    http::run(plain, ledger, pool, admin, control).await?;
+    admission::run(plain, pool, admin, control).await?;
     Ok(())
 }
 async fn install(admin: &PgPool) -> anyhow::Result<()> {
@@ -231,17 +246,17 @@ async fn basic_pages(plain: &PgAudit, control: &Control<'_, TestClock>) -> anyho
     let t = tenant()?;
     let page = committed(
         plain
-            .read_page(Cursor::start(t), ReadLimit::new(2, 10000)?, control)
+            .read_page(Cursor::start(t), ReadLimit::new(1, 10000)?, control)
             .await,
     )?;
-    assert_eq!(page.records().len(), 2);
+    assert_eq!(page.records().len(), 1);
     rolled_back(
         plain
             .read_page(Cursor::start(t), ReadLimit::new(2, 1)?, control)
             .await,
         |e| matches!(e, Error::ReadBudgetExceeded),
     );
-    let empty = committed(
+    let last = committed(
         plain
             .read_page(
                 page.next()
@@ -251,6 +266,7 @@ async fn basic_pages(plain: &PgAudit, control: &Control<'_, TestClock>) -> anyho
             )
             .await,
     )?;
-    assert!(empty.records().is_empty());
+    assert_eq!(last.records().len(), 1);
+    assert!(last.next().is_none());
     Ok(())
 }
