@@ -60,6 +60,15 @@ class ConsumerEnvironmentTests(unittest.TestCase):
             self.assertEqual("rss-ledger-postgres" in manifest["dependencies"], "ledger" in expected)
             self.assertEqual("rss-transactional-messaging-postgres" in manifest["dependencies"], "messaging" in expected)
 
+    def test_http_consumer_declares_only_plain_adapter_features(self) -> None:
+        import tomllib
+        manifest = tomllib.loads(CHECKER.manifest('path = "/tmp/core"', "http", 'path = "/tmp/pg", default-features = false', 'path = "/tmp/http", default-features = false'))
+        self.assertEqual(manifest["dependencies"]["rss-audit-postgres"]["features"], [])
+        self.assertFalse(manifest["dependencies"]["rss-audit-http-axum"]["default-features"])
+        self.assertIn("http1", manifest["dependencies"]["axum"]["features"])
+        self.assertNotIn("rss-ledger-postgres", manifest["dependencies"])
+        self.assertNotIn("rss-transactional-messaging-postgres", manifest["dependencies"])
+
 
 if __name__ == "__main__":
     unittest.main()

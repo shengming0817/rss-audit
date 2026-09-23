@@ -11,6 +11,11 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sy
 anyhow.workspace = true
 
 [dev-dependencies]
+rss-audit-http-axum.workspace = true
+axum.workspace = true
+tower.workspace = true
+serde_json.workspace = true
+base64.workspace = true
 rss-audit-core.workspace = true
 rss-audit-postgres = { workspace = true, features = ["ledger", "messaging", "integration"] }
 rss-ledger.workspace = true

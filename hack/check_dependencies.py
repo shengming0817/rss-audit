@@ -11,6 +11,7 @@ RSS_URL = "https://dev.azure.com/shengming0923/rss/_git/rss"
 RSS_REVISION = "c752578e1b5e30724b8e81726a62553211b66dd5"
 RSS_ROOTS = {
     "rss-contract",
+    "rss-axum",
     "rss-diag-context",
     "rss-ledger",
     "rss-redact",
@@ -90,6 +91,7 @@ def main() -> None:
     expected_features["rss-transactional-messaging"] = {"default", "producer", "consumer"}
     expected_features["rss-transactional-messaging-postgres"] = {"default", "integration", "test-support"}
     expected_features["testkit"] = {"containers"}
+    expected_features["rss-axum"] = set()
     require(
         feature_sets == expected_features,
         f"RSS feature closure drift: {feature_sets}",

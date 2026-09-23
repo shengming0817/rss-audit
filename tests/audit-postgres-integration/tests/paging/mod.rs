@@ -44,6 +44,15 @@ pub(super) async fn run(
         cursor.is_none(),
         "query audit must not extend this enumeration"
     );
+    invalid_and_missing(pg, admin, tenant, control).await
+}
+
+async fn invalid_and_missing(
+    pg: &PgAudit,
+    admin: &PgPool,
+    tenant: TenantId,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
     let fresh = committed(
         pg.read_page(Cursor::start(tenant), ReadLimit::new(10, 131072)?, control)
             .await,
