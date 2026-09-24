@@ -583,6 +583,7 @@ fn assert_entry(body: &Value, tenant: TenantId, position: usize, id: &str) {
     assert_eq!(body["integrity"], "unverified");
     assert_eq!(body.as_object().map(|v| v.len()), Some(4));
     let entry = &body["entries"][0];
+    assert_eq!(entry["outcome"], "succeeded");
     assert_eq!(body["entries"].as_array().map(|v| v.len()), Some(1));
     assert_eq!(
         entry

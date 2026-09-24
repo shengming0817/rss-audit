@@ -28,14 +28,7 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
         #[cfg(feature = "ledger")]
         if let Integrity::Ledger(auth) = self.integrity {
             let clock = crate::control::LedgerClock(self.control.timer, self.control.timer.now());
-            let budget = rss_ledger_postgres::Control::new(
-                &clock,
-                self.control
-                    .deadline
-                    .instant()
-                    .saturating_duration_since(clock.1),
-                self.control.cancel,
-            );
+            let budget = clock.budget(self.control);
             rss_ledger_postgres::lock_head_in_transaction(
                 self.tx,
                 auth,
@@ -54,10 +47,7 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
         self.control
             .run(
                 rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
-                async {
-                    crate::probe::tenant(self.tx, self.tenant).await?;
-                    repository::prepare(self.tx, event).await
-                },
+                repository::prepare(self.tx, event, Some(self.tenant)),
             )
             .await
     }
@@ -91,14 +81,7 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
             Integrity::Ledger(auth) => {
                 let clock =
                     crate::control::LedgerClock(self.control.timer, self.control.timer.now());
-                let budget = rss_ledger_postgres::Control::new(
-                    &clock,
-                    self.control
-                        .deadline
-                        .instant()
-                        .saturating_duration_since(clock.1),
-                    self.control.cancel,
-                );
+                let budget = clock.budget(self.control);
                 let staged = rss_ledger_postgres::append_in_transaction(
                     self.tx,
                     auth,
@@ -136,6 +119,17 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
     }
     /// Borrow trusted SQL and scoped host inputs together; neither can escape the callback.
     /// This has the same SQL/session restrictions as `with_connection`.
+    ///
+    /// ```compile_fail
+    /// use rss_audit_postgres::{AuditTransaction, Error};
+    /// use rss_request_context::ExecutionTimer;
+    /// async fn escape<T: ExecutionTimer>(tx: &mut AuditTransaction<'_, '_, '_, T>) {
+    ///     let mut context = String::new();
+    ///     let escaped = tx.with_connection_context(&mut context, |context, connection| {
+    ///         Box::pin(async move { Ok::<_, Error>((context, connection)) })
+    ///     }).await;
+    /// }
+    /// ```
     pub async fn with_connection_context<R: Send, E: Send, C: Send, F>(
         &mut self,
         context: &mut C,
@@ -156,20 +150,9 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
             return Err(Error::IntegrityRequired);
         };
         crate::probe::tenant(self.tx, self.tenant).await?;
-        let id = rss_ledger::LedgerId::new(
-            self.tenant,
-            rss_ledger::ChainId::parse(rss_audit_core::AUDIT_CHAIN_ID)
-                .map_err(rss_audit_core::Error::from)?,
-        );
+        let id = crate::runtime::ledger_id(self.tenant)?;
         let clock = crate::control::LedgerClock(self.control.timer, self.control.timer.now());
-        let budget = rss_ledger_postgres::Control::new(
-            &clock,
-            self.control
-                .deadline
-                .instant()
-                .saturating_duration_since(clock.1),
-            self.control.cancel,
-        );
+        let budget = clock.budget(self.control);
         let window = rss_ledger_postgres::read_window_in_transaction(
             self.tx, auth, &id, start, limit, &budget,
         )

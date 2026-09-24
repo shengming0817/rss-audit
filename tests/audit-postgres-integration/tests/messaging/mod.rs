@@ -38,12 +38,7 @@ impl PgConsumerEffect<Vec<u8>> for Effect {
             .find_in(tx, identity)
             .await
             .map_err(PgConsumerEffectFailure::infrastructure)?;
-        if let Some(prior) = prior {
-            assert_eq!(
-                prior.prepared().canonical_bytes(),
-                self.request.canonical_bytes()
-            );
-        }
+        assert!(prior.is_none());
         self.store
             .append_in(tx, &self.request)
             .await
@@ -138,15 +133,26 @@ pub(super) async fn run(
         ("borrowed-ledger", ledger.clone()),
     ] {
         let e = event(tenant()?, mode, "prepared-in-owner", vec![3])?;
+        let identity = e.identity().clone();
+        let writer = store.clone();
+        let prepared = runtime
+            .local_tx(tenant()?, deadline()?, move |tx| {
+                Box::pin(async move {
+                    writer.lock_head_in(tx).await?;
+                    assert!(writer.find_in(tx, e.identity()).await?.is_none());
+                    let prepared = writer.prepare_in(tx, e).await?;
+                    assert!(writer.append_in(tx, &prepared).await?.inserted());
+                    Ok(prepared)
+                })
+            })
+            .await
+            .fold(Ok, Err, Err, Err, Err, Err)?;
+        let replay = store.clone();
         runtime
             .local_tx(tenant()?, deadline()?, move |tx| {
                 Box::pin(async move {
-                    store.lock_head_in(tx).await?;
-                    let identity = e.identity().clone();
-                    assert!(store.find_in(tx, &identity).await?.is_none());
-                    let prepared = store.prepare_in(tx, e).await?;
-                    store.append_in(tx, &prepared).await?;
-                    let found = store
+                    replay.lock_head_in(tx).await?;
+                    let found = replay
                         .find_in(tx, &identity)
                         .await?
                         .ok_or(rss_audit_postgres::Error::StorageContract)?;
@@ -154,6 +160,50 @@ pub(super) async fn run(
                         found.prepared().canonical_bytes(),
                         prepared.canonical_bytes()
                     );
+                    assert!(!replay.append_in(tx, found.prepared()).await?.inserted());
+                    Ok(())
+                })
+            })
+            .await
+            .fold(Ok, Err, Err, Err, Err, Err)?;
+        let wrong = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d480")?;
+        let foreign = event(wrong, "scope", "foreign", vec![])?;
+        runtime
+            .local_tx(tenant()?, deadline()?, move |tx| {
+                Box::pin(async move {
+                    assert!(matches!(
+                        store.find_in(tx, foreign.identity()).await,
+                        Err(rss_audit_postgres::Error::ScopeMismatch)
+                    ));
+                    assert!(matches!(
+                        store.prepare_in(tx, foreign).await,
+                        Err(rss_audit_postgres::Error::ScopeMismatch)
+                    ));
+                    tx.with_connection(move |c| {
+                        Box::pin(async move {
+                            sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
+                                .bind(wrong.to_string())
+                                .execute(c)
+                                .await?;
+                            Ok(())
+                        })
+                    })
+                    .await?;
+                    assert!(matches!(
+                        store.lock_head_in(tx).await,
+                        Err(rss_audit_postgres::Error::ScopeMismatch)
+                    ));
+                    let actual = tx.tenant_id();
+                    tx.with_connection(move |c| {
+                        Box::pin(async move {
+                            sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
+                                .bind(actual.to_string())
+                                .execute(c)
+                                .await?;
+                            Ok(())
+                        })
+                    })
+                    .await?;
                     Ok(())
                 })
             })

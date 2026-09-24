@@ -87,7 +87,8 @@ impl PgAudit {
         control
             .run(Stage::Operation, async {
                 let mut lease = Lease::new(self.pool.acquire().await?);
-                let prepared = crate::repository::prepare(&mut lease.connection, event).await?;
+                let prepared =
+                    crate::repository::prepare(&mut lease.connection, event, None).await?;
                 lease.confirmed = true;
                 Ok(prepared)
             })

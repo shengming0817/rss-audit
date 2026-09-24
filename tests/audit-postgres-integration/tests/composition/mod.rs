@@ -7,6 +7,22 @@ pub(super) async fn run(
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
     for (mode, store) in [("compose-plain", plain), ("compose-ledger", ledger)] {
+        let empty_tenant = TenantId::parse(if mode == "compose-plain" {
+            "f47ac10b-58cc-4372-a567-0e02b2c3d481"
+        } else {
+            "f47ac10b-58cc-4372-a567-0e02b2c3d482"
+        })?;
+        committed(store.local_tx(empty_tenant, control, move |tx| Box::pin(async move {
+            tx.lock_head().await?;
+            tx.lock_head().await?;
+            tx.with_connection(move |c| Box::pin(async move {
+                let position: Option<i64> = sqlx::query_scalar("SELECT position FROM rss_audit.heads WHERE tenant_id=$1::uuid").bind(empty_tenant.to_string()).fetch_one(&mut *c).await?;
+                assert_eq!(position, None);
+                let records: i64 = sqlx::query_scalar("SELECT count(*) FROM rss_audit.records WHERE tenant_id=$1::uuid").bind(empty_tenant.to_string()).fetch_one(c).await?;
+                assert_eq!(records, 0);
+                Ok::<_,Error>(())
+            })).await
+        })).await)?;
         let e = event(tenant()?, mode, "final-fact", vec![7])?;
         let identity = e.identity().clone();
         let recovered_identity = identity.clone();
@@ -99,9 +115,12 @@ pub(super) async fn single_connection(pool: &PgPool) -> anyhow::Result<()> {
         store
             .local_tx(tenant()?, &control, move |tx| {
                 Box::pin(async move {
-                    tx.find(e.identity()).await?;
-                    tx.prepare(e).await?;
-                    Ok::<_, Error>(())
+                    assert!(matches!(
+                        tx.find(e.identity()).await,
+                        Err(Error::ScopeMismatch)
+                    ));
+                    assert!(matches!(tx.prepare(e).await, Err(Error::ScopeMismatch)));
+                    Err::<(), Error>(Error::ScopeMismatch)
                 })
             })
             .await,

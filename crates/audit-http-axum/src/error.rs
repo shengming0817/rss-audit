@@ -43,12 +43,12 @@ fn attach(mut response: Response, attempt: Attempt) -> Response {
 }
 fn code(error: &TransactionError<Error>) -> SafeErrorCode {
     match error {
+        TransactionError::Audit(e) | TransactionError::Operation(e) if e.is_interrupted() => {
+            SafeErrorCode::Unavailable
+        }
         TransactionError::Audit(e) | TransactionError::Operation(e) => match e {
             Error::InvalidBound => SafeErrorCode::InvalidInput,
-            Error::Storage { .. }
-            | Error::Deadline(_)
-            | Error::Cancelled(_)
-            | Error::Admission(_) => SafeErrorCode::Unavailable,
+            Error::Storage { .. } | Error::Admission(_) => SafeErrorCode::Unavailable,
             _ => SafeErrorCode::Internal,
         },
         TransactionError::Rollback { .. } => SafeErrorCode::Unavailable,
@@ -99,6 +99,18 @@ mod tests {
             (Error::Conflict, 500),
             (Error::Deadline(Stage::Operation), 503),
             (Error::Cancelled(Stage::Operation), 503),
+            (
+                Error::Ledger(rss_ledger_postgres::Error::Deadline(Stage::Operation)),
+                503,
+            ),
+            (
+                Error::Ledger(rss_ledger_postgres::Error::Cancelled(Stage::Operation)),
+                503,
+            ),
+            (
+                Error::Ledger(rss_ledger_postgres::Error::StorageContract),
+                500,
+            ),
             (
                 Error::from(sqlx::Error::Protocol("credential-secret".into())),
                 503,

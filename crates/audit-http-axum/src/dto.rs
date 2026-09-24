@@ -51,12 +51,7 @@ fn entry(record: &Record) -> Result<EntryDto, Error> {
         source_id: event.identity().source().source_id().as_str().to_owned(),
         event_id: event.identity().event_id().as_str().to_owned(),
         action: facts.action().as_str().to_owned(),
-        outcome: match facts.outcome() {
-            Outcome::Succeeded => "succeeded",
-            Outcome::Denied => "denied",
-            Outcome::Failed => "failed",
-            Outcome::Unknown => "unknown",
-        },
+        outcome: outcome(facts.outcome()),
         occurred_at: facts.occurred_at().unix_seconds().to_string(),
         recorded_at: decoded.recorded_at().unix_seconds().to_string(),
         ledger: record.ledger_sequence().map(|sequence| LedgerDto {
@@ -65,4 +60,28 @@ fn entry(record: &Record) -> Result<EntryDto, Error> {
             sequence: sequence.to_string(),
         }),
     })
+}
+
+fn outcome(value: Outcome) -> &'static str {
+    match value {
+        Outcome::Succeeded => "succeeded",
+        Outcome::Denied => "denied",
+        Outcome::Failed => "failed",
+        Outcome::Unknown => "unknown",
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn outcome_wire_labels_preserve_unknown() {
+        for (value, expected) in [
+            (Outcome::Succeeded, "succeeded"),
+            (Outcome::Denied, "denied"),
+            (Outcome::Failed, "failed"),
+            (Outcome::Unknown, "unknown"),
+        ] {
+            assert_eq!(outcome(value), expected);
+        }
+    }
 }

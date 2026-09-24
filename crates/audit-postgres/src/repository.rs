@@ -15,7 +15,16 @@ pub(crate) async fn lock_head(c: &mut PgConnection, tenant: TenantId) -> Result<
 pub(crate) async fn prepare(
     c: &mut PgConnection,
     event: AuditEventV1,
+    tenant: Option<TenantId>,
 ) -> Result<PreparedAuditV1, Error> {
+    // Bound transactions share the live tenant/admission gate. Independent prepare
+    // only reads database time and does not claim a tenant-bound transaction.
+    if let Some(tenant) = tenant {
+        if event.identity().tenant() != tenant {
+            return Err(Error::ScopeMismatch);
+        }
+        probe::tenant(c, tenant).await?;
+    }
     let seconds: i64 =
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()))::bigint")
             .fetch_one(c)

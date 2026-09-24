@@ -61,31 +61,36 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
     wait_locked.await?;
     let short = Control::new(
         &clock,
-        Deadline::from_timeout(&clock, Duration::from_millis(100))?,
+        Deadline::from_timeout(&clock, Duration::from_millis(500))?,
         &cancel,
     );
     let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let entered = started.clone();
     let flag = reached.clone();
     let attempt = store
         .local_tx(tenant()?, &short, move |tx| {
             Box::pin(async move {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
                 tx.lock_head().await?;
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok::<_, Error>(())
             })
         })
         .await;
+    assert!(started.load(std::sync::atomic::Ordering::SeqCst));
     assert!(!reached.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(!attempt.fold(
-        |_| true,
+    assert!(attempt.fold(
         |_| false,
         |_| false,
+        |e| operation_deadline(&e),
+        |e| operation_deadline(&e),
         |_| false,
         |_| false,
-        |_| false
     ));
+    assert_head_locked(pool, false).await?;
     if ledger {
-        assert_ledger_locked(pool).await?;
+        assert_head_locked(pool, true).await?;
     }
     release
         .send(())
@@ -105,7 +110,7 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn assert_ledger_locked(pool: &PgPool) -> anyhow::Result<()> {
+async fn assert_head_locked(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(
         "SELECT set_config('rss.tenant_id',$1,true),set_config('lock_timeout','100ms',true)",
@@ -113,18 +118,38 @@ async fn assert_ledger_locked(pool: &PgPool) -> anyhow::Result<()> {
     .bind(tenant()?.to_string())
     .execute(&mut *tx)
     .await?;
-    let error =
+    let result = if ledger {
         sqlx::query("SELECT rss_ledger.prepare_append($1::uuid,$2,'audit-fixture',1::smallint)")
             .bind(tenant()?.to_string())
             .bind(AUDIT_CHAIN_ID)
             .execute(&mut *tx)
             .await
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("ledger head must already be locked"))?;
+    } else {
+        sqlx::query("SELECT rss_audit.reserve($1::uuid)")
+            .bind(tenant()?.to_string())
+            .execute(&mut *tx)
+            .await
+    };
+    let error = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("head must already be locked"))?;
     assert_eq!(
         error.as_database_error().and_then(|e| e.code()).as_deref(),
         Some("55P03")
     );
     tx.rollback().await?;
     Ok(())
+}
+
+fn operation_deadline(error: &TransactionError<Error>) -> bool {
+    match error {
+        TransactionError::Audit(Error::Deadline(
+            rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
+        ))
+        | TransactionError::Operation(Error::Deadline(
+            rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
+        )) => true,
+        TransactionError::Rollback { operation, .. } => operation_deadline(operation),
+        _ => false,
+    }
 }

@@ -59,3 +59,17 @@ impl<T: ExecutionTimer> rss_ledger_postgres::Timer for LedgerClock<'_, T> {
         self.0.sleep_until(Deadline::at(self.1 + cutoff)).await;
     }
 }
+
+#[cfg(feature = "ledger")]
+impl<T: ExecutionTimer> LedgerClock<'_, T> {
+    pub(crate) fn budget<'a>(
+        &'a self,
+        control: &'a Control<'_, T>,
+    ) -> rss_ledger_postgres::Control<'a, Self> {
+        rss_ledger_postgres::Control::new(
+            self,
+            control.deadline.instant().saturating_duration_since(self.1),
+            control.cancel,
+        )
+    }
+}

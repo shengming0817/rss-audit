@@ -1957,6 +1957,7 @@ dependencies = [
  "rss-audit-postgres",
  "rss-axum",
  "rss-contract",
+ "rss-ledger-postgres",
  "rss-request-context",
  "rss-transactional-messaging",
  "serde",

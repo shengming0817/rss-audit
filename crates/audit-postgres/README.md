@@ -108,3 +108,10 @@ operators can still alter storage; Audit provides no WORM, retention/hold, key c
 
 ref: launchbadge/sqlx sqlx-core/src/transaction.rs@v0.9.0
 ref: sea-ql/sea-orm TransactionError<E>@2.0.2 (typed callback error, not settlement authority)
+
+Tenant-bound lock, prepare, find and append calls recheck live tenant and storage admission
+on each public operation, including after trusted SQL callbacks. These checks deliberately
+include catalog reads; no cached admission replaces permission-revocation checks. The
+independent prepare operation only reads database time without binding a transaction tenant.
+`Error::is_interrupted()` classifies Audit and Ledger deadline/cancellation causes consistently;
+it does not prove rollback or authorize a retry.

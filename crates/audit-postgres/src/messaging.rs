@@ -35,13 +35,7 @@ impl PgAudit {
             return Err(Error::ScopeMismatch);
         }
         tx.with_connection(move |c| {
-            Box::pin(async move {
-                Ok(async {
-                    crate::probe::tenant(c, tenant).await?;
-                    repository::prepare(c, event).await
-                }
-                .await)
-            })
+            Box::pin(async move { Ok(repository::prepare(c, event, Some(tenant)).await) })
         })
         .await?
     }
