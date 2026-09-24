@@ -1,4 +1,5 @@
 use super::*;
+mod locking;
 
 pub(super) async fn run(
     plain: &PgAudit,
@@ -29,27 +30,33 @@ pub(super) async fn run(
                 })
                 .await,
         )?;
+        let mut recovered = Vec::new();
         committed(
             store
-                .local_tx(tenant()?, control, move |tx| {
-                    Box::pin(async move {
-                        tx.lock_head().await?;
-                        let r = tx
-                            .find(&recovered_identity)
-                            .await?
-                            .ok_or(Error::StorageContract)?;
-                        assert_eq!(r.prepared().canonical_bytes(), bytes);
-                        assert!(!tx.append(r.prepared()).await?.inserted());
-                        Ok::<_, Error>(())
-                    })
-                })
+                .local_tx_with_context(
+                    tenant()?,
+                    control,
+                    (&recovered_identity, &bytes, &mut recovered),
+                    |(identity, expected, recovered), tx| {
+                        Box::pin(async move {
+                            tx.lock_head().await?;
+                            let r = tx.find(identity).await?.ok_or(Error::StorageContract)?;
+                            assert_eq!(r.prepared().canonical_bytes(), expected.as_slice());
+                            recovered.extend_from_slice(r.prepared().canonical_bytes());
+                            assert!(!tx.append(r.prepared()).await?.inserted());
+                            Ok::<_, Error>(())
+                        })
+                    },
+                )
                 .await,
         )?;
+        assert_eq!(recovered, bytes);
     }
     Ok(())
 }
 
 pub(super) async fn single_connection(pool: &PgPool) -> anyhow::Result<()> {
+    locking::run(pool).await?;
     let one = PgPoolOptions::new()
         .max_connections(1)
         .connect_with(pool.connect_options().as_ref().clone())

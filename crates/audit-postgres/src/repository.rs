@@ -30,6 +30,13 @@ pub(crate) async fn find(
     identity: &RecordIdentity,
 ) -> Result<Option<Record>, Error> {
     probe::tenant(c, identity.tenant()).await?;
+    find_validated(c, identity).await
+}
+
+async fn find_validated(
+    c: &mut PgConnection,
+    identity: &RecordIdentity,
+) -> Result<Option<Record>, Error> {
     let row = sqlx::query("SELECT tenant_id::text,source_id,event_id,position,recorded_at,canonical,ledger_sequence FROM rss_audit.records WHERE tenant_id=$1::uuid AND source_id=$2 AND event_id=$3")
         .bind(identity.tenant().to_string()).bind(identity.source().source_id().as_str()).bind(identity.event_id().as_str())
         .fetch_optional(c).await?;
@@ -46,7 +53,7 @@ pub(crate) async fn reserve(
     let decoded = decode_untrusted(request.canonical_bytes())?;
     let identity = decoded.event().identity();
     lock_head(c, identity.tenant()).await?;
-    let existing = find(c, identity).await?;
+    let existing = find_validated(c, identity).await?;
     if let Some(record) = &existing
         && (record.prepared.canonical_bytes() != request.canonical_bytes()
             || record.ledger_sequence.is_some() != ledger)
