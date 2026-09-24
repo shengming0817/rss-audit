@@ -13,7 +13,7 @@ Concurrent appends, including self-audit, do not extend the enumeration; this is
 snapshot, authenticated checkpoint, or complete-history proof. Start a new query to see new records.
 
 The response is `{tenantId, integrity: "unverified", entries, nextCursor}`. Entries contain only
-`position`, `sourceId`, `eventId`, `action`, `outcome` (`succeeded|denied|failed`), `occurredAt`,
+`position`, `sourceId`, `eventId`, `action`, `outcome` (`succeeded|denied|failed|unknown`), `occurredAt`,
 `recordedAt`, and nullable `ledger: {chainId, recordId, sequence}`. All 64-bit values are canonical
 decimal strings; times are nonnegative Unix seconds. Position is not ledger sequence. Ledger
 coordinates do not authenticate records. Actor/resource references, correlation/request/operation
