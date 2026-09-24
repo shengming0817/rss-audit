@@ -187,16 +187,15 @@ impl From<sqlx::Error> for Error {
     }
 }
 
-// PostgreSQL SQLSTATE classes; unknown permanent failures must not become endless retries.
+// SQLSTATE classes also contain permanent protocol/configuration failures.
+// ref: PostgreSQL errcodes-appendix.html; postgres.c ProcessInterrupts timeout codes.
 fn database_failure(code: &str) -> StorageFailure {
-    if code.starts_with("08")
-        || code.starts_with("40")
-        || code.starts_with("53")
-        || matches!(code, "55P03" | "57014" | "57P01" | "57P02" | "57P03")
-    {
-        StorageFailure::Transient
-    } else {
-        StorageFailure::Permanent
+    match code {
+        "08000" | "08001" | "08003" | "08006" | "08007" | "40001" | "40P01" | "53200" | "53300"
+        | "55P03" | "57014" | "57P01" | "57P02" | "57P03" | "25P03" | "25P04" | "57P05" => {
+            StorageFailure::Transient
+        }
+        _ => StorageFailure::Permanent,
     }
 }
 
@@ -219,6 +218,18 @@ mod storage_tests {
             )));
             assert!(matches!(&error,Error::Storage {kind,..} if *kind==expected));
             assert!(!format!("{error:?}").contains("private-io-marker"));
+        }
+    }
+    #[test]
+    fn permanent_sqlstates_in_connection_rollback_and_resource_classes() {
+        for code in ["08P01", "08004", "40002", "53100", "53400", "ZZ999"] {
+            assert_eq!(database_failure(code), StorageFailure::Permanent, "{code}");
+        }
+    }
+    #[test]
+    fn server_timeout_disconnects_remain_recoverable() {
+        for code in ["25P03", "25P04", "57P05"] {
+            assert_eq!(database_failure(code), StorageFailure::Transient, "{code}");
         }
     }
     #[test]
