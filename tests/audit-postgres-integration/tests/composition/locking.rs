@@ -85,26 +85,7 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
         |_| false
     ));
     if ledger {
-        let mut tx = pool.begin().await?;
-        sqlx::query(
-            "SELECT set_config('rss.tenant_id',$1,true),set_config('lock_timeout','100ms',true)",
-        )
-        .bind(tenant()?.to_string())
-        .execute(&mut *tx)
-        .await?;
-        let error = sqlx::query(
-            "SELECT rss_ledger.prepare_append($1::uuid,$2,'audit-fixture',1::smallint)",
-        )
-        .bind(tenant()?.to_string())
-        .bind(AUDIT_CHAIN_ID)
-        .execute(&mut *tx)
-        .await
-        .expect_err("ledger head must already be locked");
-        assert_eq!(
-            error.as_database_error().and_then(|e| e.code()).as_deref(),
-            Some("55P03")
-        );
-        tx.rollback().await?;
+        assert_ledger_locked(pool).await?;
     }
     release
         .send(())
@@ -121,5 +102,29 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
             })
             .await,
     )?;
+    Ok(())
+}
+
+async fn assert_ledger_locked(pool: &PgPool) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "SELECT set_config('rss.tenant_id',$1,true),set_config('lock_timeout','100ms',true)",
+    )
+    .bind(tenant()?.to_string())
+    .execute(&mut *tx)
+    .await?;
+    let error =
+        sqlx::query("SELECT rss_ledger.prepare_append($1::uuid,$2,'audit-fixture',1::smallint)")
+            .bind(tenant()?.to_string())
+            .bind(AUDIT_CHAIN_ID)
+            .execute(&mut *tx)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("ledger head must already be locked"))?;
+    assert_eq!(
+        error.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("55P03")
+    );
+    tx.rollback().await?;
     Ok(())
 }
