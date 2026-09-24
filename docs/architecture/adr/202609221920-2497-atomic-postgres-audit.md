@@ -46,8 +46,7 @@ memory provider、HTTP 或来源产品改造。MDM #2498、Identity #2499、HTTP
 COMMIT 发送前暂停、真实 COMMIT 执行中断及 ACK 后丢失、后端终止、损坏和有界读取。
 真实在途证据由延迟约束触发器阻塞 COMMIT，并核对 pg_stat_activity 与阻塞 PID 后才中断；
 中断后的数据库结果可以是提交或回滚，恢复必须原字节重试并保持业务/Audit 原子性。
-source 与固定 Git consumer 在仓库祖先之外
-创建 workspace/lock/target，分别执行 core、plain PG、ledger、messaging、ledger+messaging。
-固定候选依赖验证不是 registry 发布证明；本仓验证不是产品 T3。
+core 行为由现有协议和 ledger 组合测试覆盖，plain PG、ledger 与 messaging 行为归现有 provider suite。
+真实 MDM/Identity 接入由消费产品验证，本仓 T1/T2 不代替产品 T3；日常选择遵循[验证范围](../../rules/verification-scope.md)。
 
 ref: launchbadge/sqlx sqlx-core/src/transaction.rs@v0.9.0
