@@ -55,7 +55,15 @@ impl From<Error> for PgError {
             Error::Conflict => MessagingErrorKind::Conflict,
             Error::Deadline(_) | Error::Cancelled(_) => MessagingErrorKind::DeadlineElapsed,
             Error::Admission(_) | Error::StorageContract => MessagingErrorKind::Invariant,
-            Error::Storage(_) | Error::Rollback { .. } => MessagingErrorKind::Transient,
+            Error::Storage {
+                kind: crate::StorageFailure::Transient,
+                ..
+            }
+            | Error::Rollback { .. } => MessagingErrorKind::Transient,
+            Error::Storage {
+                kind: crate::StorageFailure::Permanent,
+                ..
+            } => MessagingErrorKind::Permanent,
             Error::ScopeMismatch
             | Error::InvalidBound
             | Error::ReadBudgetExceeded

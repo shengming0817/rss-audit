@@ -17,7 +17,10 @@ neither their source nor the recording-time assertion. Source adapters remain tr
 `append` returns canonical `LocalTxAttempt<Committed<StagedAppend>, Error>`. Only the private
 `Committed` constructor follows an acknowledged database COMMIT. Successful staging, an error,
 an absent read, `CommitUnknown` and `RollbackFailed` are not rollback evidence. Retry the
-unchanged prepared request to serialize recovery. Database errors remain redacted.
+unchanged prepared request to serialize recovery. Database errors remain redacted. `Error::Storage { kind, source }` retains a closed
+`StorageFailure::{Transient,Permanent}` classification; permissions/schema failures require
+intervention, while connection interruption, contention and cancellation may be retried.
+The messaging conversion preserves that classification; neither class grants ACK authority.
 
 `local_tx(tenant, control, callback)` combines Audit with trusted business SQL via
 `AuditTransaction::with_connection`. A callback returning `Result<R, E>` produces

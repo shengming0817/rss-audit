@@ -148,6 +148,7 @@ async fn run() -> anyhow::Result<()> {
     let plain = PgAudit::new(pool.clone(), Integrity::Plain, &control).await?;
     let ledger = PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), &control).await?;
     exercise(&plain, &ledger, &pool, &admin, &fixture, &control).await?;
+    storage_classification(&pool).await?;
     pool.close().await;
     admin.close().await;
     drop(fixture);
@@ -268,5 +269,56 @@ async fn basic_pages(plain: &PgAudit, control: &Control<'_, TestClock>) -> anyho
     )?;
     assert_eq!(last.records().len(), 1);
     assert!(last.next().is_none());
+    Ok(())
+}
+
+async fn storage_classification(pool: &PgPool) -> anyhow::Result<()> {
+    use rss_audit_postgres::StorageFailure;
+    for sql in [
+        "SELECT private_missing_function_marker()",
+        "SELECT * FROM pg_authid",
+    ] {
+        let original = sqlx::query(sql)
+            .execute(pool)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected storage rejection"))?;
+        let error = Error::from(original);
+        assert!(matches!(
+            error,
+            Error::Storage {
+                kind: StorageFailure::Permanent,
+                ..
+            }
+        ));
+        assert!(!format!("{error:?}").contains("private_missing_function_marker"));
+        let messaging = rss_transactional_messaging_postgres::PgError::from(error);
+        assert_eq!(
+            messaging.kind(),
+            rss_transactional_messaging::error::MessagingErrorKind::Permanent
+        );
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout='10ms'")
+        .execute(&mut *tx)
+        .await?;
+    let original = sqlx::query("SELECT pg_sleep(1)")
+        .execute(&mut *tx)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected timeout"))?;
+    let error = Error::from(original);
+    assert!(matches!(
+        error,
+        Error::Storage {
+            kind: StorageFailure::Transient,
+            ..
+        }
+    ));
+    assert_eq!(
+        rss_transactional_messaging_postgres::PgError::from(error).kind(),
+        rss_transactional_messaging::error::MessagingErrorKind::Transient
+    );
+    tx.rollback().await?;
     Ok(())
 }

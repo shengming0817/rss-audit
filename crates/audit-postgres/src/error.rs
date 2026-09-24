@@ -18,6 +18,15 @@ pub enum AdmissionViolation {
     Shape,
 }
 
+/// Closed infrastructure retry classification; not transaction settlement evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFailure {
+    /// Connection interruption, resource contention or cancellation may recover.
+    Transient,
+    /// Permissions, schema, invalid queries or closed resources require intervention.
+    Permanent,
+}
+
 /// Operation failure. Settlement remains a separate canonical `LocalTxAttempt`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -61,7 +70,13 @@ pub enum Error {
     Messaging(#[from] rss_transactional_messaging_postgres::PgError),
     /// Provider error text is not exposed by formatting or source traversal.
     #[error("audit storage unavailable")]
-    Storage(#[source] RedactedSource),
+    Storage {
+        /// Safe classification; the host decides whether to stop or retry.
+        kind: StorageFailure,
+        /// Opaque diagnostics, never exposed through formatting or source traversal.
+        #[source]
+        source: RedactedSource,
+    },
     /// Rollback was not acknowledged; retain the operation and settlement failures.
     #[error("audit rollback unconfirmed")]
     Rollback {
@@ -145,7 +160,87 @@ impl From<sqlx::Error> for Error {
         match error.as_database_error().and_then(|e| e.code()).as_deref() {
             Some("PA001") => Self::ScopeMismatch,
             Some("PA002" | "23505" | "23514" | "23503") => Self::StorageContract,
-            _ => Self::Storage(RedactedSource::new(error)),
+            _ => {
+                let kind = match &error {
+                    sqlx::Error::Database(db) => db
+                        .code()
+                        .map_or(StorageFailure::Permanent, |code| database_failure(&code)),
+                    sqlx::Error::Io(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+                        ) =>
+                    {
+                        StorageFailure::Permanent
+                    }
+                    sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::WorkerCrashed => {
+                        StorageFailure::Transient
+                    }
+                    _ => StorageFailure::Permanent,
+                };
+                Self::Storage {
+                    kind,
+                    source: RedactedSource::new(error),
+                }
+            }
+        }
+    }
+}
+
+// SQLSTATE classes also contain permanent protocol/configuration failures.
+// ref: PostgreSQL errcodes-appendix.html; postgres.c ProcessInterrupts timeout codes.
+fn database_failure(code: &str) -> StorageFailure {
+    match code {
+        "08000" | "08001" | "08003" | "08006" | "08007" | "40001" | "40P01" | "53200" | "53300"
+        | "55P03" | "57014" | "57P01" | "57P02" | "57P03" | "25P03" | "25P04" | "57P05" => {
+            StorageFailure::Transient
+        }
+        _ => StorageFailure::Permanent,
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    #[test]
+    fn io_classification_keeps_permanent_data_errors_and_redacts_sources() {
+        for (io, expected) in [
+            (std::io::ErrorKind::InvalidData, StorageFailure::Permanent),
+            (std::io::ErrorKind::InvalidInput, StorageFailure::Permanent),
+            (
+                std::io::ErrorKind::ConnectionReset,
+                StorageFailure::Transient,
+            ),
+        ] {
+            let error = Error::from(sqlx::Error::Io(std::io::Error::new(
+                io,
+                "private-io-marker",
+            )));
+            assert!(matches!(&error,Error::Storage {kind,..} if *kind==expected));
+            assert!(!format!("{error:?}").contains("private-io-marker"));
+        }
+    }
+    #[test]
+    fn permanent_sqlstates_in_connection_rollback_and_resource_classes() {
+        for code in ["08P01", "08004", "40002", "53100", "53400", "ZZ999"] {
+            assert_eq!(database_failure(code), StorageFailure::Permanent, "{code}");
+        }
+    }
+    #[test]
+    fn server_timeout_disconnects_remain_recoverable() {
+        for code in ["25P03", "25P04", "57P05"] {
+            assert_eq!(database_failure(code), StorageFailure::Transient, "{code}");
+        }
+    }
+    #[test]
+    fn sqlstates_preserve_retryability_without_diagnostics() {
+        for code in ["42501", "42P01", "42883", "22012", "XX000"] {
+            assert_eq!(database_failure(code), StorageFailure::Permanent);
+        }
+        for code in [
+            "08006", "40001", "40P01", "53300", "55P03", "57014", "57P01",
+        ] {
+            assert_eq!(database_failure(code), StorageFailure::Transient);
         }
     }
 }
