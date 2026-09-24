@@ -18,6 +18,15 @@ pub enum AdmissionViolation {
     Shape,
 }
 
+/// Closed infrastructure retry classification; not transaction settlement evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFailure {
+    /// Connection interruption, resource contention or cancellation may recover.
+    Transient,
+    /// Permissions, schema, invalid queries or closed resources require intervention.
+    Permanent,
+}
+
 /// Operation failure. Settlement remains a separate canonical `LocalTxAttempt`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -61,7 +70,13 @@ pub enum Error {
     Messaging(#[from] rss_transactional_messaging_postgres::PgError),
     /// Provider error text is not exposed by formatting or source traversal.
     #[error("audit storage unavailable")]
-    Storage(#[source] RedactedSource),
+    Storage {
+        /// Safe classification; the host decides whether to stop or retry.
+        kind: StorageFailure,
+        /// Opaque diagnostics, never exposed through formatting or source traversal.
+        #[source]
+        source: RedactedSource,
+    },
     /// Rollback was not acknowledged; retain the operation and settlement failures.
     #[error("audit rollback unconfirmed")]
     Rollback {
@@ -145,7 +160,50 @@ impl From<sqlx::Error> for Error {
         match error.as_database_error().and_then(|e| e.code()).as_deref() {
             Some("PA001") => Self::ScopeMismatch,
             Some("PA002" | "23505" | "23514" | "23503") => Self::StorageContract,
-            _ => Self::Storage(RedactedSource::new(error)),
+            _ => {
+                let kind = match &error {
+                    sqlx::Error::Database(db) => db
+                        .code()
+                        .map_or(StorageFailure::Permanent, |code| database_failure(&code)),
+                    sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::WorkerCrashed => {
+                        StorageFailure::Transient
+                    }
+                    _ => StorageFailure::Permanent,
+                };
+                Self::Storage {
+                    kind,
+                    source: RedactedSource::new(error),
+                }
+            }
+        }
+    }
+}
+
+// PostgreSQL SQLSTATE classes; unknown permanent failures must not become endless retries.
+fn database_failure(code: &str) -> StorageFailure {
+    if code.starts_with("08")
+        || code.starts_with("40")
+        || code.starts_with("53")
+        || matches!(code, "55P03" | "57014" | "57P01" | "57P02" | "57P03")
+    {
+        StorageFailure::Transient
+    } else {
+        StorageFailure::Permanent
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    #[test]
+    fn sqlstates_preserve_retryability_without_diagnostics() {
+        for code in ["42501", "42P01", "42883", "22012", "XX000"] {
+            assert_eq!(database_failure(code), StorageFailure::Permanent);
+        }
+        for code in [
+            "08006", "40001", "40P01", "53300", "55P03", "57014", "57P01",
+        ] {
+            assert_eq!(database_failure(code), StorageFailure::Transient);
         }
     }
 }

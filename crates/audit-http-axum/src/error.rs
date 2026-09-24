@@ -45,9 +45,10 @@ fn code(error: &TransactionError<Error>) -> SafeErrorCode {
     match error {
         TransactionError::Audit(e) | TransactionError::Operation(e) => match e {
             Error::InvalidBound => SafeErrorCode::InvalidInput,
-            Error::Storage(_) | Error::Deadline(_) | Error::Cancelled(_) | Error::Admission(_) => {
-                SafeErrorCode::Unavailable
-            }
+            Error::Storage { .. }
+            | Error::Deadline(_)
+            | Error::Cancelled(_)
+            | Error::Admission(_) => SafeErrorCode::Unavailable,
             _ => SafeErrorCode::Internal,
         },
         TransactionError::Rollback { .. } => SafeErrorCode::Unavailable,
