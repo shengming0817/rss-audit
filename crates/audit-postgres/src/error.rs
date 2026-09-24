@@ -165,6 +165,14 @@ impl From<sqlx::Error> for Error {
                     sqlx::Error::Database(db) => db
                         .code()
                         .map_or(StorageFailure::Permanent, |code| database_failure(&code)),
+                    sqlx::Error::Io(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+                        ) =>
+                    {
+                        StorageFailure::Permanent
+                    }
                     sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::WorkerCrashed => {
                         StorageFailure::Transient
                     }
@@ -195,6 +203,24 @@ fn database_failure(code: &str) -> StorageFailure {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+    #[test]
+    fn io_classification_keeps_permanent_data_errors_and_redacts_sources() {
+        for (io, expected) in [
+            (std::io::ErrorKind::InvalidData, StorageFailure::Permanent),
+            (std::io::ErrorKind::InvalidInput, StorageFailure::Permanent),
+            (
+                std::io::ErrorKind::ConnectionReset,
+                StorageFailure::Transient,
+            ),
+        ] {
+            let error = Error::from(sqlx::Error::Io(std::io::Error::new(
+                io,
+                "private-io-marker",
+            )));
+            assert!(matches!(&error,Error::Storage {kind,..} if *kind==expected));
+            assert!(!format!("{error:?}").contains("private-io-marker"));
+        }
+    }
     #[test]
     fn sqlstates_preserve_retryability_without_diagnostics() {
         for code in ["42501", "42P01", "42883", "22012", "XX000"] {
