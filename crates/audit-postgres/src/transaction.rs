@@ -1,6 +1,6 @@
 use crate::{Control, Error, Integrity, StagedAppend, repository};
 use futures::future::BoxFuture;
-use rss_audit_core::PreparedAuditV1;
+use rss_audit_core::{AuditEventV1, PreparedAuditV1, RecordIdentity};
 use rss_request_context::{ExecutionTimer, TenantId};
 use sqlx::{PgConnection, Postgres, Transaction};
 
@@ -15,6 +15,56 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
     /// Fixed tenant of this transaction.
     pub const fn tenant_id(&self) -> TenantId {
         self.tenant
+    }
+    /// Acquire Audit then optional ledger locks before deriving business facts.
+    /// Does not append an event; only the original owner can settle this transaction.
+    pub async fn lock_head(&mut self) -> Result<(), Error> {
+        self.control
+            .run(
+                rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
+                repository::lock_head(self.tx, self.tenant),
+            )
+            .await?;
+        #[cfg(feature = "ledger")]
+        if let Integrity::Ledger(auth) = self.integrity {
+            let clock = crate::control::LedgerClock(self.control.timer, self.control.timer.now());
+            let budget = clock.budget(self.control);
+            rss_ledger_postgres::lock_head_in_transaction(
+                self.tx,
+                auth,
+                &crate::runtime::ledger_id(self.tenant)?,
+                &budget,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    /// Prepare exact bytes using PostgreSQL time on this connection and budget.
+    pub async fn prepare(&mut self, event: AuditEventV1) -> Result<PreparedAuditV1, Error> {
+        if event.identity().tenant() != self.tenant {
+            return Err(Error::ScopeMismatch);
+        }
+        self.control
+            .run(
+                rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
+                repository::prepare(self.tx, event, Some(self.tenant)),
+            )
+            .await
+    }
+    /// Read exact stored bytes. Absence alone is not rollback evidence.
+    pub async fn find(
+        &mut self,
+        identity: &RecordIdentity,
+    ) -> Result<Option<crate::Record>, Error> {
+        if identity.tenant() != self.tenant {
+            return Err(Error::ScopeMismatch);
+        }
+        self.control
+            .run(
+                rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
+                repository::find(self.tx, identity),
+            )
+            .await
     }
     /// Stage exact canonical bytes. Propagate any error to the enclosing owner.
     /// Acquire Audit before ledger before business/outbox locks.
@@ -31,14 +81,7 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
             Integrity::Ledger(auth) => {
                 let clock =
                     crate::control::LedgerClock(self.control.timer, self.control.timer.now());
-                let budget = rss_ledger_postgres::Control::new(
-                    &clock,
-                    self.control
-                        .deadline
-                        .instant()
-                        .saturating_duration_since(clock.1),
-                    self.control.cancel,
-                );
+                let budget = clock.budget(self.control);
                 let staged = rss_ledger_postgres::append_in_transaction(
                     self.tx,
                     auth,
@@ -71,7 +114,31 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
     where
         F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<R, E>> + Send,
     {
-        operation(self.tx).await
+        self.with_connection_context(&mut (), move |_, c| operation(c))
+            .await
+    }
+    /// Borrow trusted SQL and scoped host inputs together; neither can escape the callback.
+    /// This has the same SQL/session restrictions as `with_connection`.
+    ///
+    /// ```compile_fail
+    /// use rss_audit_postgres::{AuditTransaction, Error};
+    /// use rss_request_context::ExecutionTimer;
+    /// async fn escape<T: ExecutionTimer>(tx: &mut AuditTransaction<'_, '_, '_, T>) {
+    ///     let mut context = String::new();
+    ///     let escaped = tx.with_connection_context(&mut context, |context, connection| {
+    ///         Box::pin(async move { Ok::<_, Error>((context, connection)) })
+    ///     }).await;
+    /// }
+    /// ```
+    pub async fn with_connection_context<R: Send, E: Send, C: Send, F>(
+        &mut self,
+        context: &mut C,
+        operation: F,
+    ) -> Result<R, E>
+    where
+        F: for<'c> FnOnce(&'c mut C, &'c mut PgConnection) -> BoxFuture<'c, Result<R, E>> + Send,
+    {
+        operation(context, self.tx).await
     }
     #[cfg(feature = "ledger")]
     pub(crate) async fn verified(
@@ -83,20 +150,9 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
             return Err(Error::IntegrityRequired);
         };
         crate::probe::tenant(self.tx, self.tenant).await?;
-        let id = rss_ledger::LedgerId::new(
-            self.tenant,
-            rss_ledger::ChainId::parse(rss_audit_core::AUDIT_CHAIN_ID)
-                .map_err(rss_audit_core::Error::from)?,
-        );
+        let id = crate::runtime::ledger_id(self.tenant)?;
         let clock = crate::control::LedgerClock(self.control.timer, self.control.timer.now());
-        let budget = rss_ledger_postgres::Control::new(
-            &clock,
-            self.control
-                .deadline
-                .instant()
-                .saturating_duration_since(clock.1),
-            self.control.cancel,
-        );
+        let budget = clock.budget(self.control);
         let window = rss_ledger_postgres::read_window_in_transaction(
             self.tx, auth, &id, start, limit, &budget,
         )

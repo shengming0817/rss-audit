@@ -18,6 +18,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 mod admission;
 mod atomicity;
+mod composition;
 mod http;
 mod messaging;
 mod paging;
@@ -169,6 +170,8 @@ async fn exercise(
     paging::run(plain, admin, control).await?;
     messaging::run(plain, ledger, admin, fixture, control).await?;
     http::run(plain, ledger, pool, admin, control).await?;
+    composition::run(plain, ledger, control).await?;
+    composition::single_connection(pool).await?;
     admission::run(plain, pool, admin, control).await?;
     Ok(())
 }

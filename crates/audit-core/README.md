@@ -61,3 +61,7 @@ locked builds and cargo-deny provide the normal dependency checks.
 Use `decode_untrusted` only for structural decoding and `verify_window` when authenticating an
 exact ledger range. Both return the closed [`Error`](crate::Error) categories without
 including rejected values; callers retain ownership of retry policy, diagnostics and commit proof.
+
+`Outcome::Unknown` (V1 tag 4) records an unconfirmed source-operation outcome; it is not
+`Failed` or rollback evidence. Sources keep business events and per-request settlement
+identities separate, so resolving a request cannot overwrite a prior business event.

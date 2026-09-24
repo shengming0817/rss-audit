@@ -4,7 +4,6 @@ use crate::{
 };
 use futures::future::BoxFuture;
 use rss_audit_core::{AuditEventV1, PreparedAuditV1};
-use rss_contract::Timepoint;
 use rss_request_context::{ExecutionTimer, TenantId};
 use rss_transactional_messaging::transaction::{LocalTxAttempt, LocalTxDeadlineStage as Stage};
 use sqlx::{Acquire, PgPool, Postgres, pool::PoolConnection};
@@ -88,13 +87,8 @@ impl PgAudit {
         control
             .run(Stage::Operation, async {
                 let mut lease = Lease::new(self.pool.acquire().await?);
-                let seconds: i64 = sqlx::query_scalar(
-                    "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint",
-                )
-                .fetch_one(&mut *lease.connection)
-                .await?;
-                let recorded = Timepoint::try_from(seconds).map_err(|_| Error::StorageContract)?;
-                let prepared = rss_audit_core::prepare(event, recorded)?;
+                let prepared =
+                    crate::repository::prepare(&mut lease.connection, event, None).await?;
                 lease.confirmed = true;
                 Ok(prepared)
             })
@@ -169,6 +163,24 @@ impl PgAudit {
         F: for<'a> FnOnce(&'a mut AuditTransaction<'_, '_, '_, T>) -> BoxFuture<'a, Result<R, E>>
             + Send,
     {
+        self.local_tx_with_context(tenant, control, (), move |_, tx| operation(tx))
+            .await
+    }
+    /// Execute with borrowed product inputs without requiring static captures or changing ownership.
+    pub async fn local_tx_with_context<T: ExecutionTimer, R: Send, E: Send, C: Send, F>(
+        &self,
+        tenant: TenantId,
+        control: &Control<'_, T>,
+        mut context: C,
+        operation: F,
+    ) -> LocalTxAttempt<Committed<R>, TransactionError<E>>
+    where
+        F: for<'a> FnOnce(
+                &'a mut C,
+                &'a mut AuditTransaction<'_, '_, '_, T>,
+            ) -> BoxFuture<'a, Result<R, E>>
+            + Send,
+    {
         let connection = match control
             .run(Stage::Acquire, async { Ok(self.pool.acquire().await?) })
             .await
@@ -193,12 +205,15 @@ impl PgAudit {
         let body = match body {
             Ok(()) => control
                 .run(Stage::Operation, async {
-                    Ok(operation(&mut AuditTransaction {
-                        tx: &mut tx,
-                        control,
-                        integrity: &self.integrity,
-                        tenant,
-                    })
+                    Ok(operation(
+                        &mut context,
+                        &mut AuditTransaction {
+                            tx: &mut tx,
+                            control,
+                            integrity: &self.integrity,
+                            tenant,
+                        },
+                    )
                     .await)
                 })
                 .await
@@ -308,4 +323,13 @@ fn audit_only<R>(
         |e| LocalTxAttempt::commit_unknown(e.into_audit()),
         |e| LocalTxAttempt::fenced(e.into_audit()),
     )
+}
+
+#[cfg(feature = "ledger")]
+pub(crate) fn ledger_id(tenant: TenantId) -> Result<rss_ledger::LedgerId, Error> {
+    Ok(rss_ledger::LedgerId::new(
+        tenant,
+        rss_ledger::ChainId::parse(rss_audit_core::AUDIT_CHAIN_ID)
+            .map_err(rss_audit_core::Error::from)?,
+    ))
 }

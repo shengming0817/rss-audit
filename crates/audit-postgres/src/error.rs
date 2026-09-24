@@ -87,6 +87,21 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// The Audit or Ledger operation was interrupted by its deadline or cancellation.
+    /// This classifies the cause only; it does not establish rollback or retry safety.
+    pub fn is_interrupted(&self) -> bool {
+        match self {
+            Self::Deadline(_) | Self::Cancelled(_) => true,
+            #[cfg(feature = "ledger")]
+            Self::Ledger(
+                rss_ledger_postgres::Error::Deadline(_) | rss_ledger_postgres::Error::Cancelled(_),
+            ) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Failure of an Audit-owned transaction with the host's original operation error.
 /// Settlement authority remains in `LocalTxAttempt`, never in this error value.
 /// Formatting and source traversal do not expose the host error; match `Operation`
@@ -202,6 +217,21 @@ fn database_failure(code: &str) -> StorageFailure {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+    #[cfg(feature = "ledger")]
+    #[test]
+    fn ledger_interruptions_share_audit_cause_classification() {
+        let stage = LocalTxDeadlineStage::Operation;
+        for error in [
+            Error::Deadline(stage),
+            Error::Cancelled(stage),
+            Error::Ledger(rss_ledger_postgres::Error::Deadline(stage)),
+            Error::Ledger(rss_ledger_postgres::Error::Cancelled(stage)),
+        ] {
+            assert!(error.is_interrupted());
+        }
+        assert!(!Error::Ledger(rss_ledger_postgres::Error::StorageContract).is_interrupted());
+        assert!(!Error::Conflict.is_interrupted());
+    }
     #[test]
     fn io_classification_keeps_permanent_data_errors_and_redacts_sources() {
         for (io, expected) in [

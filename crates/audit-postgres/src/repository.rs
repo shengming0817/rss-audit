@@ -1,7 +1,58 @@
 use crate::{Cursor, Error, Page, ReadLimit, Record, StagedAppend, probe};
-use rss_audit_core::{PreparedAuditV1, decode_untrusted};
+use rss_audit_core::{AuditEventV1, PreparedAuditV1, RecordIdentity, decode_untrusted};
 use rss_request_context::TenantId;
 use sqlx::{PgConnection, Row, postgres::PgRow};
+
+pub(crate) async fn lock_head(c: &mut PgConnection, tenant: TenantId) -> Result<(), Error> {
+    probe::tenant(c, tenant).await?;
+    sqlx::query("SELECT rss_audit.reserve($1::uuid)")
+        .bind(tenant.to_string())
+        .execute(c)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn prepare(
+    c: &mut PgConnection,
+    event: AuditEventV1,
+    tenant: Option<TenantId>,
+) -> Result<PreparedAuditV1, Error> {
+    // Bound transactions share the live tenant/admission gate. Independent prepare
+    // only reads database time and does not claim a tenant-bound transaction.
+    if let Some(tenant) = tenant {
+        if event.identity().tenant() != tenant {
+            return Err(Error::ScopeMismatch);
+        }
+        probe::tenant(c, tenant).await?;
+    }
+    let seconds: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()))::bigint")
+            .fetch_one(c)
+            .await?;
+    let recorded =
+        rss_contract::Timepoint::try_from(seconds).map_err(|_| Error::StorageContract)?;
+    Ok(rss_audit_core::prepare(event, recorded)?)
+}
+
+pub(crate) async fn find(
+    c: &mut PgConnection,
+    identity: &RecordIdentity,
+) -> Result<Option<Record>, Error> {
+    probe::tenant(c, identity.tenant()).await?;
+    find_validated(c, identity).await
+}
+
+async fn find_validated(
+    c: &mut PgConnection,
+    identity: &RecordIdentity,
+) -> Result<Option<Record>, Error> {
+    let row = sqlx::query("SELECT tenant_id::text,source_id,event_id,position,recorded_at,canonical,ledger_sequence FROM rss_audit.records WHERE tenant_id=$1::uuid AND source_id=$2 AND event_id=$3")
+        .bind(identity.tenant().to_string()).bind(identity.source().source_id().as_str()).bind(identity.event_id().as_str())
+        .fetch_optional(c).await?;
+    row.as_ref()
+        .map(|r| decode(r, identity.tenant()))
+        .transpose()
+}
 
 pub(crate) async fn reserve(
     c: &mut PgConnection,
@@ -10,18 +61,8 @@ pub(crate) async fn reserve(
 ) -> Result<Option<Record>, Error> {
     let decoded = decode_untrusted(request.canonical_bytes())?;
     let identity = decoded.event().identity();
-    probe::tenant(c, identity.tenant()).await?;
-    sqlx::query("SELECT rss_audit.reserve($1::uuid)")
-        .bind(identity.tenant().to_string())
-        .execute(&mut *c)
-        .await?;
-    let row=sqlx::query("SELECT tenant_id::text,source_id,event_id,position,recorded_at,canonical,ledger_sequence FROM rss_audit.records WHERE tenant_id=$1::uuid AND source_id=$2 AND event_id=$3")
-        .bind(identity.tenant().to_string()).bind(identity.source().source_id().as_str()).bind(identity.event_id().as_str())
-        .fetch_optional(&mut *c).await?;
-    let existing = row
-        .as_ref()
-        .map(|r| decode(r, identity.tenant()))
-        .transpose()?;
+    lock_head(c, identity.tenant()).await?;
+    let existing = find_validated(c, identity).await?;
     if let Some(record) = &existing
         && (record.prepared.canonical_bytes() != request.canonical_bytes()
             || record.ledger_sequence.is_some() != ledger)

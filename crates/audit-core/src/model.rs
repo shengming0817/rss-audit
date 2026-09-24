@@ -25,6 +25,8 @@ pub enum Outcome {
     Denied,
     /// The operation failed without succeeding.
     Failed,
+    /// The source operation has not obtained a confirmed outcome.
+    Unknown,
 }
 
 impl Outcome {
@@ -33,6 +35,7 @@ impl Outcome {
             Self::Succeeded => 1,
             Self::Denied => 2,
             Self::Failed => 3,
+            Self::Unknown => 4,
         }
     }
 
@@ -41,12 +44,14 @@ impl Outcome {
             1 => Some(Self::Succeeded),
             2 => Some(Self::Denied),
             3 => Some(Self::Failed),
+            4 => Some(Self::Unknown),
             _ => None,
         }
     }
 }
 
 /// Stable tenant, source and event identity.
+#[derive(Clone)]
 pub struct RecordIdentity {
     tenant: TenantId,
     source: SourceIdentity,

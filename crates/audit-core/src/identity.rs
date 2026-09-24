@@ -53,6 +53,7 @@ fn validate_reference(value: &str, field: Field) -> Result<Box<str>, Error> {
 macro_rules! token_type {
     ($name:ident, $field:expr, $max:expr, $lower:expr, $doc:literal) => {
         #[doc = $doc]
+        #[derive(Clone)]
         pub struct $name(Box<str>);
 
         impl $name {
@@ -82,6 +83,7 @@ macro_rules! token_type {
 macro_rules! reference_type {
     ($name:ident, $field:expr, $doc:literal) => {
         #[doc = $doc]
+        #[derive(Clone)]
         pub struct $name(Box<str>);
 
         impl $name {
@@ -162,6 +164,7 @@ reference_type!(
 );
 
 /// Exact source contract identity carried with a record.
+#[derive(Clone)]
 pub struct SourceContract {
     id: ContractId,
     version: ContractVersion,
@@ -209,6 +212,7 @@ impl std::fmt::Debug for SourceContract {
 }
 
 /// Producer and source contract identity.
+#[derive(Clone)]
 pub struct SourceIdentity {
     source_id: SourceId,
     contract: SourceContract,
