@@ -1,10 +1,65 @@
 use crate::{Error, Integrity, PgAudit, StagedAppend, repository};
-use rss_audit_core::PreparedAuditV1;
+use rss_audit_core::{AuditEventV1, PreparedAuditV1, RecordIdentity};
 use rss_redact::RedactedSource;
 use rss_transactional_messaging::error::MessagingErrorKind;
 use rss_transactional_messaging_postgres::{PgError, PgTransaction};
 
 impl PgAudit {
+    /// Acquire Audit and optional ledger locks before business/outbox locks.
+    /// Borrows the original owner; no event, connection acquisition or settlement occurs.
+    pub async fn lock_head_in(&self, tx: &mut PgTransaction<'_>) -> Result<(), Error> {
+        let tenant = tx.tenant_id();
+        tx.with_connection(move |c| {
+            Box::pin(async move { Ok(repository::lock_head(c, tenant).await) })
+        })
+        .await??;
+        #[cfg(feature = "ledger")]
+        if let Integrity::Ledger(auth) = &self.integrity {
+            rss_ledger_postgres::lock_head_in(
+                tx,
+                auth.clone(),
+                &crate::runtime::ledger_id(tenant)?,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    /// Prepare from database time on the message owner's connection and remaining budget.
+    pub async fn prepare_in(
+        &self,
+        tx: &mut PgTransaction<'_>,
+        event: AuditEventV1,
+    ) -> Result<PreparedAuditV1, Error> {
+        let tenant = tx.tenant_id();
+        if event.identity().tenant() != tenant {
+            return Err(Error::ScopeMismatch);
+        }
+        tx.with_connection(move |c| {
+            Box::pin(async move {
+                Ok(async {
+                    crate::probe::tenant(c, tenant).await?;
+                    repository::prepare(c, event).await
+                }
+                .await)
+            })
+        })
+        .await?
+    }
+    /// Read by stable identity without interpreting absence as rollback evidence.
+    pub async fn find_in(
+        &self,
+        tx: &mut PgTransaction<'_>,
+        identity: &RecordIdentity,
+    ) -> Result<Option<crate::Record>, Error> {
+        if identity.tenant() != tx.tenant_id() {
+            return Err(Error::ScopeMismatch);
+        }
+        let identity = identity.clone();
+        tx.with_connection(move |c| {
+            Box::pin(async move { Ok(repository::find(c, &identity).await) })
+        })
+        .await?
+    }
     /// Stage Audit in the message owner's actual connection and remaining budget.
     /// Does not acquire from this adapter's pool, change GUCs, begin or settle.
     /// Return failures to the message owner; only its receipt can authorize ACK.

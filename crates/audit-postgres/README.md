@@ -45,6 +45,21 @@ It does not use this Audit object's pool. Its result is staged; only the origina
 can settle Inbox/business/Audit/ledger together and mint ACK authority. Return failures through
 that owner; original `PgError` classification, including ownership loss, is preserved.
 
+## Facts derived inside a transaction
+
+Call `AuditTransaction::lock_head` or `PgAudit::lock_head_in` before business/outbox
+locks. They acquire Audit first, then the fixed Audit ledger chain in Ledger mode,
+without writing an event. Failures propagate to the original owner; Ledger never
+falls back to Plain. An empty head is allowed and allocates no event position.
+
+After deriving final facts, `AuditTransaction::prepare` or `PgAudit::prepare_in`
+uses database time on the already borrowed connection, avoiding a second pool lease.
+Persist exact canonical bytes in the product receipt and append in that same transaction.
+`find` / `find_in` retrieves a record by stable identity, including stored integrity mode;
+it is a structural read, not ledger verification or a commit/rollback receipt.
+Absence alone does not settle a previous attempt. Product recovery must first serialize
+with the previous transaction and use a fresh snapshot before making recovery decisions.
+
 ## Integrity and reads
 
 Stable identity is `(tenant, source_id, event_id)`. Exact bytes and stored integrity mode

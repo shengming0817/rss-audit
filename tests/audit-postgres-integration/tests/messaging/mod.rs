@@ -27,6 +27,24 @@ impl PgConsumerEffect<Vec<u8>> for Effect {
         _: OperationDeadline,
     ) -> Result<TerminalDisposition, PgConsumerEffectFailure> {
         self.store
+            .lock_head_in(tx)
+            .await
+            .map_err(PgConsumerEffectFailure::infrastructure)?;
+        let decoded = decode_untrusted(self.request.canonical_bytes())
+            .map_err(PgConsumerEffectFailure::infrastructure)?;
+        let identity = decoded.event().identity();
+        let prior = self
+            .store
+            .find_in(tx, identity)
+            .await
+            .map_err(PgConsumerEffectFailure::infrastructure)?;
+        if let Some(prior) = prior {
+            assert_eq!(
+                prior.prepared().canonical_bytes(),
+                self.request.canonical_bytes()
+            );
+        }
+        self.store
             .append_in(tx, &self.request)
             .await
             .map_err(PgConsumerEffectFailure::infrastructure)?;
@@ -115,6 +133,33 @@ pub(super) async fn run(
         )
         .await?,
     );
+    for (mode, store) in [
+        ("borrowed-plain", plain.clone()),
+        ("borrowed-ledger", ledger.clone()),
+    ] {
+        let e = event(tenant()?, mode, "prepared-in-owner", vec![3])?;
+        runtime
+            .local_tx(tenant()?, deadline()?, move |tx| {
+                Box::pin(async move {
+                    store.lock_head_in(tx).await?;
+                    let identity = e.identity().clone();
+                    assert!(store.find_in(tx, &identity).await?.is_none());
+                    let prepared = store.prepare_in(tx, e).await?;
+                    store.append_in(tx, &prepared).await?;
+                    let found = store
+                        .find_in(tx, &identity)
+                        .await?
+                        .ok_or(rss_audit_postgres::Error::StorageContract)?;
+                    assert_eq!(
+                        found.prepared().canonical_bytes(),
+                        prepared.canonical_bytes()
+                    );
+                    Ok(())
+                })
+            })
+            .await
+            .fold(Ok, Err, Err, Err, Err, Err)?;
+    }
     let inbox = PgInboxStore::new(
         runtime.clone(),
         LeaseRenewalPolicy::from_ttl(Duration::from_secs(30))?,

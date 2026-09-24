@@ -142,7 +142,11 @@ fn canonical_v1_matches_independent_golden_bytes() -> Result<(), Box<dyn std::er
 #[test]
 fn golden_v1_fixes_every_outcome_tag() -> Result<(), Box<dyn std::error::Error>> {
     const OUTCOME_OFFSET: usize = 251;
-    for (outcome, expected_tag) in [(Outcome::Denied, 2), (Outcome::Failed, 3)] {
+    for (outcome, expected_tag) in [
+        (Outcome::Denied, 2),
+        (Outcome::Failed, 3),
+        (Outcome::Unknown, 4),
+    ] {
         let mut expected = golden_v1()?;
         expected[OUTCOME_OFFSET] = expected_tag;
         let prepared = prepare(
@@ -160,6 +164,10 @@ fn golden_v1_fixes_every_outcome_tag() -> Result<(), Box<dyn std::error::Error>>
             Timepoint::try_from(1_726_000_001_i64)?,
         )?;
         assert_eq!(prepared.canonical_bytes(), expected);
+        assert_eq!(
+            decode_untrusted(&expected)?.event().facts().outcome(),
+            outcome
+        );
     }
     Ok(())
 }

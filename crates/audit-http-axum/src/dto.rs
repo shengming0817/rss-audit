@@ -55,6 +55,7 @@ fn entry(record: &Record) -> Result<EntryDto, Error> {
             Outcome::Succeeded => "succeeded",
             Outcome::Denied => "denied",
             Outcome::Failed => "failed",
+            Outcome::Unknown => "unknown",
         },
         occurred_at: facts.occurred_at().unix_seconds().to_string(),
         recorded_at: decoded.recorded_at().unix_seconds().to_string(),
