@@ -40,6 +40,17 @@ pub(super) async fn run(
                     |(identity, expected, recovered), tx| {
                         Box::pin(async move {
                             tx.lock_head().await?;
+                            tx.with_connection_context(recovered, |buffer, c| {
+                                Box::pin(async move {
+                                    let marker: i32 =
+                                        sqlx::query_scalar("SELECT 1").fetch_one(c).await?;
+                                    assert_eq!(marker, 1);
+                                    assert!(buffer.is_empty());
+                                    Ok::<_, sqlx::Error>(())
+                                })
+                            })
+                            .await
+                            .map_err(Error::from)?;
                             let r = tx.find(identity).await?.ok_or(Error::StorageContract)?;
                             assert_eq!(r.prepared().canonical_bytes(), expected.as_slice());
                             recovered.extend_from_slice(r.prepared().canonical_bytes());

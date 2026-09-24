@@ -131,7 +131,20 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
     where
         F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<R, E>> + Send,
     {
-        operation(self.tx).await
+        self.with_connection_context(&mut (), move |_, c| operation(c))
+            .await
+    }
+    /// Borrow trusted SQL and scoped host inputs together; neither can escape the callback.
+    /// This has the same SQL/session restrictions as `with_connection`.
+    pub async fn with_connection_context<R: Send, E: Send, C: Send, F>(
+        &mut self,
+        context: &mut C,
+        operation: F,
+    ) -> Result<R, E>
+    where
+        F: for<'c> FnOnce(&'c mut C, &'c mut PgConnection) -> BoxFuture<'c, Result<R, E>> + Send,
+    {
+        operation(context, self.tx).await
     }
     #[cfg(feature = "ledger")]
     pub(crate) async fn verified(
