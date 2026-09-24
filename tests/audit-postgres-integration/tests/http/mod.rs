@@ -118,6 +118,7 @@ pub(super) async fn run(
     let app = router::<Session, _, _>(pg.clone(), Policy, TestClock);
     let cancel = CancellationToken::new();
     boundary(&app, tenant, &cancel).await?;
+    unaudited_page(&app, admin, tenant, &cancel).await?;
     pages(pg, &app, tenant, other, &cancel, control).await?;
     routes(&app, tenant, &cancel).await?;
     self_audit_failures(pg, &app, tenant, &cancel, control).await?;
@@ -125,6 +126,36 @@ pub(super) async fn run(
     interruptions(pg, admin, other, false).await?;
     interruptions(pg, admin, other, true).await?;
     unavailable(pool, other, &cancel, control).await?;
+    Ok(())
+}
+async fn unaudited_page(
+    app: &Router,
+    admin: &PgPool,
+    tenant: TenantId,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    let count_sql = "SELECT count(*) FROM rss_audit.records WHERE tenant_id=$1::uuid";
+    let before: i64 = sqlx::query_scalar(count_sql)
+        .bind(tenant.to_string())
+        .fetch_one(admin)
+        .await?;
+    let (status, body, outcome) = inspect(
+        app.clone()
+            .oneshot(request(
+                "/api/v2/audit/entries?limit=1",
+                Some(session(tenant)),
+                Some(budget(cancel)?),
+            )?)
+            .await?,
+    )
+    .await?;
+    assert_eq!((status, outcome), (200, Some("committed")));
+    assert_entry(&body, tenant, 0, "one");
+    let after: i64 = sqlx::query_scalar(count_sql)
+        .bind(tenant.to_string())
+        .fetch_one(admin)
+        .await?;
+    assert_eq!(after, before);
     Ok(())
 }
 async fn self_audit_failures(

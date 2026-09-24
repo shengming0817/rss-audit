@@ -9,7 +9,7 @@ rss-audit 提供可嵌入 Rust 产品的审计记录协议、PostgreSQL 持久�
 - 修改前读取目标文件和 `docs/rules/*.md`，用 `rg` 搜索已有实现；提交采用 Conventional Commits。
 - 行为变化同步更新所属文档，只修改当前需求需要的内容。
 - RSS 依赖只允许同一仓库 URL与固定完整 commit；禁止跨仓 path、浮动 branch/tag、源码复制或双来源。
-- 本地 worktree、临时 consumer 和验证产物使用 `.git/info/exclude` 或仓库外目录，不强制加入 Git。
+- 本地 worktree 和验证产物使用 `.git/info/exclude` 或仓库外目录，不强制加入 Git。
 
 ## 安全与范围
 
@@ -19,5 +19,8 @@ rss-audit 提供可嵌入 Rust 产品的审计记录协议、PostgreSQL 持久�
 
 ## 验证
 
-本仓检查入口为 `make ci`。独立 consumer 必须使用仓库祖先之外的 workspace、lock 和 target。
-PostgreSQL T2 由本仓 provider 集成测试验证；产品 T3 仍由消费产品独立持有。
+日常开发与 PR 收尾按[验证范围](docs/rules/verification-scope.md)运行受影响检查和必要集成，复用缓存与
+有效结果，修复后只复验失败项及受影响行为；不因提交或流程阶段变化重复全量验证。
+`make ci` 保留为完整检查入口。依赖通过 Cargo manifest/lock、locked 构建及 cargo-deny 管理。
+不建设内部拆包的独立 consumer、artifact 或 commit 来源证明，不默认运行容量压测。
+PostgreSQL T2 由本仓 provider 集成测试验证；真实 MDM/Identity 接入及产品 T3 由消费产品持有。
