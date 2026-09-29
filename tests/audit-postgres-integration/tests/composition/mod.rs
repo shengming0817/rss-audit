@@ -1,20 +1,21 @@
 use super::*;
 mod locking;
+mod readonly;
 
 pub(super) async fn run(
     plain: &PgAudit,
     ledger: &PgAudit,
+    admin: &PgPool,
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
+    readonly::run(plain, ledger, admin, control).await?;
     for (mode, store) in [("compose-plain", plain), ("compose-ledger", ledger)] {
         let empty_tenant = TenantId::parse(if mode == "compose-plain" {
             "f47ac10b-58cc-4372-a567-0e02b2c3d481"
         } else {
             "f47ac10b-58cc-4372-a567-0e02b2c3d482"
         })?;
-        committed(store.local_tx(empty_tenant, control, move |tx| Box::pin(async move {
-            tx.lock_head().await?;
-            tx.lock_head().await?;
+        committed(store.write_tx_with_context(empty_tenant, control, (), move |_, tx| Box::pin(async move {
             tx.with_connection(move |c| Box::pin(async move {
                 let position: Option<i64> = sqlx::query_scalar("SELECT position FROM rss_audit.heads WHERE tenant_id=$1::uuid").bind(empty_tenant.to_string()).fetch_one(&mut *c).await?;
                 assert_eq!(position, None);
@@ -28,10 +29,8 @@ pub(super) async fn run(
         let recovered_identity = identity.clone();
         let bytes = committed(
             store
-                .local_tx(tenant()?, control, move |tx| {
+                .write_tx_with_context(tenant()?, control, (), move |_, tx| {
                     Box::pin(async move {
-                        tx.lock_head().await?;
-                        tx.lock_head().await?;
                         assert!(tx.find(&identity).await?.is_none());
                         // Facts may now be derived from business SQL on the same connection.
                         let prepared = tx.prepare(e).await?;
@@ -49,13 +48,12 @@ pub(super) async fn run(
         let mut recovered = Vec::new();
         committed(
             store
-                .local_tx_with_context(
+                .write_tx_with_context(
                     tenant()?,
                     control,
                     (&recovered_identity, &bytes, &mut recovered),
                     |(identity, expected, recovered), tx| {
                         Box::pin(async move {
-                            tx.lock_head().await?;
                             tx.with_connection_context(recovered, |buffer, c| {
                                 Box::pin(async move {
                                     let marker: i32 =
@@ -90,18 +88,14 @@ pub(super) async fn single_connection(pool: &PgPool) -> anyhow::Result<()> {
         .await?;
     let clock = TestClock;
     let cancel = CancellationToken::new();
-    let control = Control::new(
-        &clock,
-        Deadline::from_timeout(&clock, Duration::from_secs(5))?,
-        &cancel,
-    );
+    let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(5))?;
+    let control = Control::new(&clock, cutoff, cutoff, &cancel);
     let store = PgAudit::new(one.clone(), Integrity::Ledger(auth()?), &control).await?;
     let e = event(tenant()?, "single-connection", "id", vec![4])?;
     committed(
         store
-            .local_tx(tenant()?, &control, move |tx| {
+            .write_tx_with_context(tenant()?, &control, (), move |_, tx| {
                 Box::pin(async move {
-                    tx.lock_head().await?;
                     let p = tx.prepare(e).await?;
                     tx.append(&p).await?;
                     Ok::<_, Error>(())
@@ -113,7 +107,7 @@ pub(super) async fn single_connection(pool: &PgPool) -> anyhow::Result<()> {
     let e = event(wrong, "scope", "id", vec![])?;
     rolled_back(
         store
-            .local_tx(tenant()?, &control, move |tx| {
+            .write_tx_with_context(tenant()?, &control, (), move |_, tx| {
                 Box::pin(async move {
                     assert!(matches!(
                         tx.find(e.identity()).await,

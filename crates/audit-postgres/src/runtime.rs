@@ -1,12 +1,12 @@
 use crate::{
-    AuditTransaction, Control, Cursor, Error, Page, ReadLimit, StagedAppend, TransactionError,
-    probe,
+    Control, Cursor, Error, Page, ReadAuditTransaction, ReadLimit, StagedAppend, TransactionError,
+    WriteAuditTransaction, probe,
 };
 use futures::future::BoxFuture;
 use rss_audit_core::{AuditEventV1, PreparedAuditV1};
 use rss_request_context::{ExecutionTimer, TenantId};
 use rss_transactional_messaging::transaction::{LocalTxAttempt, LocalTxDeadlineStage as Stage};
-use sqlx::{Acquire, PgPool, Postgres, pool::PoolConnection};
+use sqlx::{Acquire, Connection, PgConnection, PgPool, Postgres, pool::PoolConnection};
 
 /// Explicit integrity mode. There is no fallback from ledger failure to plain persistence.
 #[derive(Clone)]
@@ -102,10 +102,12 @@ impl PgAudit {
     ) -> LocalTxAttempt<Committed<StagedAppend>, Error> {
         let request = request.clone();
         audit_only(
-            self.local_tx(
+            self.transact(
                 request.append_request().ledger().tenant(),
                 control,
-                move |tx| Box::pin(async move { tx.append(&request).await }),
+                Access::Append,
+                (),
+                move |_, tx| Box::pin(async move { tx.append(&request).await }),
             )
             .await,
         )
@@ -118,9 +120,13 @@ impl PgAudit {
         control: &Control<'_, T>,
     ) -> LocalTxAttempt<Committed<Page>, Error> {
         audit_only(
-            self.local_tx(cursor.tenant(), control, move |tx| {
-                Box::pin(async move { tx.read_page(cursor, limit).await })
-            })
+            self.transact(
+                cursor.tenant(),
+                control,
+                Access::ReadOperation,
+                (),
+                move |_, tx| Box::pin(async move { tx.read_page(cursor, limit).await }),
+            )
             .await,
         )
     }
@@ -135,49 +141,70 @@ impl PgAudit {
         control: &Control<'_, T>,
     ) -> LocalTxAttempt<Committed<rss_audit_core::VerifiedAuditWindow>, Error> {
         audit_only(
-            self.local_tx(tenant, control, move |tx| {
+            self.transact(tenant, control, Access::ReadOperation, (), move |_, tx| {
                 Box::pin(async move { tx.verified(start, limit).await })
             })
             .await,
         )
     }
-    /// Execute Audit and trusted business SQL in one tenant-bound transaction.
-    /// Every stage inherits the same absolute deadline; unconfirmed leases are retired.
-    /// The callback's original error is retained in `TransactionError::Operation`.
-    /// An unacknowledged rollback additionally retains its separate settlement failure.
-    ///
-    /// ```compile_fail
-    /// use rss_audit_postgres::{AuditTransaction, Error};
-    /// use rss_request_context::ExecutionTimer;
-    /// async fn escape<T: ExecutionTimer>(tx: &mut AuditTransaction<'_, '_, '_, T>) {
-    ///     let connection = tx.with_connection(|c| Box::pin(async move { Ok::<_, Error>(c) })).await;
-    /// }
-    /// ```
-    pub async fn local_tx<T: ExecutionTimer, R: Send, E: Send, F>(
+    /// Execute trusted read SQL in a PostgreSQL read-only tenant transaction.
+    /// Full live admission precedes the callback; Audit/Ledger heads are never reserved.
+    /// Callback errors retain their type, and only acknowledged settlement yields a receipt.
+    pub async fn read_tx_with_context<T: ExecutionTimer, R: Send, E: Send, C: Send, F>(
         &self,
         tenant: TenantId,
         control: &Control<'_, T>,
+        context: C,
         operation: F,
     ) -> LocalTxAttempt<Committed<R>, TransactionError<E>>
     where
-        F: for<'a> FnOnce(&'a mut AuditTransaction<'_, '_, '_, T>) -> BoxFuture<'a, Result<R, E>>
+        F: for<'a> FnOnce(
+                &'a mut C,
+                &'a mut ReadAuditTransaction<'_, '_, '_, T>,
+            ) -> BoxFuture<'a, Result<R, E>>
             + Send,
     {
-        self.local_tx_with_context(tenant, control, (), move |_, tx| operation(tx))
-            .await
+        self.transact(
+            tenant,
+            control,
+            Access::ReadCallback,
+            context,
+            move |c, tx| operation(c, &mut tx.read),
+        )
+        .await
     }
-    /// Execute with borrowed product inputs without requiring static captures or changing ownership.
-    pub async fn local_tx_with_context<T: ExecutionTimer, R: Send, E: Send, C: Send, F>(
+    /// Acquire Audit then optional Ledger before invoking trusted business SQL.
+    /// Operation uses the shorter cutoff; acquisition/setup/settlement use the total cutoff.
+    /// No fresh cleanup budget is minted, and unconfirmed connections are retired.
+    pub async fn write_tx_with_context<T: ExecutionTimer, R: Send, E: Send, C: Send, F>(
         &self,
         tenant: TenantId,
         control: &Control<'_, T>,
+        context: C,
+        operation: F,
+    ) -> LocalTxAttempt<Committed<R>, TransactionError<E>>
+    where
+        F: for<'a> FnOnce(
+                &'a mut C,
+                &'a mut WriteAuditTransaction<'_, '_, '_, T>,
+            ) -> BoxFuture<'a, Result<R, E>>
+            + Send,
+    {
+        self.transact(tenant, control, Access::WriteCallback, context, operation)
+            .await
+    }
+    async fn transact<T: ExecutionTimer, R: Send, E: Send, C: Send, F>(
+        &self,
+        tenant: TenantId,
+        control: &Control<'_, T>,
+        access: Access,
         mut context: C,
         operation: F,
     ) -> LocalTxAttempt<Committed<R>, TransactionError<E>>
     where
         F: for<'a> FnOnce(
                 &'a mut C,
-                &'a mut AuditTransaction<'_, '_, '_, T>,
+                &'a mut WriteAuditTransaction<'_, '_, '_, T>,
             ) -> BoxFuture<'a, Result<R, E>>
             + Send,
     {
@@ -197,24 +224,34 @@ impl PgAudit {
             Err(e) => return LocalTxAttempt::not_started(TransactionError::Audit(e)),
         };
         let body=control.run(Stage::Setup,async {
-            let millis=control.remaining().as_millis().clamp(1,i32::MAX as u128).to_string();
+            if matches!(access, Access::ReadCallback | Access::ReadOperation) {
+                sqlx::query("SET TRANSACTION READ ONLY").execute(&mut *tx).await?;
+            }
+            // Dropping a SQLx query does not cancel the statement on the server. Bound
+            // that statement too, so ROLLBACK can be acknowledged within the owner cutoff.
+            let millis=(control.operation_remaining().as_millis()+1).clamp(1,i32::MAX as u128).to_string();
             sqlx::query("SELECT set_config('rss.tenant_id',$1,true),set_config('statement_timeout',$2,true),set_config('lock_timeout',$2,true)")
                 .bind(tenant.to_string()).bind(millis).execute(&mut *tx).await?;
-            probe::validate(&mut tx).await
+            Ok(())
         }).await;
         let body = match body {
             Ok(()) => control
                 .run(Stage::Operation, async {
-                    Ok(operation(
-                        &mut context,
-                        &mut AuditTransaction {
+                    let mut transaction = WriteAuditTransaction {
+                        read: ReadAuditTransaction {
                             tx: &mut tx,
                             control,
                             integrity: &self.integrity,
                             tenant,
                         },
-                    )
-                    .await)
+                    };
+                    match access {
+                        Access::WriteCallback => transaction.lock_head().await?,
+                        Access::ReadCallback => probe::tenant(transaction.read.tx, tenant).await?,
+                        // Private single-operation callbacks perform their own admission.
+                        Access::Append | Access::ReadOperation => {}
+                    }
+                    Ok(operation(&mut context, &mut transaction).await)
                 })
                 .await
                 .map_err(TransactionError::Audit)
@@ -227,6 +264,11 @@ impl PgAudit {
             Ok(value) => {
                 let settled = control
                     .run(Stage::Commit, async {
+                        // The callback is finished. Deferred COMMIT work may use the
+                        // remaining owner budget, even after the operation cutoff.
+                        let millis = control.total_remaining().as_millis().clamp(1, i32::MAX as u128).to_string();
+                        sqlx::query("SELECT set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true)")
+                            .bind(millis).execute(&mut *tx).await?;
                         #[cfg(feature = "integration")]
                         if fault == PgFault::BeforeCommitPending as u8 {
                             std::future::pending::<()>().await;
@@ -250,6 +292,7 @@ impl PgAudit {
             Err(operation) => {
                 let settled = control
                     .run(Stage::Rollback, async {
+                        drain(&mut tx).await?;
                         tx.rollback().await?;
                         #[cfg(feature = "integration")]
                         if fault == PgFault::RollbackFailedAfterAck as u8 {
@@ -278,6 +321,25 @@ impl PgAudit {
     pub fn inject_next_fault(&self, fault: PgFault) {
         self.fault
             .store(fault as u8, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+enum Access {
+    ReadCallback,
+    WriteCallback,
+    ReadOperation,
+    Append,
+}
+// A timed-out SQL future may leave its server ErrorResponse unread. Consume it
+// through ReadyForQuery before sending ROLLBACK; only the latter's ACK settles.
+// Transport/protocol errors still fail settlement and retire the lease.
+// ref: launchbadge/sqlx sqlx-postgres/src/connection/mod.rs@v0.9.0
+async fn drain(connection: &mut PgConnection) -> Result<(), Error> {
+    loop {
+        match connection.flush().await {
+            Ok(()) => return Ok(()),
+            Err(sqlx::Error::Database(_)) => continue,
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 struct Lease {

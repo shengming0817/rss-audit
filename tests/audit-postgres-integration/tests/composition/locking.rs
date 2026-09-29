@@ -10,11 +10,8 @@ pub(super) async fn run(pool: &PgPool) -> anyhow::Result<()> {
 async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
     let clock = TestClock;
     let cancel = CancellationToken::new();
-    let control = Control::new(
-        &clock,
-        Deadline::from_timeout(&clock, Duration::from_secs(10))?,
-        &cancel,
-    );
+    let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(10))?;
+    let control = Control::new(&clock, cutoff, cutoff, &cancel);
     let store = PgAudit::new(
         pool.clone(),
         if ledger {
@@ -38,16 +35,12 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
     let task = tokio::spawn(async move {
         let clock = TestClock;
         let cancel = CancellationToken::new();
-        let control = Control::new(
-            &clock,
-            Deadline::from_timeout(&clock, Duration::from_secs(10))?,
-            &cancel,
-        );
+        let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(10))?;
+        let control = Control::new(&clock, cutoff, cutoff, &cancel);
         committed(
             first
-                .local_tx(tenant()?, &control, move |tx| {
+                .write_tx_with_context(tenant()?, &control, (), move |_, tx| {
                     Box::pin(async move {
-                        tx.lock_head().await?;
                         locked.send(()).map_err(|_| Error::StorageContract)?;
                         released.await.map_err(|_| Error::StorageContract)?;
                         let prepared = tx.prepare(e).await?;
@@ -59,35 +52,53 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
         )
     });
     wait_locked.await?;
-    let short = Control::new(
-        &clock,
-        Deadline::from_timeout(&clock, Duration::from_millis(500))?,
-        &cancel,
-    );
-    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cutoff = Deadline::from_timeout(&clock, Duration::from_millis(500))?;
+    let total = Deadline::from_timeout(&clock, Duration::from_secs(5))?;
+    let short = Control::new(&clock, total, cutoff, &cancel);
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let entered = started.clone();
-    let flag = reached.clone();
     let attempt = store
-        .local_tx(tenant()?, &short, move |tx| {
+        .write_tx_with_context(tenant()?, &short, (), move |_, _| {
             Box::pin(async move {
                 entered.store(true, std::sync::atomic::Ordering::SeqCst);
-                tx.lock_head().await?;
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok::<_, Error>(())
             })
         })
         .await;
-    assert!(started.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(!reached.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(attempt.fold(
-        |_| false,
-        |_| false,
-        |e| operation_deadline(&e),
-        |e| operation_deadline(&e),
-        |_| false,
-        |_| false,
-    ));
+    assert!(
+        !started.load(std::sync::atomic::Ordering::SeqCst),
+        "write callback must not start before Audit and optional Ledger are locked"
+    );
+    attempt.fold(
+        |_| Err(anyhow::anyhow!("unexpected commit")),
+        |e| Err(anyhow::anyhow!("not started: {e:?}")),
+        |e| {
+            if operation_deadline(&e) {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("rolled back: {e:?}"))
+            }
+        },
+        |e| Err(anyhow::anyhow!("rollback failed: {e:?}")),
+        |e| Err(anyhow::anyhow!("commit unknown: {e:?}")),
+        |e| Err(anyhow::anyhow!("fenced: {e:?}")),
+    )?;
+    // A reader of the same tenant must complete while the first writer holds both heads.
+    let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(1))?;
+    let reader = Control::new(&clock, cutoff, cutoff, &cancel);
+    committed(
+        store
+            .read_tx_with_context(tenant()?, &reader, (), |_, tx| {
+                Box::pin(async move {
+                    tx.read_page(
+                        Cursor::start(tenant().map_err(|_| Error::StorageContract)?),
+                        ReadLimit::new(1, 131072)?,
+                    )
+                    .await
+                })
+            })
+            .await,
+    )?;
     assert_head_locked(pool, false).await?;
     if ledger {
         assert_head_locked(pool, true).await?;
@@ -98,9 +109,8 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
     task.await??;
     committed(
         store
-            .local_tx(tenant()?, &control, move |tx| {
+            .write_tx_with_context(tenant()?, &control, (), move |_, tx| {
                 Box::pin(async move {
-                    tx.lock_head().await?;
                     assert!(tx.find(&identity).await?.is_some());
                     Ok::<_, Error>(())
                 })
@@ -143,13 +153,9 @@ async fn assert_head_locked(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
 
 fn operation_deadline(error: &TransactionError<Error>) -> bool {
     match error {
-        TransactionError::Audit(Error::Deadline(
-            rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
-        ))
-        | TransactionError::Operation(Error::Deadline(
-            rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
-        )) => true,
+        TransactionError::Audit(error) | TransactionError::Operation(error) => {
+            error.is_interrupted()
+        }
         TransactionError::Rollback { operation, .. } => operation_deadline(operation),
-        _ => false,
     }
 }

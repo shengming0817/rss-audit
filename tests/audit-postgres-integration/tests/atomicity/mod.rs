@@ -37,7 +37,7 @@ async fn rollback(
     let staged = request.clone();
     rolled_back(
         store
-            .local_tx(t, control, move |tx| {
+            .write_tx_with_context(t, control, (), move |_, tx| {
                 Box::pin(async move {
                     tx.append(&staged).await.map_err(BusinessError::Audit)?;
                     tx.with_connection(|c| {
@@ -74,7 +74,7 @@ async fn rollback(
     store.inject_next_fault(PgFault::RollbackFailedAfterAck);
     let staged = request.clone();
     let attempt = store
-        .local_tx(t, control, move |tx| {
+        .write_tx_with_context(t, control, (), move |_, tx| {
             Box::pin(async move {
                 tx.append(&staged).await.map_err(BusinessError::Audit)?;
                 Err::<(), BusinessError>(BusinessError::Declined("rollback-ack-loss"))
@@ -127,11 +127,8 @@ async fn unknown(
     );
     let clock = TestClock;
     let cancel = CancellationToken::new();
-    let short = Control::new(
-        &clock,
-        Deadline::from_timeout(&clock, Duration::from_millis(400))?,
-        &cancel,
-    );
+    let cutoff = Deadline::from_timeout(&clock, Duration::from_millis(400))?;
+    let short = Control::new(&clock, cutoff, cutoff, &cancel);
     let pending = store
         .prepare(event(tenant()?, id, "before-commit", vec![])?, control)
         .await?;
@@ -199,7 +196,7 @@ async fn termination(store: &PgAudit, control: &Control<'_, TestClock>) -> anyho
         .await?;
     let staged = request.clone();
     let result = store
-        .local_tx(tenant()?, control, move |tx| {
+        .write_tx_with_context(tenant()?, control, (), move |_, tx| {
             Box::pin(async move {
                 tx.append(&staged).await?;
                 tx.with_connection(|c| {

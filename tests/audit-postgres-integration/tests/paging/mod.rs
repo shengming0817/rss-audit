@@ -28,7 +28,7 @@ pub(super) async fn run(
             .await?;
         let current = cursor.ok_or_else(|| anyhow::anyhow!("premature end"))?;
         let page = committed(
-            pg.local_tx(tenant, control, move |tx| {
+            pg.write_tx_with_context(tenant, control, (), move |_, tx| {
                 Box::pin(async move {
                     let page = tx.read_page(current, ReadLimit::new(1, 131072)?).await?;
                     tx.append(&p).await?;
@@ -79,7 +79,7 @@ async fn invalid_and_missing(
     assert!(shortened.next().is_none());
     let other = super::tenant()?;
     rolled_back(
-        pg.local_tx(tenant, control, move |tx| {
+        pg.write_tx_with_context(tenant, control, (), move |_, tx| {
             Box::pin(async move {
                 tx.read_page(Cursor::start(other), ReadLimit::new(1, 131072)?)
                     .await
