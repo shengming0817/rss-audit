@@ -251,7 +251,14 @@ impl PgAudit {
                         // Private single-operation callbacks perform their own admission.
                         Access::Append | Access::ReadOperation => {}
                     }
-                    Ok(operation(&mut context, &mut transaction).await)
+                    control.check(Stage::Operation)?;
+                    let result = operation(&mut context, &mut transaction).await;
+                    // A callback can cross the cutoff in its final synchronous poll.
+                    // Preserve its original failure, but never commit a late success.
+                    if result.is_ok() {
+                        control.check(Stage::Operation)?;
+                    }
+                    Ok(result)
                 })
                 .await
                 .map_err(TransactionError::Audit)

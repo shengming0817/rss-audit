@@ -1,4 +1,5 @@
 use super::*;
+mod deadline;
 mod locking;
 mod readonly;
 
@@ -9,6 +10,7 @@ pub(super) async fn run(
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
     readonly::run(plain, ledger, admin, control).await?;
+    deadline::run(plain).await?;
     for (mode, store) in [("compose-plain", plain), ("compose-ledger", ledger)] {
         let empty_tenant = TenantId::parse(if mode == "compose-plain" {
             "f47ac10b-58cc-4372-a567-0e02b2c3d481"
