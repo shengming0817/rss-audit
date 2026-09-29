@@ -193,6 +193,10 @@ impl PgAudit {
         self.transact(tenant, control, Access::WriteCallback, context, operation)
             .await
     }
+    #[allow(
+        clippy::expect_used,
+        reason = "pending is initialized once; only COMMIT takes it, and both post-take outcomes return before rollback"
+    )]
     async fn transact<T: ExecutionTimer, R: Send, E: Send, C: Send, F>(
         &self,
         tenant: TenantId,
@@ -267,20 +271,21 @@ impl PgAudit {
         };
         #[cfg(feature = "integration")]
         let fault = self.fault.swap(0, std::sync::atomic::Ordering::SeqCst);
-        match body {
+        let mut pending = Some(tx);
+        let operation = match body {
             Ok(value) => {
                 let settled = control
                     .run(Stage::Commit, async {
-                        // The callback is finished. Deferred COMMIT work may use the
-                        // remaining owner budget, even after the operation cutoff.
+                        // Keep ownership until COMMIT is actually attempted. A setup
+                        // error or cancellation before this point still needs rollback.
                         let millis = control.total_remaining().as_millis().clamp(1, i32::MAX as u128).to_string();
                         sqlx::query("SELECT set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true)")
-                            .bind(millis).execute(&mut *tx).await?;
+                            .bind(millis).execute(&mut **pending.as_mut().expect("transaction pending")).await?;
                         #[cfg(feature = "integration")]
                         if fault == PgFault::BeforeCommitPending as u8 {
                             std::future::pending::<()>().await;
                         }
-                        tx.commit().await?;
+                        pending.take().expect("transaction pending").commit().await?;
                         #[cfg(feature = "integration")]
                         if fault == PgFault::CommitUnknownAfterAck as u8 {
                             return Err(Error::Deadline(Stage::Commit));
@@ -291,36 +296,37 @@ impl PgAudit {
                 match settled {
                     Ok(()) => {
                         lease.confirmed = true;
-                        LocalTxAttempt::committed(Committed(value))
+                        return LocalTxAttempt::committed(Committed(value));
                     }
-                    Err(e) => LocalTxAttempt::commit_unknown(TransactionError::Audit(e)),
+                    Err(e) if pending.is_none() => {
+                        return LocalTxAttempt::commit_unknown(TransactionError::Audit(e));
+                    }
+                    Err(e) => TransactionError::Audit(e),
                 }
             }
-            Err(operation) => {
-                let settled = control
-                    .run(Stage::Rollback, async {
-                        drain(&mut tx).await?;
-                        tx.rollback().await?;
-                        #[cfg(feature = "integration")]
-                        if fault == PgFault::RollbackFailedAfterAck as u8 {
-                            return Err(Error::Deadline(Stage::Rollback));
-                        }
-                        Ok(())
-                    })
-                    .await;
-                match settled {
-                    Ok(()) => {
-                        lease.confirmed = true;
-                        LocalTxAttempt::rolled_back(operation)
-                    }
-                    Err(settlement) => {
-                        LocalTxAttempt::rollback_failed(TransactionError::Rollback {
-                            operation: Box::new(operation),
-                            settlement,
-                        })
-                    }
+            Err(operation) => operation,
+        };
+        let mut tx = pending.expect("unattempted transaction");
+        let settled = control
+            .run(Stage::Rollback, async {
+                drain(&mut tx).await?;
+                tx.rollback().await?;
+                #[cfg(feature = "integration")]
+                if fault == PgFault::RollbackFailedAfterAck as u8 {
+                    return Err(Error::Deadline(Stage::Rollback));
                 }
+                Ok(())
+            })
+            .await;
+        match settled {
+            Ok(()) => {
+                lease.confirmed = true;
+                LocalTxAttempt::rolled_back(operation)
             }
+            Err(settlement) => LocalTxAttempt::rollback_failed(TransactionError::Rollback {
+                operation: Box::new(operation),
+                settlement,
+            }),
         }
     }
     /// Inject one fixture-owned settlement fault. Not present in production feature sets.

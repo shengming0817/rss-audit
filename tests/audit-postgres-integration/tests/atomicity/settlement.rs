@@ -8,6 +8,8 @@ pub(super) async fn run(
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
     typed_failures(ledger, control).await?;
+    precommit_failure(plain, control).await?;
+    precommit_failure(ledger, control).await?;
     cancelled_operation(ledger, control).await?;
     sqlx::raw_sql(
         "CREATE TABLE public.commit_barrier(id text PRIMARY KEY); \
@@ -311,5 +313,29 @@ async fn settlement_window(store: &PgAudit, admin: &PgPool, id: &str) -> anyhow:
     committed(attempt)?;
     assert!(budget.operation_remaining().is_zero());
     assert!(!budget.total_remaining().is_zero());
+    Ok(())
+}
+
+async fn precommit_failure(
+    store: &PgAudit,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let attempt = store
+        .write_tx_with_context(tenant()?, control, (), |_, tx| {
+            Box::pin(async move {
+                // PostgreSQL has aborted the transaction. A callback returning Ok cannot make
+                // the subsequent settlement setup SQL succeed, nor does it attempt COMMIT.
+                assert!(
+                    tx.with_connection(|c| Box::pin(async move {
+                        sqlx::query("SELECT 1/0").execute(c).await
+                    }))
+                    .await
+                    .is_err()
+                );
+                Ok::<_, BusinessError>(())
+            })
+        })
+        .await;
+    rolled_back(attempt, |e| matches!(e, TransactionError::Audit(_)));
     Ok(())
 }

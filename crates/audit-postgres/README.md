@@ -47,6 +47,8 @@ Cancellation after the callback returns an error cannot overwrite that error. If
 prevents rollback from starting, the result is `RollbackFailed` with both causes, not
 `CommitUnknown`: this branch never attempted commit. Only a real rollback ACK permits
 `RolledBack`. No fresh cleanup budget is minted.
+Preparation errors before COMMIT also use this rollback path. `CommitUnknown` requires
+that this owner has actually started the COMMIT operation.
 
 With `messaging`, `append_in(&mut PgTransaction, &prepared)` borrows the actual message connection,
 inherits its tenant and remaining budget, and changes no GUC, isolation level or lifecycle state.

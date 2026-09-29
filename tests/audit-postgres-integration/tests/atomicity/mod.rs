@@ -137,8 +137,8 @@ async fn unknown(
         |_| false,
         |_| false,
         |_| false,
-        |_| false,
         |_| true,
+        |_| false,
         |_| false
     ));
     assert!(committed(store.append(&pending, control).await)?.inserted());
