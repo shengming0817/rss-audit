@@ -32,7 +32,7 @@ pub(super) async fn run(
     let copy = one.clone();
     rolled_back(
         plain
-            .local_tx(tenant()?, control, move |tx| {
+            .write_tx_with_context(tenant()?, control, (), move |_, tx| {
                 Box::pin(async move { tx.append(&copy).await })
             })
             .await,
@@ -40,7 +40,7 @@ pub(super) async fn run(
     );
     let count = committed(
         plain
-            .local_tx(tenant()?, control, move |tx| {
+            .write_tx_with_context(tenant()?, control, (), move |_, tx| {
                 Box::pin(async move {
                     tx.with_connection(move |c| {
                         Box::pin(async move {

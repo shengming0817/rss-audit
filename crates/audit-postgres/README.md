@@ -1,7 +1,7 @@
 # rss-audit-postgres
 
 Fresh PostgreSQL 16+ Audit persistence. The host supplies a pool, monotonic timer,
-absolute deadline, cancellation and explicit `Integrity::Plain` or `Integrity::Ledger(auth)`.
+absolute total and operation deadlines, cancellation and explicit `Integrity::Plain` or `Integrity::Ledger(auth)`.
 No migration execution, pool shutdown, global reads, memory provider or automatic downgrade.
 The `ledger` and `messaging` features are independently additive; `integration` is test-only.
 
@@ -22,8 +22,12 @@ unchanged prepared request to serialize recovery. Database errors remain redacte
 intervention, while connection interruption, contention and cancellation may be retried.
 The messaging conversion preserves that classification; neither class grants ACK authority.
 
-`local_tx(tenant, control, callback)` combines Audit with trusted business SQL via
-`AuditTransaction::with_connection`. A callback returning `Result<R, E>` produces
+`read_tx_with_context(tenant, control, context, callback)` supplies `ReadAuditTransaction`
+inside a PostgreSQL read-only transaction. It validates live admission before trusted reads,
+never reserves Audit/Ledger heads, and exposes no append or lock operation.
+`write_tx_with_context` supplies `WriteAuditTransaction` after acquiring Audit then optional
+Ledger locks. It also provides the read methods. Pass `()` when no context is needed.
+Both borrow trusted business SQL via `with_connection`. A callback returning `Result<R, E>` produces
 `LocalTxAttempt<Committed<R>, TransactionError<E>>`: `Operation(E)` retains the original
 host reason/classification, `Audit(Error)` identifies adapter/control failures, and
 `Rollback { operation, settlement }` retains both causes when rollback is unconfirmed.
@@ -32,12 +36,19 @@ explicitly to recover its typed value. `with_connection` likewise preserves its 
 error type. There is no untyped business-rejection sentinel or error side channel.
 Errors must propagate. This is not a SQL sandbox:
 do not issue transaction control, change role/tenant/session state, or swallow append errors.
-Lock order is Audit tenant head → ledger → business/outbox. One absolute budget covers
-acquisition, setup, operation and settlement. Unconfirmed connections are closed, never reused.
+Lock order is Audit tenant head → ledger → business/outbox.
+`Control::new(timer, total_deadline, operation_deadline, cancel)` caps the operation cutoff
+by the total cutoff without refreshing either. Acquisition, setup and settlement use total;
+pre-locking and callback work use operation, allowing the host to reserve settlement time.
+Server statement timeouts also bound outstanding work. Settlement drains pending server
+responses before rollback and remains limited by the original total cutoff; it may still fail. `total_remaining` and `operation_remaining` expose each cutoff.
+Unconfirmed connections are closed, never reused.
 Cancellation after the callback returns an error cannot overwrite that error. If cancellation
 prevents rollback from starting, the result is `RollbackFailed` with both causes, not
 `CommitUnknown`: this branch never attempted commit. Only a real rollback ACK permits
 `RolledBack`. No fresh cleanup budget is minted.
+Preparation errors before COMMIT also use this rollback path. `CommitUnknown` requires
+that this owner has actually started the COMMIT operation.
 
 With `messaging`, `append_in(&mut PgTransaction, &prepared)` borrows the actual message connection,
 inherits its tenant and remaining budget, and changes no GUC, isolation level or lifecycle state.
@@ -47,12 +58,13 @@ that owner; original `PgError` classification, including ownership loss, is pres
 
 ## Facts derived inside a transaction
 
-Call `AuditTransaction::lock_head` or `PgAudit::lock_head_in` before business/outbox
-locks. They acquire Audit first, then the fixed Audit ledger chain in Ledger mode,
+`write_tx_with_context` acquires Audit first, then the fixed Audit ledger chain in Ledger mode,
+before invoking the callback. With a borrowed message transaction, call `PgAudit::lock_head_in`
+before business/outbox locks. Both paths reserve the heads
 without writing an event. Failures propagate to the original owner; Ledger never
 falls back to Plain. An empty head is allowed and allocates no event position.
 
-After deriving final facts, `AuditTransaction::prepare` or `PgAudit::prepare_in`
+After deriving final facts, `WriteAuditTransaction::prepare` or `PgAudit::prepare_in`
 uses database time on the already borrowed connection, avoiding a second pool lease.
 Persist exact canonical bytes in the product receipt and append in that same transaction.
 `find` / `find_in` retrieves a record by stable identity, including stored integrity mode;
@@ -74,7 +86,7 @@ oversized pages return no partial rows. The first statement captures the tenant 
 use `Cursor::resume(tenant, after, through)` with `after < through`; the last page has no cursor.
 New appends, including queries auditing themselves, cannot prolong that enumeration. A future
 upper bound is invalid input; missing records within the range fail closed. This is not a
-multi-page MVCC snapshot or an authenticated checkpoint. `AuditTransaction::read_page` uses
+multi-page MVCC snapshot or an authenticated checkpoint. `WriteAuditTransaction::read_page` uses
 this same implementation for atomic query/append composition. The uncommitted `Cursor::after`
 API is replaced without an alias.
 
@@ -111,7 +123,8 @@ ref: sea-ql/sea-orm TransactionError<E>@2.0.2 (typed callback error, not settlem
 
 Tenant-bound lock, prepare, find and append calls recheck live tenant and storage admission
 on each public operation, including after trusted SQL callbacks. These checks deliberately
-include catalog reads; no cached admission replaces permission-revocation checks. The
+include one catalog snapshot query with a shared reachable-role closure; no cached admission
+replaces permission-revocation checks. The
 independent prepare operation only reads database time without binding a transaction tenant.
 `Error::is_interrupted()` classifies Audit and Ledger deadline/cancellation causes consistently;
 it does not prove rollback or authorize a retry.

@@ -141,11 +141,8 @@ async fn run() -> anyhow::Result<()> {
         .await?;
     let clock = TestClock;
     let cancel = CancellationToken::new();
-    let control = Control::new(
-        &clock,
-        Deadline::from_timeout(&clock, Duration::from_secs(150))?,
-        &cancel,
-    );
+    let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(150))?;
+    let control = Control::new(&clock, cutoff, cutoff, &cancel);
     let plain = PgAudit::new(pool.clone(), Integrity::Plain, &control).await?;
     let ledger = PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), &control).await?;
     exercise(&plain, &ledger, &pool, &admin, &fixture, &control).await?;
@@ -170,7 +167,7 @@ async fn exercise(
     paging::run(plain, admin, control).await?;
     messaging::run(plain, ledger, admin, fixture, control).await?;
     http::run(plain, ledger, pool, admin, control).await?;
-    composition::run(plain, ledger, control).await?;
+    composition::run(plain, ledger, admin, control).await?;
     composition::single_connection(pool).await?;
     admission::run(plain, pool, admin, control).await?;
     Ok(())

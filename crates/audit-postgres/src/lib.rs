@@ -17,7 +17,7 @@ pub use model::{Cursor, Page, ReadLimit, Record, StagedAppend};
 #[cfg(feature = "integration")]
 pub use runtime::PgFault;
 pub use runtime::{Committed, Integrity, PgAudit};
-pub use transaction::AuditTransaction;
+pub use transaction::{ReadAuditTransaction, WriteAuditTransaction};
 
 /// Fresh PostgreSQL schema; execute only through the separately provisioned migration owner.
 pub const MIGRATION_SQL: &str = include_str!("../migrations/0001_audit.sql");

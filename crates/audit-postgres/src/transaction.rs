@@ -4,40 +4,27 @@ use rss_audit_core::{AuditEventV1, PreparedAuditV1, RecordIdentity};
 use rss_request_context::{ExecutionTimer, TenantId};
 use sqlx::{PgConnection, Postgres, Transaction};
 
-/// Tenant-bound trusted business transaction. Only its enclosing owner can settle it.
-pub struct AuditTransaction<'a, 'db, 'control, T> {
+/// Tenant-bound read access. PostgreSQL enforces read-only mode in a read transaction.
+/// The enclosing owner alone settles; transaction/session control is forbidden in raw SQL.
+///
+/// ```compile_fail
+/// use rss_audit_postgres::ReadAuditTransaction;
+/// use rss_audit_core::PreparedAuditV1;
+/// use rss_request_context::ExecutionTimer;
+/// async fn append<T: ExecutionTimer>(tx: &mut ReadAuditTransaction<'_, '_, '_, T>, p: &PreparedAuditV1) {
+///     tx.append(p).await;
+/// }
+/// ```
+pub struct ReadAuditTransaction<'a, 'db, 'control, T> {
     pub(crate) tx: &'a mut Transaction<'db, Postgres>,
     pub(crate) control: &'control Control<'control, T>,
     pub(crate) integrity: &'control Integrity,
     pub(crate) tenant: TenantId,
 }
-impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
+impl<T: ExecutionTimer> ReadAuditTransaction<'_, '_, '_, T> {
     /// Fixed tenant of this transaction.
     pub const fn tenant_id(&self) -> TenantId {
         self.tenant
-    }
-    /// Acquire Audit then optional ledger locks before deriving business facts.
-    /// Does not append an event; only the original owner can settle this transaction.
-    pub async fn lock_head(&mut self) -> Result<(), Error> {
-        self.control
-            .run(
-                rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
-                repository::lock_head(self.tx, self.tenant),
-            )
-            .await?;
-        #[cfg(feature = "ledger")]
-        if let Integrity::Ledger(auth) = self.integrity {
-            let clock = crate::control::LedgerClock(self.control.timer, self.control.timer.now());
-            let budget = clock.budget(self.control);
-            rss_ledger_postgres::lock_head_in_transaction(
-                self.tx,
-                auth,
-                &crate::runtime::ledger_id(self.tenant)?,
-                &budget,
-            )
-            .await?;
-        }
-        Ok(())
     }
     /// Prepare exact bytes using PostgreSQL time on this connection and budget.
     pub async fn prepare(&mut self, event: AuditEventV1) -> Result<PreparedAuditV1, Error> {
@@ -66,34 +53,6 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
             )
             .await
     }
-    /// Stage exact canonical bytes. Propagate any error to the enclosing owner.
-    /// Acquire Audit before ledger before business/outbox locks.
-    pub async fn append(&mut self, request: &PreparedAuditV1) -> Result<StagedAppend, Error> {
-        self.control
-            .check(rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation)?;
-        if request.append_request().ledger().tenant() != self.tenant {
-            return Err(Error::ScopeMismatch);
-        }
-        let existing = repository::reserve(self.tx, request, self.integrity.is_ledger()).await?;
-        let ledger = match self.integrity {
-            Integrity::Plain => None,
-            #[cfg(feature = "ledger")]
-            Integrity::Ledger(auth) => {
-                let clock =
-                    crate::control::LedgerClock(self.control.timer, self.control.timer.now());
-                let budget = clock.budget(self.control);
-                let staged = rss_ledger_postgres::append_in_transaction(
-                    self.tx,
-                    auth,
-                    request.append_request(),
-                    &budget,
-                )
-                .await?;
-                Some((staged.entry().sequence().get(), staged.inserted()))
-            }
-        };
-        repository::finish(self.tx, request, existing, ledger).await
-    }
     /// Read within this transaction's tenant and the first page's fixed upper bound.
     pub async fn read_page(
         &mut self,
@@ -121,9 +80,9 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
     /// This has the same SQL/session restrictions as `with_connection`.
     ///
     /// ```compile_fail
-    /// use rss_audit_postgres::{AuditTransaction, Error};
+    /// use rss_audit_postgres::{ReadAuditTransaction, Error};
     /// use rss_request_context::ExecutionTimer;
-    /// async fn escape<T: ExecutionTimer>(tx: &mut AuditTransaction<'_, '_, '_, T>) {
+    /// async fn escape<T: ExecutionTimer>(tx: &mut ReadAuditTransaction<'_, '_, '_, T>) {
     ///     let mut context = String::new();
     ///     let escaped = tx.with_connection_context(&mut context, |context, connection| {
     ///         Box::pin(async move { Ok::<_, Error>((context, connection)) })
@@ -185,5 +144,81 @@ impl<T: ExecutionTimer> AuditTransaction<'_, '_, '_, T> {
             window.predecessor(),
             window.entries(),
         )?)
+    }
+}
+
+/// Tenant-bound write access, handed to the callback after Audit and optional Ledger locks.
+/// Read operations share the same connection, live admission and absolute operation cutoff.
+pub struct WriteAuditTransaction<'a, 'db, 'control, T> {
+    pub(crate) read: ReadAuditTransaction<'a, 'db, 'control, T>,
+}
+impl<'a, 'db, 'control, T> std::ops::Deref for WriteAuditTransaction<'a, 'db, 'control, T> {
+    type Target = ReadAuditTransaction<'a, 'db, 'control, T>;
+    fn deref(&self) -> &Self::Target {
+        &self.read
+    }
+}
+impl<T> std::ops::DerefMut for WriteAuditTransaction<'_, '_, '_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.read
+    }
+}
+impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
+    /// Acquire Audit then optional ledger locks before deriving business facts.
+    /// Does not append an event; only the original owner can settle this transaction.
+    pub(crate) async fn lock_head(&mut self) -> Result<(), Error> {
+        self.read
+            .control
+            .run(
+                rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
+                repository::lock_head(self.read.tx, self.read.tenant),
+            )
+            .await?;
+        #[cfg(feature = "ledger")]
+        if let Integrity::Ledger(auth) = self.read.integrity {
+            let clock =
+                crate::control::LedgerClock(self.read.control.timer, self.read.control.timer.now());
+            let budget = clock.budget(self.read.control);
+            rss_ledger_postgres::lock_head_in_transaction(
+                self.read.tx,
+                auth,
+                &crate::runtime::ledger_id(self.read.tenant)?,
+                &budget,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    /// Stage exact canonical bytes. Propagate any error to the enclosing owner.
+    /// Acquire Audit before ledger before business/outbox locks.
+    pub async fn append(&mut self, request: &PreparedAuditV1) -> Result<StagedAppend, Error> {
+        self.read
+            .control
+            .check(rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation)?;
+        if request.append_request().ledger().tenant() != self.read.tenant {
+            return Err(Error::ScopeMismatch);
+        }
+        let existing =
+            repository::reserve(self.read.tx, request, self.read.integrity.is_ledger()).await?;
+        let ledger = match self.read.integrity {
+            Integrity::Plain => None,
+            #[cfg(feature = "ledger")]
+            Integrity::Ledger(auth) => {
+                let clock = crate::control::LedgerClock(
+                    self.read.control.timer,
+                    self.read.control.timer.now(),
+                );
+                let budget = clock.budget(self.read.control);
+                let staged = rss_ledger_postgres::append_in_transaction(
+                    self.read.tx,
+                    auth,
+                    request.append_request(),
+                    &budget,
+                )
+                .await?;
+                Some((staged.entry().sequence().get(), staged.inserted()))
+            }
+        };
+        repository::finish(self.read.tx, request, existing, ledger).await
     }
 }

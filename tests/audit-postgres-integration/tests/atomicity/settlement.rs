@@ -8,6 +8,8 @@ pub(super) async fn run(
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
     typed_failures(ledger, control).await?;
+    precommit_failure(plain, control).await?;
+    precommit_failure(ledger, control).await?;
     cancelled_operation(ledger, control).await?;
     sqlx::raw_sql(
         "CREATE TABLE public.commit_barrier(id text PRIMARY KEY); \
@@ -21,6 +23,7 @@ pub(super) async fn run(
     .await?;
     for (id, store) in [("inflight-plain", plain), ("inflight-ledger", ledger)] {
         in_flight(store, admin, control, id).await?;
+        settlement_window(store, admin, id).await?;
     }
     Ok(())
 }
@@ -32,7 +35,7 @@ async fn typed_failures(store: &PgAudit, control: &Control<'_, TestClock>) -> an
     ] {
         let expected = business_kind(&failure);
         let attempt = store
-            .local_tx(tenant()?, control, move |_| {
+            .write_tx_with_context(tenant()?, control, (), move |_, _| {
                 Box::pin(async move { Err::<(), _>(failure) })
             })
             .await;
@@ -75,14 +78,11 @@ async fn cancelled_operation(
     let clock = TestClock;
     let cancel = CancellationToken::new();
     let operation_cancel = cancel.clone();
-    let budget = Control::new(
-        &clock,
-        Deadline::from_timeout(&clock, Duration::from_secs(10))?,
-        &cancel,
-    );
+    let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(10))?;
+    let budget = Control::new(&clock, cutoff, cutoff, &cancel);
     let staged = request.clone();
     let attempt = store
-        .local_tx(tenant()?, &budget, move |tx| {
+        .write_tx_with_context(tenant()?, &budget, (), move |_, tx| {
             Box::pin(async move {
                 tx.append(&staged).await.map_err(BusinessError::Audit)?;
                 // The error and cancellation become ready in the same callback poll.
@@ -123,14 +123,11 @@ async fn in_flight(
         .await?;
     let cancel = CancellationToken::new();
     let clock = TestClock;
-    let budget = Control::new(
-        &clock,
-        Deadline::from_timeout(&clock, Duration::from_secs(15))?,
-        &cancel,
-    );
+    let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(15))?;
+    let budget = Control::new(&clock, cutoff, cutoff, &cancel);
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let staged = request.clone();
-    let operation = store.local_tx(tenant()?, &budget, move |tx| {
+    let operation = store.write_tx_with_context(tenant()?, &budget, (), move |_, tx| {
         Box::pin(async move {
             tx.append(&staged).await?;
             let pid = tx
@@ -191,7 +188,7 @@ async fn recover(
     let restored = PreparedAuditV1::from_canonical_bytes(request.canonical_bytes())?;
     let retry = committed(
         store
-            .local_tx(tenant()?, control, move |tx| {
+            .write_tx_with_context(tenant()?, control, (), move |_, tx| {
                 Box::pin(async move {
                     let staged = tx.append(&restored).await?;
                     tx.with_connection(move |c| {
@@ -262,5 +259,83 @@ async fn wait_retired(admin: &PgPool, pid: i32) -> anyhow::Result<()> {
         }
     })
     .await??;
+    Ok(())
+}
+
+// Deferred work at COMMIT uses total, not the already exhausted operation cutoff.
+async fn settlement_window(store: &PgAudit, admin: &PgPool, id: &str) -> anyhow::Result<()> {
+    let mut blocker = admin.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(2497,1084)")
+        .execute(&mut *blocker)
+        .await?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    let clock = TestClock;
+    let cancel = CancellationToken::new();
+    let operation = Deadline::from_timeout(&clock, Duration::from_secs(1))?;
+    let total = Deadline::from_timeout(&clock, Duration::from_secs(10))?;
+    let budget = Control::new(&clock, total, operation, &cancel);
+    let id = format!("settlement-window-{id}");
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let attempt = store.write_tx_with_context(tenant()?, &budget, (), move |_, tx| {
+        Box::pin(async move {
+            let pid = tx
+                .with_connection(move |c| {
+                    Box::pin(async move {
+                        sqlx::query("INSERT INTO public.commit_barrier VALUES($1)")
+                            .bind(id)
+                            .execute(&mut *c)
+                            .await?;
+                        sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                            .fetch_one(c)
+                            .await
+                    })
+                })
+                .await?;
+            sender.send(pid).map_err(|_| Error::StorageContract)?;
+            Ok::<_, Error>(())
+        })
+    });
+    let unblock = async {
+        let pid = receiver.await?;
+        wait_commit(admin, pid, blocker_pid).await?;
+        clock
+            .sleep_until(Deadline::at(
+                operation.instant() + Duration::from_millis(100),
+            ))
+            .await;
+        blocker.rollback().await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (attempt, released) = tokio::join!(attempt, unblock);
+    released?;
+    committed(attempt)?;
+    assert!(budget.operation_remaining().is_zero());
+    assert!(!budget.total_remaining().is_zero());
+    Ok(())
+}
+
+async fn precommit_failure(
+    store: &PgAudit,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let attempt = store
+        .write_tx_with_context(tenant()?, control, (), |_, tx| {
+            Box::pin(async move {
+                // PostgreSQL has aborted the transaction. A callback returning Ok cannot make
+                // the subsequent settlement setup SQL succeed, nor does it attempt COMMIT.
+                assert!(
+                    tx.with_connection(|c| Box::pin(async move {
+                        sqlx::query("SELECT 1/0").execute(c).await
+                    }))
+                    .await
+                    .is_err()
+                );
+                Ok::<_, BusinessError>(())
+            })
+        })
+        .await;
+    rolled_back(attempt, |e| matches!(e, TransactionError::Audit(_)));
     Ok(())
 }

@@ -99,20 +99,31 @@ where
         Ok(limit) => limit,
         Err(_) => return error::safe(SafeErrorCode::Internal),
     };
-    let control = Control::new(&app.timer, budget.deadline, &budget.cancel);
+    let control = Control::new(&app.timer, budget.deadline, budget.deadline, &budget.cancel);
     // Await the owner's result; dropping a timeout-wrapped transaction loses settlement.
-    let attempt = app
-        .pg
-        .local_tx(grant.tenant, &control, move |tx| {
-            Box::pin(async move {
-                let page = tx.read_page(cursor, limit).await?;
-                let response = dto::PageDto::new(grant.tenant, &page)?;
-                if let SelfAudit::Required(prepared) = grant.audit {
-                    tx.append(&prepared).await?;
-                }
-                Ok::<_, rss_audit_postgres::Error>(response)
-            })
-        })
-        .await;
+    let attempt = match grant.audit {
+        SelfAudit::NotRequired => {
+            app.pg
+                .read_tx_with_context(grant.tenant, &control, (), move |_, tx| {
+                    Box::pin(async move {
+                        let page = tx.read_page(cursor, limit).await?;
+                        dto::PageDto::new(grant.tenant, &page)
+                    })
+                })
+                .await
+        }
+        SelfAudit::Required(prepared) => {
+            app.pg
+                .write_tx_with_context(grant.tenant, &control, (), move |_, tx| {
+                    Box::pin(async move {
+                        let page = tx.read_page(cursor, limit).await?;
+                        let response = dto::PageDto::new(grant.tenant, &page)?;
+                        tx.append(&prepared).await?;
+                        Ok::<_, rss_audit_postgres::Error>(response)
+                    })
+                })
+                .await
+        }
+    };
     error::settle(attempt)
 }
