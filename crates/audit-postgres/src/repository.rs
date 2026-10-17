@@ -15,16 +15,7 @@ pub(crate) async fn lock_head(c: &mut PgConnection, tenant: TenantId) -> Result<
 pub(crate) async fn prepare(
     c: &mut PgConnection,
     event: AuditEventV1,
-    tenant: Option<TenantId>,
 ) -> Result<PreparedAuditV1, Error> {
-    // Bound transactions share the live tenant/admission gate. Independent prepare
-    // only reads database time and does not claim a tenant-bound transaction.
-    if let Some(tenant) = tenant {
-        if event.identity().tenant() != tenant {
-            return Err(Error::ScopeMismatch);
-        }
-        probe::tenant(c, tenant).await?;
-    }
     let seconds: i64 =
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()))::bigint")
             .fetch_one(c)
@@ -32,14 +23,6 @@ pub(crate) async fn prepare(
     let recorded =
         rss_contract::Timepoint::try_from(seconds).map_err(|_| Error::StorageContract)?;
     Ok(rss_audit_core::prepare(event, recorded)?)
-}
-
-pub(crate) async fn find(
-    c: &mut PgConnection,
-    identity: &RecordIdentity,
-) -> Result<Option<Record>, Error> {
-    probe::tenant(c, identity.tenant()).await?;
-    find_validated(c, identity).await
 }
 
 async fn find_validated(
@@ -63,12 +46,7 @@ pub(crate) async fn reserve(
     let identity = decoded.event().identity();
     lock_head(c, identity.tenant()).await?;
     let existing = find_validated(c, identity).await?;
-    if let Some(record) = &existing
-        && (record.prepared.canonical_bytes() != request.canonical_bytes()
-            || record.ledger_sequence.is_some() != ledger)
-    {
-        return Err(Error::Conflict);
-    }
+    check_existing(request, existing.as_ref(), ledger)?;
     Ok(existing)
 }
 
@@ -196,4 +174,57 @@ pub(crate) async fn page(
         .map(|r| Cursor::resume(cursor.tenant(), r.position(), through as u64))
         .transpose()?;
     Ok(Page { records, next })
+}
+
+// Only used while the owner holds Audit -> Ledger locks. READ COMMITTED gives this
+// lookup a fresh snapshot after a competing transaction has settled.
+pub(crate) async fn resolution(
+    c: &mut PgConnection,
+    identity: &RecordIdentity,
+) -> Result<(Option<Record>, rss_contract::Timepoint), Error> {
+    probe::tenant(c, identity.tenant()).await?;
+    let (isolation, seconds): (String, i64) = sqlx::query_as(
+        "SELECT current_setting('transaction_isolation'),floor(extract(epoch FROM clock_timestamp()))::bigint")
+        .fetch_one(&mut *c).await?;
+    if isolation != "read committed" {
+        return Err(Error::StorageContract);
+    }
+    let recorded =
+        rss_contract::Timepoint::try_from(seconds).map_err(|_| Error::StorageContract)?;
+    Ok((find_validated(c, identity).await?, recorded))
+}
+
+pub(crate) fn check_resolved(
+    identity: &RecordIdentity,
+    request: &PreparedAuditV1,
+    existing: Option<&Record>,
+    ledger: bool,
+) -> Result<(), Error> {
+    let decoded = decode_untrusted(request.canonical_bytes())?;
+    let actual = decoded.event().identity();
+    if actual.tenant() != identity.tenant()
+        || actual.source().source_id().as_str() != identity.source().source_id().as_str()
+        || actual.event_id().as_str() != identity.event_id().as_str()
+        || actual.source().contract().id() != identity.source().contract().id()
+        || actual.source().contract().version() != identity.source().contract().version()
+        || actual.source().contract().schema_digest()
+            != identity.source().contract().schema_digest()
+    {
+        return Err(Error::ScopeMismatch);
+    }
+    check_existing(request, existing, ledger)
+}
+
+fn check_existing(
+    request: &PreparedAuditV1,
+    existing: Option<&Record>,
+    ledger: bool,
+) -> Result<(), Error> {
+    if let Some(record) = existing
+        && (record.prepared.canonical_bytes() != request.canonical_bytes()
+            || record.ledger_sequence.is_some() != ledger)
+    {
+        return Err(Error::Conflict);
+    }
+    Ok(())
 }

@@ -1,7 +1,8 @@
 use crate::{Control, Error, Integrity, StagedAppend, repository};
 use futures::future::BoxFuture;
-use rss_audit_core::{AuditEventV1, PreparedAuditV1, RecordIdentity};
+use rss_audit_core::{PreparedAuditV1, RecordIdentity};
 use rss_request_context::{ExecutionTimer, TenantId};
+use rss_transactional_messaging::transaction::LocalTxDeadlineStage as Stage;
 use sqlx::{PgConnection, Postgres, Transaction};
 
 /// Tenant-bound read access. PostgreSQL enforces read-only mode in a read transaction.
@@ -26,41 +27,13 @@ impl<T: ExecutionTimer> ReadAuditTransaction<'_, '_, '_, T> {
     pub const fn tenant_id(&self) -> TenantId {
         self.tenant
     }
-    /// Prepare exact bytes using PostgreSQL time on this connection and budget.
-    pub async fn prepare(&mut self, event: AuditEventV1) -> Result<PreparedAuditV1, Error> {
-        if event.identity().tenant() != self.tenant {
-            return Err(Error::ScopeMismatch);
-        }
-        self.control
-            .run(
-                rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
-                repository::prepare(self.tx, event, Some(self.tenant)),
-            )
-            .await
-    }
-    /// Read exact stored bytes. Absence alone is not rollback evidence.
-    pub async fn find(
-        &mut self,
-        identity: &RecordIdentity,
-    ) -> Result<Option<crate::Record>, Error> {
-        if identity.tenant() != self.tenant {
-            return Err(Error::ScopeMismatch);
-        }
-        self.control
-            .run(
-                rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
-                repository::find(self.tx, identity),
-            )
-            .await
-    }
     /// Read within this transaction's tenant and the first page's fixed upper bound.
     pub async fn read_page(
         &mut self,
         cursor: crate::Cursor,
         limit: crate::ReadLimit,
     ) -> Result<crate::Page, Error> {
-        self.control
-            .check(rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation)?;
+        self.control.check(Stage::Operation)?;
         if cursor.tenant() != self.tenant {
             return Err(Error::ScopeMismatch);
         }
@@ -111,7 +84,7 @@ impl<T: ExecutionTimer> ReadAuditTransaction<'_, '_, '_, T> {
         crate::probe::tenant(self.tx, self.tenant).await?;
         let id = crate::runtime::ledger_id(self.tenant)?;
         let clock = crate::control::LedgerClock(self.control.timer, self.control.timer.now());
-        let budget = clock.budget(self.control);
+        let budget = clock.budget(self.control, Stage::Operation);
         let window = rss_ledger_postgres::read_window_in_transaction(
             self.tx, auth, &id, start, limit, &budget,
         )
@@ -148,7 +121,7 @@ impl<T: ExecutionTimer> ReadAuditTransaction<'_, '_, '_, T> {
 }
 
 /// Tenant-bound write access, handed to the callback after Audit and optional Ledger locks.
-/// Read operations share the same connection, live admission and absolute operation cutoff.
+/// Operations share the connection, admitted storage and absolute operation cutoff.
 pub struct WriteAuditTransaction<'a, 'db, 'control, T> {
     pub(crate) read: ReadAuditTransaction<'a, 'db, 'control, T>,
 }
@@ -170,7 +143,7 @@ impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
         self.read
             .control
             .run(
-                rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation,
+                Stage::Operation,
                 repository::lock_head(self.read.tx, self.read.tenant),
             )
             .await?;
@@ -178,7 +151,7 @@ impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
         if let Integrity::Ledger(auth) = self.read.integrity {
             let clock =
                 crate::control::LedgerClock(self.read.control.timer, self.read.control.timer.now());
-            let budget = clock.budget(self.read.control);
+            let budget = clock.budget(self.read.control, Stage::Operation);
             rss_ledger_postgres::lock_head_in_transaction(
                 self.read.tx,
                 auth,
@@ -192,14 +165,55 @@ impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
     /// Stage exact canonical bytes. Propagate any error to the enclosing owner.
     /// Acquire Audit before ledger before business/outbox locks.
     pub async fn append(&mut self, request: &PreparedAuditV1) -> Result<StagedAppend, Error> {
-        self.read
-            .control
-            .check(rss_transactional_messaging::transaction::LocalTxDeadlineStage::Operation)?;
+        self.read.control.check(Stage::Operation)?;
         if request.append_request().ledger().tenant() != self.read.tenant {
             return Err(Error::ScopeMismatch);
         }
         let existing =
             repository::reserve(self.read.tx, request, self.read.integrity.is_ledger()).await?;
+        self.stage(request, existing).await
+    }
+    /// Resolve and append a fact under this owner's existing Audit/Ledger locks.
+    /// Requires READ COMMITTED. The synchronous resolver sees the exact existing record and
+    /// database time, and must return the same stable identity. Product receipt validation
+    /// remains with the caller; persist returned canonical bytes in the same transaction.
+    /// After commit-unknown, recover exact bytes under the same locks; absence alone is not proof.
+    pub async fn append_with<E, F>(
+        &mut self,
+        identity: &RecordIdentity,
+        resolve: F,
+    ) -> Result<StagedAppend, E>
+    where
+        E: From<Error> + Send,
+        F: FnOnce(Option<&crate::Record>, rss_contract::Timepoint) -> Result<PreparedAuditV1, E>
+            + Send,
+    {
+        if identity.tenant() != self.read.tenant {
+            return Err(Error::ScopeMismatch.into());
+        }
+        let (existing, now) = self
+            .read
+            .control
+            .run(
+                Stage::Operation,
+                repository::resolution(self.read.tx, identity),
+            )
+            .await?;
+        let request = resolve(existing.as_ref(), now)?;
+        self.read.control.check(Stage::Operation)?;
+        repository::check_resolved(
+            identity,
+            &request,
+            existing.as_ref(),
+            self.read.integrity.is_ledger(),
+        )?;
+        self.stage(&request, existing).await.map_err(E::from)
+    }
+    async fn stage(
+        &mut self,
+        request: &PreparedAuditV1,
+        existing: Option<crate::Record>,
+    ) -> Result<StagedAppend, Error> {
         let ledger = match self.read.integrity {
             Integrity::Plain => None,
             #[cfg(feature = "ledger")]
@@ -208,7 +222,7 @@ impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
                     self.read.control.timer,
                     self.read.control.timer.now(),
                 );
-                let budget = clock.budget(self.read.control);
+                let budget = clock.budget(self.read.control, Stage::Operation);
                 let staged = rss_ledger_postgres::append_in_transaction(
                     self.read.tx,
                     auth,

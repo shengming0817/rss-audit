@@ -43,9 +43,13 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
                     Box::pin(async move {
                         locked.send(()).map_err(|_| Error::StorageContract)?;
                         released.await.map_err(|_| Error::StorageContract)?;
-                        let prepared = tx.prepare(e).await?;
-                        tx.append(&prepared).await?;
-                        Ok::<_, Error>(())
+                        let id = e.identity().clone();
+                        let staged = tx
+                            .append_with(&id, |_, now| {
+                                Ok::<_, Error>(rss_audit_core::prepare(e, now)?)
+                            })
+                            .await?;
+                        Ok::<_, Error>(staged.record().prepared().canonical_bytes().to_vec())
                     })
                 })
                 .await,
@@ -103,20 +107,43 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
     if ledger {
         assert_head_locked(pool, true).await?;
     }
+    let waiter = tokio::spawn(async move {
+        let clock = TestClock;
+        let cancel = CancellationToken::new();
+        let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(10))?;
+        let control = Control::new(&clock, cutoff, cutoff, &cancel);
+        committed(
+            store
+                .write_tx_with_context(tenant()?, &control, (), move |_, tx| {
+                    Box::pin(async move {
+                        let replay = tx
+                            .append_with(&identity, |previous, _| {
+                                Ok::<_, Error>(
+                                    previous.ok_or(Error::StorageContract)?.prepared().clone(),
+                                )
+                            })
+                            .await?;
+                        assert!(!replay.inserted());
+                        Ok::<_, Error>(replay.record().prepared().canonical_bytes().to_vec())
+                    })
+                })
+                .await,
+        )
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND usename=current_user AND wait_event_type='Lock' AND query LIKE '%rss_audit.reserve%')",
+            ).fetch_one(pool).await?;
+            if waiting { return Ok::<_, sqlx::Error>(()); }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await??;
     release
         .send(())
         .map_err(|_| anyhow::anyhow!("reservation owner ended early"))?;
-    task.await??;
-    committed(
-        store
-            .write_tx_with_context(tenant()?, &control, (), move |_, tx| {
-                Box::pin(async move {
-                    assert!(tx.find(&identity).await?.is_some());
-                    Ok::<_, Error>(())
-                })
-            })
-            .await,
-    )?;
+    let original = task.await??;
+    assert_eq!(waiter.await??, original);
     Ok(())
 }
 

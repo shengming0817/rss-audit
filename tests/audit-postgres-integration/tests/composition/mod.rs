@@ -2,6 +2,7 @@ use super::*;
 mod deadline;
 mod locking;
 mod readonly;
+mod resolution;
 
 pub(super) async fn run(
     plain: &PgAudit,
@@ -9,6 +10,7 @@ pub(super) async fn run(
     admin: &PgPool,
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
+    resolution::run(plain, ledger, control).await?;
     readonly::run(plain, ledger, admin, control).await?;
     deadline::run(plain).await?;
     for (mode, store) in [("compose-plain", plain), ("compose-ledger", ledger)] {
@@ -33,16 +35,14 @@ pub(super) async fn run(
             store
                 .write_tx_with_context(tenant()?, control, (), move |_, tx| {
                     Box::pin(async move {
-                        assert!(tx.find(&identity).await?.is_none());
-                        // Facts may now be derived from business SQL on the same connection.
-                        let prepared = tx.prepare(e).await?;
-                        assert!(tx.append(&prepared).await?.inserted());
-                        let record = tx.find(&identity).await?.ok_or(Error::StorageContract)?;
-                        assert_eq!(
-                            record.prepared().canonical_bytes(),
-                            prepared.canonical_bytes()
-                        );
-                        Ok::<_, Error>(prepared.canonical_bytes().to_vec())
+                        let appended = tx
+                            .append_with(&identity, |previous, now| {
+                                assert!(previous.is_none());
+                                Ok::<_, Error>(rss_audit_core::prepare(e, now)?)
+                            })
+                            .await?;
+                        assert!(appended.inserted());
+                        Ok::<_, Error>(appended.record().prepared().canonical_bytes().to_vec())
                     })
                 })
                 .await,
@@ -67,10 +67,15 @@ pub(super) async fn run(
                             })
                             .await
                             .map_err(Error::from)?;
-                            let r = tx.find(identity).await?.ok_or(Error::StorageContract)?;
-                            assert_eq!(r.prepared().canonical_bytes(), expected.as_slice());
-                            recovered.extend_from_slice(r.prepared().canonical_bytes());
-                            assert!(!tx.append(r.prepared()).await?.inserted());
+                            let appended = tx
+                                .append_with(identity, |previous, _| {
+                                    let r = previous.ok_or(Error::StorageContract)?;
+                                    assert_eq!(r.prepared().canonical_bytes(), expected.as_slice());
+                                    recovered.extend_from_slice(r.prepared().canonical_bytes());
+                                    Ok::<_, Error>(r.prepared().clone())
+                                })
+                                .await?;
+                            assert!(!appended.inserted());
                             Ok::<_, Error>(())
                         })
                     },
@@ -83,6 +88,7 @@ pub(super) async fn run(
 }
 
 pub(super) async fn single_connection(pool: &PgPool) -> anyhow::Result<()> {
+    resolution::isolation(pool).await?;
     locking::run(pool).await?;
     let one = PgPoolOptions::new()
         .max_connections(1)
@@ -98,8 +104,11 @@ pub(super) async fn single_connection(pool: &PgPool) -> anyhow::Result<()> {
         store
             .write_tx_with_context(tenant()?, &control, (), move |_, tx| {
                 Box::pin(async move {
-                    let p = tx.prepare(e).await?;
-                    tx.append(&p).await?;
+                    let identity = e.identity().clone();
+                    tx.append_with(&identity, |_, now| {
+                        Ok::<_, Error>(rss_audit_core::prepare(e, now)?)
+                    })
+                    .await?;
                     Ok::<_, Error>(())
                 })
             })
@@ -112,10 +121,12 @@ pub(super) async fn single_connection(pool: &PgPool) -> anyhow::Result<()> {
             .write_tx_with_context(tenant()?, &control, (), move |_, tx| {
                 Box::pin(async move {
                     assert!(matches!(
-                        tx.find(e.identity()).await,
+                        tx.append_with(e.identity(), |_, _| Err::<PreparedAuditV1, Error>(
+                            Error::StorageContract
+                        ))
+                        .await,
                         Err(Error::ScopeMismatch)
                     ));
-                    assert!(matches!(tx.prepare(e).await, Err(Error::ScopeMismatch)));
                     Err::<(), Error>(Error::ScopeMismatch)
                 })
             })

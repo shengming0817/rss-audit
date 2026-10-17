@@ -1,4 +1,4 @@
--- One statement snapshot. Runtime authority is recomputed for every operation.
+-- One installation/startup snapshot of the actual role and storage contract.
 WITH reachable AS MATERIALIZED (
  SELECT * FROM pg_roles WHERE pg_has_role(current_user,oid,'SET')
 ), relations AS MATERIALIZED (

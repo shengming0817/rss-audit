@@ -1,7 +1,7 @@
 use rss_redact::RedactedSource;
 use rss_transactional_messaging::transaction::LocalTxDeadlineStage;
 
-/// Closed live admission categories without database identifiers.
+/// Closed startup storage admission categories without database identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionViolation {
     /// Missing or changed durable schema.
@@ -30,7 +30,7 @@ pub enum StorageFailure {
 /// Operation failure. Settlement remains a separate canonical `LocalTxAttempt`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Live schema or role admission failed.
+    /// Installation/startup schema or role validation failed.
     #[error("audit admission violation: {0:?}")]
     Admission(AdmissionViolation),
     /// Caller supplied an invalid cursor or bound.

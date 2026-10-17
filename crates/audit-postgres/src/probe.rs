@@ -3,12 +3,16 @@ use rss_request_context::TenantId;
 use sqlx::{PgConnection, Row};
 
 pub(crate) async fn tenant(connection: &mut PgConnection, expected: TenantId) -> Result<(), Error> {
-    admission(connection, Some(expected)).await
+    let setting: Option<String> =
+        sqlx::query_scalar("SELECT current_setting('rss.tenant_id',true)")
+            .fetch_one(connection)
+            .await?;
+    if setting.as_deref().and_then(|s| TenantId::parse(s).ok()) != Some(expected) {
+        return Err(Error::ScopeMismatch);
+    }
+    Ok(())
 }
 pub(crate) async fn validate(connection: &mut PgConnection) -> Result<(), Error> {
-    admission(connection, None).await
-}
-async fn admission(connection: &mut PgConnection, tenant: Option<TenantId>) -> Result<(), Error> {
     let append = MIGRATION_SQL
         .split("$append$")
         .nth(1)
@@ -41,12 +45,6 @@ async fn admission(connection: &mut PgConnection, tenant: Option<TenantId>) -> R
         )
         .fetch_one(connection)
         .await?;
-    if let Some(expected) = tenant {
-        let setting: Option<String> = row.try_get("tenant")?;
-        if setting.as_deref().and_then(|s| TenantId::parse(s).ok()) != Some(expected) {
-            return Err(Error::ScopeMismatch);
-        }
-    }
     for (column, category) in [
         ("roles", Violation::Role),
         ("schema", Violation::Schema),

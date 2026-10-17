@@ -23,7 +23,7 @@ intervention, while connection interruption, contention and cancellation may be 
 The messaging conversion preserves that classification; neither class grants ACK authority.
 
 `read_tx_with_context(tenant, control, context, callback)` supplies `ReadAuditTransaction`
-inside a PostgreSQL read-only transaction. It validates live admission before trusted reads,
+inside a PostgreSQL read-only transaction. It checks tenant scope before trusted reads,
 never reserves Audit/Ledger heads, and exposes no append or lock operation.
 `write_tx_with_context` supplies `WriteAuditTransaction` after acquiring Audit then optional
 Ledger locks. It also provides the read methods. Pass `()` when no context is needed.
@@ -64,13 +64,24 @@ before business/outbox locks. Both paths reserve the heads
 without writing an event. Failures propagate to the original owner; Ledger never
 falls back to Plain. An empty head is allowed and allocates no event position.
 
-After deriving final facts, `WriteAuditTransaction::prepare` or `PgAudit::prepare_in`
-uses database time on the already borrowed connection, avoiding a second pool lease.
-Persist exact canonical bytes in the product receipt and append in that same transaction.
-`find` / `find_in` retrieves a record by stable identity, including stored integrity mode;
-it is a structural read, not ledger verification or a commit/rollback receipt.
-Absence alone does not settle a previous attempt. Product recovery must first serialize
-with the previous transaction and use a fresh snapshot before making recovery decisions.
+After deriving final facts, use `WriteAuditTransaction::append_with(identity, resolver)` or
+`PgAudit::append_with_in(tx, identity, resolver)`. The resolver is synchronous: it receives
+`Option<&Record>` and database time, then returns an existing `PreparedAuditV1` or prepares
+new bytes with `rss_audit_core::prepare`. The adapter validates identity and mode, stages the
+Ledger and Audit entries, and returns `StagedAppend` with the exact persisted bytes.
+No public reservation, permission cache or second transaction is introduced.
+
+These operations require READ COMMITTED so a lookup after locking sees settled prior writes.
+The owned write callback already holds the heads. A messaging caller must call `lock_head_in`
+**before** reading product receipts or taking business/outbox locks; later locking cannot
+retroactively validate earlier reads. Resolver errors propagate unchanged; synchronous work
+must stay bounded by the caller's operation budget.
+
+Product receipt consistency remains product-owned: only a valid matching pair may restore
+exact bytes. A missing or damaged side must fail, not trigger automatic repair. Save the returned
+canonical bytes in the same transaction. After commit-unknown, serialize with the previous
+transaction and restore committed materials; an unlocked absent read is not rollback evidence.
+The exact `append`/`append_in` APIs remain for already-prepared durable retry/outbox requests.
 
 ## Integrity and reads
 
@@ -115,16 +126,31 @@ tenant scope, acquire the serialization lock and append. Both tables FORCE RLS, 
 their owner. Ledger and transactional-messaging installations/grants remain separately owned.
 The host must configure authenticated TLS; Audit does not accept a URL or replace pool settings.
 Admission checks actual role, inherited/switchable access, columns, constraints, RLS, definer
-bodies/configuration, durability and privileges. Unexpected drift fails closed. Privileged
+bodies/configuration, durability and privileges. Incompatible configuration fails startup validation. Privileged
 operators can still alter storage; Audit provides no WORM, retention/hold, key custody or DR policy.
 
 ref: launchbadge/sqlx sqlx-core/src/transaction.rs@v0.9.0
 ref: sea-ql/sea-orm TransactionError<E>@2.0.2 (typed callback error, not settlement authority)
 
-Tenant-bound lock, prepare, find and append calls recheck live tenant and storage admission
-on each public operation, including after trusted SQL callbacks. These checks deliberately
-include one catalog snapshot query with a shared reachable-role closure; no cached admission
-replaces permission-revocation checks. The
+Tenant-bound operations check the actual tenant without repeating startup catalog validation. The
 independent prepare operation only reads database time without binding a transaction tenant.
 `Error::is_interrupted()` classifies Audit and Ledger deadline/cancellation causes consistently;
 it does not prove rollback or authorize a retry.
+
+## Installation and startup validation
+
+`PgAudit::new` validates the actual Audit pool's role, schema, RLS, ACLs and functions.
+Ledger mode validates Ledger storage on the same lease, including for a one-connection pool.
+For a different borrowed runtime, call `validate_connection(connection, control)` or
+`validate_in(message_transaction)` during startup using its **actual** credential/connection.
+The latter inherits the original message owner's budget; neither method changes settings,
+acquires a second connection, repairs permissions or owns settlement. Hosts must bound server
+execution and retire unconfirmed connections after cancellation.
+
+Database engines, controlled deployment roles and trusted host infrastructure are inside the
+trust boundary. Stop and drain relevant writers before schema/role changes, validate the new
+configuration, then resume. Failure keeps service closed. Ordinary operations do not inspect
+catalogs or promise to detect arbitrary administrator GRANT/DDL before the next method call.
+SQL permissions/RLS, tenant scope, canonical identity and data/Ledger integrity still apply.
+Product authorization and revocation remain live at their separately defined business boundary.
+This is not protection against a database controller or a WORM guarantee.

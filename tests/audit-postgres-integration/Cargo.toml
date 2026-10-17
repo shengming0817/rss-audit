@@ -11,6 +11,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sy
 anyhow.workspace = true
 
 [dev-dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
 rss-audit-http-axum.workspace = true
 axum.workspace = true
 tower.workspace = true

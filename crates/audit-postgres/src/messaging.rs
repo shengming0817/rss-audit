@@ -1,5 +1,5 @@
 use crate::{Error, Integrity, PgAudit, StagedAppend, repository};
-use rss_audit_core::{AuditEventV1, PreparedAuditV1, RecordIdentity};
+use rss_audit_core::{PreparedAuditV1, RecordIdentity};
 use rss_redact::RedactedSource;
 use rss_transactional_messaging::error::MessagingErrorKind;
 use rss_transactional_messaging_postgres::{PgError, PgTransaction};
@@ -24,35 +24,51 @@ impl PgAudit {
         }
         Ok(())
     }
-    /// Prepare from database time on the message owner's connection and remaining budget.
-    pub async fn prepare_in(
-        &self,
-        tx: &mut PgTransaction<'_>,
-        event: AuditEventV1,
-    ) -> Result<PreparedAuditV1, Error> {
-        let tenant = tx.tenant_id();
-        if event.identity().tenant() != tenant {
-            return Err(Error::ScopeMismatch);
+    /// Verify this actual message owner's role and storage during startup, before accepting work.
+    /// Inherits its budget/connection and leaves all settlement to the owner.
+    pub async fn validate_in(&self, tx: &mut PgTransaction<'_>) -> Result<(), Error> {
+        tx.with_connection(|c| Box::pin(async move { Ok(crate::probe::validate(c).await) }))
+            .await??;
+        #[cfg(feature = "ledger")]
+        if matches!(self.integrity, Integrity::Ledger(_)) {
+            rss_ledger_postgres::validate_in(tx).await?;
         }
-        tx.with_connection(move |c| {
-            Box::pin(async move { Ok(repository::prepare(c, event, Some(tenant)).await) })
-        })
-        .await?
+        Ok(())
     }
-    /// Read by stable identity without interpreting absence as rollback evidence.
-    pub async fn find_in(
+    /// Resolve and stage a fact on the message owner's READ COMMITTED transaction.
+    /// Acquire `lock_head_in` before deriving business facts or reading product receipts;
+    /// this method cannot retroactively protect earlier reads or business locks.
+    /// The synchronous resolver returns exact bytes; product receipt rules remain caller-owned.
+    pub async fn append_with_in<E, F>(
         &self,
         tx: &mut PgTransaction<'_>,
         identity: &RecordIdentity,
-    ) -> Result<Option<crate::Record>, Error> {
+        resolve: F,
+    ) -> Result<StagedAppend, E>
+    where
+        E: From<Error> + Send,
+        F: FnOnce(Option<&crate::Record>, rss_contract::Timepoint) -> Result<PreparedAuditV1, E>
+            + Send,
+    {
         if identity.tenant() != tx.tenant_id() {
-            return Err(Error::ScopeMismatch);
+            return Err(Error::ScopeMismatch.into());
         }
-        let identity = identity.clone();
-        tx.with_connection(move |c| {
-            Box::pin(async move { Ok(repository::find(c, &identity).await) })
-        })
-        .await?
+        self.lock_head_in(tx).await?;
+        let id = identity.clone();
+        let (existing, now) = tx
+            .with_connection(move |c| {
+                Box::pin(async move { Ok(repository::resolution(c, &id).await) })
+            })
+            .await
+            .map_err(Error::from)??;
+        let request = resolve(existing.as_ref(), now)?;
+        repository::check_resolved(
+            identity,
+            &request,
+            existing.as_ref(),
+            self.integrity.is_ledger(),
+        )?;
+        self.stage_in(tx, &request, existing).await.map_err(E::from)
     }
     /// Stage Audit in the message owner's actual connection and remaining budget.
     /// Does not acquire from this adapter's pool, change GUCs, begin or settle.
@@ -74,6 +90,14 @@ impl PgAudit {
                 )
             })
             .await??;
+        self.stage_in(tx, request, existing).await
+    }
+    async fn stage_in(
+        &self,
+        tx: &mut PgTransaction<'_>,
+        request: &PreparedAuditV1,
+        existing: Option<crate::Record>,
+    ) -> Result<StagedAppend, Error> {
         let ledger = match &self.integrity {
             Integrity::Plain => None,
             #[cfg(feature = "ledger")]

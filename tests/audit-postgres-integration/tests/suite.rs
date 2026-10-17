@@ -22,6 +22,7 @@ mod composition;
 mod http;
 mod messaging;
 mod paging;
+mod query_cost;
 mod reads;
 
 struct TestClock;
@@ -161,6 +162,7 @@ async fn exercise(
     fixture: &testkit::PgTlsFixture,
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
+    query_cost::run(pool, admin, control).await?;
     basic(plain, ledger, control).await?;
     atomicity::run(plain, ledger, admin, control).await?;
     reads::run(plain, ledger, admin, control).await?;
@@ -169,7 +171,7 @@ async fn exercise(
     http::run(plain, ledger, pool, admin, control).await?;
     composition::run(plain, ledger, admin, control).await?;
     composition::single_connection(pool).await?;
-    admission::run(plain, pool, admin, control).await?;
+    admission::run(pool, admin, control).await?;
     Ok(())
 }
 async fn install(admin: &PgPool) -> anyhow::Result<()> {

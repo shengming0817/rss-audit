@@ -84,11 +84,12 @@ impl<T: ExecutionTimer> LedgerClock<'_, T> {
     pub(crate) fn budget<'a>(
         &'a self,
         control: &'a Control<'_, T>,
+        stage: LocalTxDeadlineStage,
     ) -> rss_ledger_postgres::Control<'a, Self> {
         rss_ledger_postgres::Control::new(
             self,
             control
-                .operation_deadline
+                .deadline(stage)
                 .instant()
                 .saturating_duration_since(self.1),
             control.cancel,

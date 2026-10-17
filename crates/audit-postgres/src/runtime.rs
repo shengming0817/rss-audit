@@ -65,7 +65,7 @@ impl PgAudit {
             .run(Stage::Acquire, async {
                 let connection = pool.acquire().await?;
                 let mut lease = Lease::new(connection);
-                probe::validate(&mut lease.connection).await?;
+                validate_storage(&mut lease.connection, &integrity, control).await?;
                 lease.confirmed = true;
                 Ok(())
             })
@@ -77,6 +77,21 @@ impl PgAudit {
             fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         })
     }
+    /// Verify the actual host runtime connection before accepting work.
+    /// Does not acquire another connection, change settings or settle a transaction.
+    /// The host bounds server execution and isolates unconfirmed connections on cancellation.
+    pub async fn validate_connection<T: ExecutionTimer>(
+        &self,
+        connection: &mut PgConnection,
+        control: &Control<'_, T>,
+    ) -> Result<(), Error> {
+        control
+            .run(
+                Stage::Setup,
+                validate_storage(connection, &self.integrity, control),
+            )
+            .await
+    }
     /// Assign recording time from PostgreSQL and return exact retry bytes, not commit evidence.
     /// Preserve this request, including its timestamp, after an uncertain append.
     pub async fn prepare<T: ExecutionTimer>(
@@ -87,8 +102,7 @@ impl PgAudit {
         control
             .run(Stage::Operation, async {
                 let mut lease = Lease::new(self.pool.acquire().await?);
-                let prepared =
-                    crate::repository::prepare(&mut lease.connection, event, None).await?;
+                let prepared = crate::repository::prepare(&mut lease.connection, event).await?;
                 lease.confirmed = true;
                 Ok(prepared)
             })
@@ -148,7 +162,7 @@ impl PgAudit {
         )
     }
     /// Execute trusted read SQL in a PostgreSQL read-only tenant transaction.
-    /// Full live admission precedes the callback; Audit/Ledger heads are never reserved.
+    /// Storage is admitted at startup; Audit/Ledger heads are never reserved.
     /// Callback errors retain their type, and only acknowledged settlement yields a receipt.
     pub async fn read_tx_with_context<T: ExecutionTimer, R: Send, E: Send, C: Send, F>(
         &self,
@@ -252,7 +266,7 @@ impl PgAudit {
                     match access {
                         Access::WriteCallback => transaction.lock_head().await?,
                         Access::ReadCallback => probe::tenant(transaction.read.tx, tenant).await?,
-                        // Private single-operation callbacks perform their own admission.
+                        // Private operations retain their tenant and data checks.
                         Access::Append | Access::ReadOperation => {}
                     }
                     control.check(Stage::Operation)?;
@@ -407,4 +421,21 @@ pub(crate) fn ledger_id(tenant: TenantId) -> Result<rss_ledger::LedgerId, Error>
         rss_ledger::ChainId::parse(rss_audit_core::AUDIT_CHAIN_ID)
             .map_err(rss_audit_core::Error::from)?,
     ))
+}
+
+async fn validate_storage<T: ExecutionTimer>(
+    connection: &mut PgConnection,
+    integrity: &Integrity,
+    control: &Control<'_, T>,
+) -> Result<(), Error> {
+    probe::validate(connection).await?;
+    #[cfg(feature = "ledger")]
+    if matches!(integrity, Integrity::Ledger(_)) {
+        let clock = crate::control::LedgerClock(control.timer, control.timer.now());
+        rss_ledger_postgres::validate_connection(connection, &clock.budget(control, Stage::Setup))
+            .await?;
+    }
+    #[cfg(not(feature = "ledger"))]
+    let _ = (integrity, control);
+    Ok(())
 }

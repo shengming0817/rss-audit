@@ -33,14 +33,11 @@ impl PgConsumerEffect<Vec<u8>> for Effect {
         let decoded = decode_untrusted(self.request.canonical_bytes())
             .map_err(PgConsumerEffectFailure::infrastructure)?;
         let identity = decoded.event().identity();
-        let prior = self
-            .store
-            .find_in(tx, identity)
-            .await
-            .map_err(PgConsumerEffectFailure::infrastructure)?;
-        assert!(prior.is_none());
         self.store
-            .append_in(tx, &self.request)
+            .append_with_in(tx, identity, |previous, _| {
+                assert!(previous.is_none());
+                Ok::<_, rss_audit_postgres::Error>(self.request.clone())
+            })
             .await
             .map_err(PgConsumerEffectFailure::infrastructure)?;
         let id = decode_untrusted(self.request.canonical_bytes())
@@ -109,25 +106,8 @@ pub(super) async fn run(
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
     install(admin).await?;
-    let p = fixture.params();
-    let runtime = Arc::new(
-        PgRuntime::connect(
-            PgConfig::new(
-                &p.host,
-                p.port,
-                &p.database,
-                "audit_runtime",
-                PgPassword::new("fixture-password"),
-                PgPrivateCa::from_pem(fixture.ca_pem().as_bytes().to_vec())?,
-            ),
-            TestClock,
-            ExecutionBinding::new(
-                StorageIdentity::new([1; 16], [2; 16])?,
-                vec![(tenant()?, Epoch::new(1)?)],
-            )?,
-        )
-        .await?,
-    );
+    let runtime = connect(fixture, "audit_runtime").await?;
+    startup(plain, ledger, admin, fixture).await?;
     for (mode, store) in [
         ("borrowed-plain", plain.clone()),
         ("borrowed-ledger", ledger.clone()),
@@ -138,11 +118,17 @@ pub(super) async fn run(
         let prepared = runtime
             .local_tx(tenant()?, deadline()?, move |tx| {
                 Box::pin(async move {
+                    writer.validate_in(tx).await?;
                     writer.lock_head_in(tx).await?;
-                    assert!(writer.find_in(tx, e.identity()).await?.is_none());
-                    let prepared = writer.prepare_in(tx, e).await?;
-                    assert!(writer.append_in(tx, &prepared).await?.inserted());
-                    Ok(prepared)
+                    let id = e.identity().clone();
+                    let appended = writer
+                        .append_with_in(tx, &id, |previous, now| {
+                            assert!(previous.is_none());
+                            Ok::<_, rss_audit_postgres::Error>(rss_audit_core::prepare(e, now)?)
+                        })
+                        .await?;
+                    assert!(appended.inserted());
+                    Ok(appended.record().prepared().clone())
                 })
             })
             .await
@@ -152,15 +138,18 @@ pub(super) async fn run(
             .local_tx(tenant()?, deadline()?, move |tx| {
                 Box::pin(async move {
                     replay.lock_head_in(tx).await?;
-                    let found = replay
-                        .find_in(tx, &identity)
-                        .await?
-                        .ok_or(rss_audit_postgres::Error::StorageContract)?;
-                    assert_eq!(
-                        found.prepared().canonical_bytes(),
-                        prepared.canonical_bytes()
-                    );
-                    assert!(!replay.append_in(tx, found.prepared()).await?.inserted());
+                    let appended = replay
+                        .append_with_in(tx, &identity, |previous, _| {
+                            let found =
+                                previous.ok_or(rss_audit_postgres::Error::StorageContract)?;
+                            assert_eq!(
+                                found.prepared().canonical_bytes(),
+                                prepared.canonical_bytes()
+                            );
+                            Ok::<_, rss_audit_postgres::Error>(found.prepared().clone())
+                        })
+                        .await?;
+                    assert!(!appended.inserted());
                     Ok(())
                 })
             })
@@ -172,11 +161,14 @@ pub(super) async fn run(
             .local_tx(tenant()?, deadline()?, move |tx| {
                 Box::pin(async move {
                     assert!(matches!(
-                        store.find_in(tx, foreign.identity()).await,
-                        Err(rss_audit_postgres::Error::ScopeMismatch)
-                    ));
-                    assert!(matches!(
-                        store.prepare_in(tx, foreign).await,
+                        store
+                            .append_with_in(tx, foreign.identity(), |_, _| Err::<
+                                PreparedAuditV1,
+                                rss_audit_postgres::Error,
+                            >(
+                                rss_audit_postgres::Error::StorageContract
+                            ))
+                            .await,
                         Err(rss_audit_postgres::Error::ScopeMismatch)
                     ));
                     tx.with_connection(move |c| {
@@ -369,5 +361,87 @@ async fn install(admin: &PgPool) -> anyhow::Result<()> {
         .bind(tenant()?.to_string())
         .execute(admin)
         .await?;
+    Ok(())
+}
+
+async fn connect(fixture: &testkit::PgTlsFixture, role: &str) -> anyhow::Result<Arc<PgRuntime>> {
+    let p = fixture.params();
+    Ok(Arc::new(
+        PgRuntime::connect(
+            PgConfig::new(
+                &p.host,
+                p.port,
+                &p.database,
+                role,
+                PgPassword::new("fixture-password"),
+                PgPrivateCa::from_pem(fixture.ca_pem().as_bytes().to_vec())?,
+            ),
+            TestClock,
+            ExecutionBinding::new(
+                StorageIdentity::new([1; 16], [2; 16])?,
+                vec![(tenant()?, Epoch::new(1)?)],
+            )?,
+        )
+        .await?,
+    ))
+}
+
+async fn startup(
+    plain: &PgAudit,
+    ledger: &PgAudit,
+    admin: &PgPool,
+    fixture: &testkit::PgTlsFixture,
+) -> anyhow::Result<()> {
+    sqlx::raw_sql("CREATE ROLE audit_borrower LOGIN PASSWORD 'fixture-password'; GRANT audit_runtime TO audit_borrower")
+        .execute(admin).await?;
+    let runtime = connect(fixture, "audit_borrower").await?;
+    for (store, grant, revoke, is_ledger) in [
+        (
+            plain,
+            "GRANT UPDATE ON rss_audit.records TO audit_borrower",
+            "REVOKE UPDATE ON rss_audit.records FROM audit_borrower",
+            false,
+        ),
+        (
+            ledger,
+            "GRANT UPDATE ON rss_ledger.entries TO audit_borrower",
+            "REVOKE UPDATE ON rss_ledger.entries FROM audit_borrower",
+            true,
+        ),
+    ] {
+        sqlx::raw_sql(grant).execute(admin).await?;
+        let validator = store.clone();
+        runtime
+            .local_tx(tenant()?, deadline()?, move |tx| {
+                Box::pin(async move {
+                    let result = validator.validate_in(tx).await;
+                    if is_ledger {
+                        assert!(matches!(
+                            result,
+                            Err(rss_audit_postgres::Error::Ledger(
+                                rss_ledger_postgres::Error::Admission(_)
+                            ))
+                        ));
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Err(rss_audit_postgres::Error::Admission(_))
+                        ));
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .fold(Ok, Err, Err, Err, Err, Err)?;
+        sqlx::raw_sql(revoke).execute(admin).await?;
+        let validator = store.clone();
+        runtime
+            .local_tx(tenant()?, deadline()?, move |tx| {
+                Box::pin(async move { validator.validate_in(tx).await.map_err(PgError::from) })
+            })
+            .await
+            .fold(Ok, Err, Err, Err, Err, Err)?;
+    }
+    runtime.close().await;
     Ok(())
 }

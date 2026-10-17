@@ -1,11 +1,13 @@
 use super::*;
+mod budget;
 pub(super) async fn run(
-    store: &PgAudit,
     pool: &PgPool,
     admin: &PgPool,
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
-    live_drift(store, admin, control).await?;
+    budget::run(pool).await?;
+    foreign_role(pool, admin, control).await?;
+    borrowed(pool, admin, control).await?;
     sqlx::raw_sql("CREATE ROLE unrelated_audit_reader NOLOGIN; GRANT SELECT ON rss_audit.records TO unrelated_audit_reader").execute(admin).await?;
     // Grants to an unreachable role are permitted; no ACL grantee whitelist is implied.
     PgAudit::new(pool.clone(), Integrity::Plain, control).await?;
@@ -55,13 +57,6 @@ pub(super) async fn run(
                 .is_err(),
             "accepted drift: {change}"
         );
-        rolled_back(
-            store
-                .read_page(Cursor::start(tenant()?), ReadLimit::new(1, 10000)?, control)
-                .await,
-            |e| matches!(e, Error::Admission(_)),
-        );
-        rejects_callback(store, control).await?;
         sqlx::raw_sql(restore).execute(admin).await?;
         // Dropped columns remain physical drift: the fresh schema contract intentionally rejects them.
         if !change.contains("ADD COLUMN") {
@@ -71,84 +66,48 @@ pub(super) async fn run(
     Ok(())
 }
 
-async fn live_drift(
-    store: &PgAudit,
+async fn borrowed(
+    pool: &PgPool,
     admin: &PgPool,
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
-    let prepared = store
-        .prepare(
-            event(tenant()?, "live-admission", "revoked", vec![])?,
-            control,
-        )
+    let ledger = PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), control).await?;
+    let mut actual = pool.acquire().await?;
+    sqlx::raw_sql("GRANT UPDATE ON rss_ledger.entries TO audit_runtime")
+        .execute(admin)
         .await?;
-    for operation in 0..4 {
-        let attempt = store
-            .write_tx_with_context(
-                tenant()?,
-                control,
-                (admin, &prepared),
-                |(admin, prepared), tx| {
-                    Box::pin(async move {
-                        sqlx::raw_sql("GRANT UPDATE ON rss_audit.records TO audit_runtime")
-                            .execute(*admin)
-                            .await?;
-                        // A successful pre-lock gate is never reused as authorization for a later public operation.
-                        let tenant = tx.tenant_id();
-                        let rejected = match operation {
-                            0 => tx
-                                .prepare(
-                                    event(tenant, "live-admission", "prepare", vec![])
-                                        .map_err(|_| Error::StorageContract)?,
-                                )
-                                .await
-                                .map(|_| ()),
-                            1 => tx
-                                .find(
-                                    decode_untrusted(prepared.canonical_bytes())?
-                                        .event()
-                                        .identity(),
-                                )
-                                .await
-                                .map(|_| ()),
-                            2 => tx
-                                .read_page(Cursor::start(tenant), ReadLimit::new(1, 131072)?)
-                                .await
-                                .map(|_| ()),
-                            _ => tx.append(prepared).await.map(|_| ()),
-                        };
-                        sqlx::raw_sql("REVOKE UPDATE ON rss_audit.records FROM audit_runtime")
-                            .execute(*admin)
-                            .await?;
-                        rejected
-                    })
-                },
-            )
-            .await;
-        rolled_back(attempt, |e| {
-            matches!(e, TransactionError::Operation(Error::Admission(_)))
-        });
-    }
+    assert!(
+        PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), control)
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        ledger.validate_connection(&mut actual, control).await,
+        Err(Error::Ledger(rss_ledger_postgres::Error::Admission(_)))
+    ));
+    // Plain Audit does not require Ledger privileges or installation.
+    PgAudit::new(pool.clone(), Integrity::Plain, control).await?;
+    sqlx::raw_sql("REVOKE UPDATE ON rss_ledger.entries FROM audit_runtime")
+        .execute(admin)
+        .await?;
+    PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), control).await?;
+    ledger.validate_connection(&mut actual, control).await?;
+    drop(actual);
     Ok(())
 }
 
-async fn rejects_callback(store: &PgAudit, control: &Control<'_, TestClock>) -> anyhow::Result<()> {
-    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = entered.clone();
-    rolled_back(
-        store
-            .write_tx_with_context(tenant()?, control, (), move |_, _| {
-                Box::pin(async move {
-                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                    Ok::<_, Error>(())
-                })
-            })
-            .await,
-        |e| matches!(e, TransactionError::Audit(Error::Admission(_))),
-    );
-    assert!(
-        !entered.load(std::sync::atomic::Ordering::SeqCst),
-        "callback entered after admission drift"
-    );
+async fn foreign_role(
+    pool: &PgPool,
+    admin: &PgPool,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let plain = PgAudit::new(pool.clone(), Integrity::Plain, control).await?;
+    let mut foreign = admin.acquire().await?;
+    assert!(matches!(
+        plain.validate_connection(&mut foreign, control).await,
+        Err(Error::Admission(_))
+    ));
+    let mut actual = pool.acquire().await?;
+    plain.validate_connection(&mut actual, control).await?;
     Ok(())
 }

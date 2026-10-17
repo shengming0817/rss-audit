@@ -24,7 +24,9 @@ with_connection 不抹去宿主错误。删除无载荷 Rejected，不保留旧�
 未确认连接退役。借用 SQL 是可信基础设施接口，不是沙箱；生命周期 SQL、tenant 修改及吞错均禁止。
 
 Fresh schema 通过固定 definer 函数追加，runtime 只有 SELECT/EXECUTE，不直接 DML。两表 FORCE RLS；
-构造和操作入口验证实际连接、角色、可继承/切换权限、列/约束、RLS、函数内容及 search_path。
+安装/启动通过构造或显式验证入口核验实际运行连接、角色、可继承/切换权限、列/约束、RLS、函数内容及 search_path。
+#2801 修订：退出逐操作完整目录自检与任意管理员变更即时拒绝承诺；操作期保留租户和数据完整性检查。
+结构/数据库角色变更由可信宿主暂停相关写入、排空、变更、重新验证后恢复，失败不接流。
 稳定文本 ID 使用 C collation。按 Audit → ledger → business/outbox 顺序加锁，避免循环等待。
 
 普通页按独立 Cursor 返回结构校验记录；SQL 在返回 payload 前检查整页行数及 canonical 字节预算。
@@ -42,7 +44,7 @@ memory provider、HTTP 或来源产品改造。MDM #2498、Identity #2499、HTTP
 
 ## 验证边界
 
-本仓 T2 使用真实 TLS PostgreSQL，覆盖独立与消息事务、RLS/权限漂移、同 ID 并发、原字节恢复、
+本仓 T2 使用真实 TLS PostgreSQL，覆盖独立与消息事务、RLS/权限错误启动拒绝、实际 SQL 权限故障、同 ID 并发、原字节恢复、
 COMMIT 发送前暂停、真实 COMMIT 执行中断及 ACK 后丢失、后端终止、损坏和有界读取。
 真实在途证据由延迟约束触发器阻塞 COMMIT，并核对 pg_stat_activity 与阻塞 PID 后才中断；
 中断后的数据库结果可以是提交或回滚，恢复必须原字节重试并保持业务/Audit 原子性。
@@ -50,3 +52,7 @@ core 行为由现有协议和 ledger 组合测试覆盖，plain PG、ledger 与 
 真实 MDM/Identity 接入由消费产品验证，本仓 T1/T2 不代替产品 T3；日常选择遵循[验证范围](../../rules/verification-scope.md)。
 
 ref: launchbadge/sqlx sqlx-core/src/transaction.rs@v0.9.0
+
+#2801 普通追加使用 append_with/append_with_in，在既有锁内统一查重、数据库时间、身份校验和追加；
+同步 resolver 只选择精确材料，产品仍拥有回执一致性和业务事实。要求 READ COMMITTED，
+单边回执损坏不得自动补写。保留精确 prepared 追加、原 owner 结算、锁顺序、位置与分页语义。
