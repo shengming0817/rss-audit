@@ -75,6 +75,10 @@ SELECT current_setting('rss.tenant_id',true) AS tenant,
  AND NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
  WHERE n.nspname='rss_audit' AND ((CASE WHEN $5::boolean THEN NOT has_function_privilege(current_user,p.oid,'EXECUTE') ELSE EXISTS(SELECT FROM reachable r WHERE has_function_privilege(r.oid,p.oid,'EXECUTE')) END)
  OR EXISTS (SELECT 1 FROM reachable r WHERE has_function_privilege(r.oid,p.oid,'EXECUTE WITH GRANT OPTION'))))
+ AND ($5::boolean OR NOT EXISTS (
+ SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace CROSS JOIN reachable r
+ WHERE n.nspname='rss_ledger' AND has_function_privilege(r.oid,p.oid,'EXECUTE')
+ ))
  AND NOT EXISTS (SELECT 1 FROM (
  SELECT a.grantee,a.is_grantable FROM pg_namespace n,
  LATERAL aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a WHERE n.nspname='rss_audit'
