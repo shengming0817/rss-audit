@@ -61,11 +61,19 @@ impl PgAudit {
         integrity: Integrity,
         control: &Control<'_, T>,
     ) -> Result<Self, Error> {
+        Self::connect(pool, integrity, control, true).await
+    }
+    pub(crate) async fn connect<T: ExecutionTimer>(
+        pool: PgPool,
+        integrity: Integrity,
+        control: &Control<'_, T>,
+        append: bool,
+    ) -> Result<Self, Error> {
         control
             .run(Stage::Acquire, async {
                 let connection = pool.acquire().await?;
                 let mut lease = Lease::new(connection);
-                validate_storage(&mut lease.connection, &integrity, control).await?;
+                validate_storage(&mut lease.connection, &integrity, control, append).await?;
                 lease.confirmed = true;
                 Ok(())
             })
@@ -88,7 +96,7 @@ impl PgAudit {
         control
             .run(
                 Stage::Setup,
-                validate_storage(connection, &self.integrity, control),
+                validate_storage(connection, &self.integrity, control, true),
             )
             .await
     }
@@ -423,17 +431,26 @@ pub(crate) fn ledger_id(tenant: TenantId) -> Result<rss_ledger::LedgerId, Error>
     ))
 }
 
-async fn validate_storage<T: ExecutionTimer>(
+pub(crate) async fn validate_storage<T: ExecutionTimer>(
     connection: &mut PgConnection,
     integrity: &Integrity,
     control: &Control<'_, T>,
+    append: bool,
 ) -> Result<(), Error> {
-    probe::validate(connection).await?;
+    if append {
+        probe::validate(connection).await?;
+    } else {
+        probe::validate_read(connection).await?;
+    }
     #[cfg(feature = "ledger")]
     if matches!(integrity, Integrity::Ledger(_)) {
         let clock = crate::control::LedgerClock(control.timer, control.timer.now());
-        rss_ledger_postgres::validate_connection(connection, &clock.budget(control, Stage::Setup))
-            .await?;
+        let budget = clock.budget(control, Stage::Setup);
+        if append {
+            rss_ledger_postgres::validate_connection(connection, &budget).await?;
+        } else {
+            rss_ledger_postgres::validate_read_connection(connection, &budget).await?;
+        }
     }
     #[cfg(not(feature = "ledger"))]
     let _ = (integrity, control);

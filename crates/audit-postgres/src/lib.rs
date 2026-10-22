@@ -7,8 +7,10 @@ mod error;
 mod messaging;
 mod model;
 mod probe;
+mod reader;
 mod repository;
 mod runtime;
+pub use reader::PgAuditReader;
 mod transaction;
 
 pub use control::Control;

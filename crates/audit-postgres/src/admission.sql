@@ -73,7 +73,7 @@ SELECT current_setting('rss.tenant_id',true) AS tenant,
  AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
  WHERE n.nspname='rss_audit' AND c.relkind='r' AND NOT has_table_privilege(current_user,c.oid,'SELECT'))
  AND NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
- WHERE n.nspname='rss_audit' AND (NOT has_function_privilege(current_user,p.oid,'EXECUTE')
+ WHERE n.nspname='rss_audit' AND ((CASE WHEN $5::boolean THEN NOT has_function_privilege(current_user,p.oid,'EXECUTE') ELSE EXISTS(SELECT FROM reachable r WHERE has_function_privilege(r.oid,p.oid,'EXECUTE')) END)
  OR EXISTS (SELECT 1 FROM reachable r WHERE has_function_privilege(r.oid,p.oid,'EXECUTE WITH GRANT OPTION'))))
  AND NOT EXISTS (SELECT 1 FROM (
  SELECT a.grantee,a.is_grantable FROM pg_namespace n,

@@ -13,7 +13,13 @@ pub(crate) async fn tenant(connection: &mut PgConnection, expected: TenantId) ->
     Ok(())
 }
 pub(crate) async fn validate(connection: &mut PgConnection) -> Result<(), Error> {
-    let append = MIGRATION_SQL
+    inspect(connection, true).await
+}
+pub(crate) async fn validate_read(connection: &mut PgConnection) -> Result<(), Error> {
+    inspect(connection, false).await
+}
+async fn inspect(connection: &mut PgConnection, require_append: bool) -> Result<(), Error> {
+    let append_body = MIGRATION_SQL
         .split("$append$")
         .nth(1)
         .ok_or(Error::StorageContract)?;
@@ -37,12 +43,13 @@ pub(crate) async fn validate(connection: &mut PgConnection) -> Result<(), Error>
     ];
     expected.sort();
     let row = sqlx::query(include_str!("admission.sql"))
-        .bind(append)
+        .bind(append_body)
         .bind(reserve)
         .bind(expected)
         .bind(
             "(tenant_id = (NULLIF(current_setting('rss.tenant_id'::text, true), ''::text))::uuid)",
         )
+        .bind(require_append)
         .fetch_one(connection)
         .await?;
     for (column, category) in [
