@@ -176,17 +176,35 @@ async fn scenario(
     if unknown {
         projection.inject_next_projection_fault(PgTransactionFault::CommitUnknownAfterAck)?;
     }
-    match projection.project_one(&Validator, deadline()?).await? {
-        PgProjectionOutcome::Committed(receipt) => {
+    let PgProjectionOutcome::Attempt(attempt) =
+        projection.project_one(&Validator, deadline()?).await?
+    else {
+        anyhow::bail!("expected local Audit transaction attempt")
+    };
+    let (outcome, pending) = attempt.into_parts();
+    let resolve = outcome.fold(
+        |committed| {
             assert!(!fail && !unknown);
-            assert_eq!(receipt.disposition(), TerminalDisposition::Succeeded);
-        }
-        PgProjectionOutcome::Uncertain(pending) => {
+            assert_eq!(
+                committed.into_parts().1.disposition(),
+                TerminalDisposition::Succeeded
+            );
+            Ok(false)
+        },
+        |_| Err(anyhow::anyhow!("unexpected not-started result")),
+        |_| {
+            assert!(fail);
+            Ok(false)
+        },
+        || Err(anyhow::anyhow!("unexpected rollback failure")),
+        || {
             assert!(unknown);
-            assert!(projection.resolve(&pending, deadline()?).await?.is_some());
-        }
-        PgProjectionOutcome::Deferred(PgProjectionFailure::RolledBack(_)) => assert!(fail),
-        _ => anyhow::bail!("unexpected local Audit projection outcome"),
+            Ok(true)
+        },
+        || Err(anyhow::anyhow!("unexpected fence loss")),
+    )?;
+    if resolve {
+        assert!(projection.resolve(&pending, deadline()?).await?.is_some());
     }
     let facts:(i64,i64,i64,String)=sqlx::query_as("SELECT (SELECT count(*) FROM rss_audit.records WHERE source_id='local-projection' AND event_id=$1),(SELECT count(*) FROM rss_ledger.entries WHERE record_id='v1:local-projection:'||$1),(SELECT count(*) FROM rss_transactional_messaging.inbox WHERE message_id=$1 AND consumer_group='local-audit' AND disposition='succeeded'),(SELECT status FROM rss_transactional_messaging.outbox WHERE message_id=$1)")
         .bind(id).fetch_one(admin).await?;
