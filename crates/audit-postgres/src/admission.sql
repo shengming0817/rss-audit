@@ -75,9 +75,25 @@ SELECT current_setting('rss.tenant_id',true) AS tenant,
  AND NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
  WHERE n.nspname='rss_audit' AND ((CASE WHEN $5::boolean THEN NOT has_function_privilege(current_user,p.oid,'EXECUTE') ELSE EXISTS(SELECT FROM reachable r WHERE has_function_privilege(r.oid,p.oid,'EXECUTE')) END)
  OR EXISTS (SELECT 1 FROM reachable r WHERE has_function_privilege(r.oid,p.oid,'EXECUTE WITH GRANT OPTION'))))
- AND ($5::boolean OR NOT EXISTS (
- SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace CROSS JOIN reachable r
- WHERE n.nspname='rss_ledger' AND has_function_privilege(r.oid,p.oid,'EXECUTE')
+ -- Plain does not require Ledger installation or SELECT, but must not carry sink mutation authority.
+ AND ($5::boolean OR (
+ NOT EXISTS (SELECT FROM pg_namespace n CROSS JOIN reachable r
+ WHERE n.nspname='rss_ledger' AND (pg_has_role(r.oid,n.nspowner,'USAGE')
+ OR has_schema_privilege(r.oid,n.oid,'CREATE')))
+ AND NOT EXISTS (SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace CROSS JOIN reachable r
+ WHERE n.nspname='rss_ledger' AND (pg_has_role(r.oid,p.proowner,'USAGE')
+ OR has_function_privilege(r.oid,p.oid,'EXECUTE')))
+ AND NOT EXISTS (SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN reachable r
+ WHERE n.nspname='rss_ledger' AND (pg_has_role(r.oid,c.relowner,'USAGE') OR CASE
+ WHEN c.relkind='S' THEN has_sequence_privilege(r.oid,c.oid,'USAGE,UPDATE')
+ WHEN c.relkind IN ('r','p','v','m','f') THEN
+ has_table_privilege(r.oid,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+ OR has_any_column_privilege(r.oid,c.oid,'INSERT,UPDATE,REFERENCES')
+ ELSE false END))
+ AND NOT EXISTS (SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+ CROSS JOIN LATERAL aclexplode(c.relacl) a CROSS JOIN reachable r
+ WHERE n.nspname='rss_ledger' AND a.privilege_type='MAINTAIN'
+ AND CASE WHEN a.grantee=0 THEN true ELSE pg_has_role(r.oid,a.grantee,'USAGE') END)
  ))
  AND NOT EXISTS (SELECT 1 FROM (
  SELECT a.grantee,a.is_grantable FROM pg_namespace n,
