@@ -154,3 +154,5 @@ catalogs or promise to detect arbitrary administrator GRANT/DDL before the next 
 SQL permissions/RLS, tenant scope, canonical identity and data/Ledger integrity still apply.
 Product authorization and revocation remain live at their separately defined business boundary.
 This is not protection against a database controller or a WORM guarantee.
+
+Read-only hosts use `PgAuditReader` with a separately provisioned credential that has SELECT but no Audit or Ledger append-function authority, including inherited/SET-role authority. It shares the full structural admission and existing bounded page/verified-window/read-transaction implementations, but exposes no append or writer handle. The host owns the pool, deadlines and re-admission after controlled changes.

@@ -11,6 +11,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sy
 anyhow.workspace = true
 
 [dev-dependencies]
+rss-data-protection.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 rss-audit-http-axum.workspace = true
@@ -23,7 +24,7 @@ rss-audit-postgres = { workspace = true, features = ["ledger", "messaging", "int
 rss-ledger.workspace = true
 rss-ledger-postgres.workspace = true
 rss-transactional-messaging = { workspace = true, features = ["consumer", "producer"] }
-rss-transactional-messaging-postgres = { workspace = true, features = ["integration"] }
+rss-transactional-messaging-postgres = { workspace = true, features = ["integration", "recovery"] }
 rss-contract.workspace = true
 rss-diag-context.workspace = true
 rss-request-context.workspace = true

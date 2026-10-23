@@ -7,6 +7,7 @@ use rss_transactional_messaging::{
     transaction::*,
 };
 use rss_transactional_messaging_postgres::*;
+mod local;
 
 fn deadline() -> anyhow::Result<OperationDeadline> {
     Ok(OperationDeadline::from_cutoff(
@@ -224,6 +225,7 @@ pub(super) async fn run(
             .await?;
         }
     }
+    Box::pin(local::run(ledger, admin, fixture, control, &runtime)).await?;
     fenced(ledger, admin, &runtime, control).await?;
     runtime.close().await;
     Ok(())

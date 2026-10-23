@@ -23,6 +23,7 @@ mod http;
 mod messaging;
 mod paging;
 mod query_cost;
+mod reader;
 mod reads;
 
 struct TestClock;
@@ -171,6 +172,7 @@ async fn exercise(
     http::run(plain, ledger, pool, admin, control).await?;
     composition::run(plain, ledger, admin, control).await?;
     composition::single_connection(pool).await?;
+    reader::run(ledger, pool, admin, control).await?;
     admission::run(pool, admin, control).await?;
     Ok(())
 }
