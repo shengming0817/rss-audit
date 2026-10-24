@@ -174,11 +174,21 @@ async fn scenario(
     )
     .await?;
     if unknown {
-        projection.inject_next_projection_fault(PgTransactionFault::CommitUnknownAfterAck)?;
+        projection.inject_next_projection_fault(
+            PgTransactionFault::CommitUnknownAfterAck,
+            std::future::ready(()),
+        )?;
     }
-    let PgProjectionOutcome::Attempt(attempt) =
-        projection.project_one(&Validator, deadline()?).await?
-    else {
+    let mut batch = projection
+        .project_batch(
+            &Validator,
+            std::num::NonZeroUsize::MIN,
+            deadline()?,
+            Duration::from_secs(5),
+        )
+        .await?;
+    assert_eq!(batch.len(), 1);
+    let PgProjectionOutcome::Attempt(attempt) = batch.remove(0).into_outcome()? else {
         anyhow::bail!("expected local Audit transaction attempt")
     };
     let (outcome, pending) = attempt.into_parts();
@@ -228,10 +238,17 @@ async fn scenario(
         .await?;
         assert_eq!(canonical, prepared.canonical_bytes());
         assert_eq!(payload, canonical);
-        assert!(matches!(
-            projection.project_one(&Validator, deadline()?).await?,
-            PgProjectionOutcome::Empty
-        ));
+        assert!(
+            projection
+                .project_batch(
+                    &Validator,
+                    std::num::NonZeroUsize::MIN,
+                    deadline()?,
+                    Duration::from_secs(5)
+                )
+                .await?
+                .is_empty()
+        );
     }
     Ok(())
 }
