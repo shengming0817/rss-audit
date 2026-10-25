@@ -1,6 +1,10 @@
 -- Run once as the existing migration owner, in one transaction with writers stopped.
 -- Historical positions and authenticated bytes are unchanged; positions now mean navigation only.
 LOCK TABLE rss_audit.records IN ACCESS EXCLUSIVE MODE;
+-- The owner is NOBYPASSRLS. Under this exclusive transaction lock it must see every
+-- tenant to seed a global sequence, then restore forced tenant isolation before commit.
+-- ref: PostgreSQL REL_17_6 src/backend/utils/misc/rls.c check_enable_rls
+ALTER TABLE rss_audit.records NO FORCE ROW LEVEL SECURITY;
 CREATE SEQUENCE rss_audit.positions AS bigint MINVALUE 0 START 0 NO CYCLE;
 DO $position$
 DECLARE last_position bigint;
@@ -9,6 +13,7 @@ BEGIN
  IF last_position=9223372036854775807 THEN RAISE EXCEPTION 'audit position exhausted' USING ERRCODE='PA002'; END IF;
  PERFORM setval('rss_audit.positions',COALESCE(last_position+1,0),false);
 END $position$;
+ALTER TABLE rss_audit.records FORCE ROW LEVEL SECURITY;
 ALTER TABLE rss_audit.records DROP CONSTRAINT records_tenant_id_fkey;
 CREATE FUNCTION rss_audit.append_batch(p_tenant uuid,p_sources text[],p_events text[],
  p_recorded bigint[],p_canonical bytea[],p_ledger bigint[])

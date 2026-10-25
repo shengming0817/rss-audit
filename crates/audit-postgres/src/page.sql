@@ -8,8 +8,7 @@ WITH tail AS (
     WHERE tenant_id=$1::uuid AND position>$2 AND position<=bounds.through
     ORDER BY position LIMIT $3
 ), summary AS (
-    SELECT count(*) AS count, COALESCE(sum(bytes),0) AS bytes,
-        min(position) AS first, max(position) AS last,
+    SELECT COALESCE(sum(bytes),0) AS bytes, max(position) AS last,
         COALESCE(bool_and(bytes BETWEEN 1 AND 131072),true) AS valid
     FROM selected
 ), admission AS MATERIALIZED (
