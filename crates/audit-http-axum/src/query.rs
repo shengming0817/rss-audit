@@ -57,7 +57,7 @@ fn decode(value: &str) -> Result<Cursor, InvalidQuery> {
         return Err(InvalidQuery);
     }
     let bytes = URL_SAFE_NO_PAD.decode(value).map_err(|_| InvalidQuery)?;
-    if bytes.len() != 33 || bytes[0] != 1 || URL_SAFE_NO_PAD.encode(&bytes) != value {
+    if bytes.len() != 33 || bytes[0] != 2 || URL_SAFE_NO_PAD.encode(&bytes) != value {
         return Err(InvalidQuery);
     }
     let hex: String = bytes[1..17].iter().map(|b| format!("{b:02x}")).collect();
@@ -79,7 +79,7 @@ pub(crate) fn encode(cursor: Cursor) -> Result<String, rss_audit_postgres::Error
         .continuation()
         .ok_or(rss_audit_postgres::Error::StorageContract)?;
     let mut bytes = Vec::with_capacity(33);
-    bytes.push(1);
+    bytes.push(2);
     bytes.extend_from_slice(&cursor.tenant().octets());
     bytes.extend_from_slice(&after.to_be_bytes());
     bytes.extend_from_slice(&through.to_be_bytes());
@@ -95,7 +95,7 @@ mod tests {
         let other = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d480")?;
         let cursor = Cursor::resume(tenant, 9_007_199_254_740_992, i64::MAX as u64)?;
         let token = encode(cursor)?;
-        const GOLDEN: &str = "AfR6wQtYzENypWcOArLD1HkAIAAAAAAAAH__________";
+        const GOLDEN: &str = "AvR6wQtYzENypWcOArLD1HkAIAAAAAAAAH__________";
         assert_eq!(token, GOLDEN);
         assert_eq!(decode(GOLDEN)?, cursor);
         assert_eq!(decode(&token)?.continuation(), cursor.continuation());

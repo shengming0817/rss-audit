@@ -208,10 +208,10 @@ async fn basic(
     );
     let first = committed(plain.append(&request, control).await)?;
     assert!(first.inserted());
-    assert_eq!(first.record().position(), 0);
     assert_eq!(first.record().ledger_sequence(), None);
     let replay = committed(plain.append(&request, control).await)?;
     assert!(!replay.inserted());
+    assert_eq!(replay.record().position(), first.record().position());
     assert_eq!(
         replay.record().prepared().canonical_bytes(),
         request.canonical_bytes()

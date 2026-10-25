@@ -45,7 +45,6 @@ fn entry(record: &Record) -> Result<EntryDto, Error> {
         .map_err(|_| Error::StorageContract)?;
     let event = decoded.event();
     let facts = event.facts();
-    let request = record.prepared().append_request();
     Ok(EntryDto {
         position: record.position().to_string(),
         source_id: event.identity().source().source_id().as_str().to_owned(),
@@ -55,8 +54,12 @@ fn entry(record: &Record) -> Result<EntryDto, Error> {
         occurred_at: facts.occurred_at().unix_seconds().to_string(),
         recorded_at: decoded.recorded_at().unix_seconds().to_string(),
         ledger: record.ledger_sequence().map(|sequence| LedgerDto {
-            chain_id: request.ledger().chain().as_str().to_owned(),
-            record_id: request.record_id().as_str().to_owned(),
+            chain_id: "rss.audit.v1".to_owned(),
+            record_id: format!(
+                "v1:{}:{}",
+                event.identity().source().source_id().as_str(),
+                event.identity().event_id().as_str()
+            ),
             sequence: sequence.to_string(),
         }),
     })

@@ -125,7 +125,7 @@ impl PgAudit {
         let request = request.clone();
         audit_only(
             self.transact(
-                request.append_request().ledger().tenant(),
+                request.identity().tenant(),
                 control,
                 Access::Append,
                 (),
@@ -195,7 +195,7 @@ impl PgAudit {
         )
         .await
     }
-    /// Acquire Audit then optional Ledger before invoking trusted business SQL.
+    /// Acquire optional Ledger before invoking trusted business SQL.
     /// Operation uses the shorter cutoff; acquisition/setup/settlement use the total cutoff.
     /// No fresh cleanup budget is minted, and unconfirmed connections are retired.
     pub async fn write_tx_with_context<T: ExecutionTimer, R: Send, E: Send, C: Send, F>(

@@ -23,7 +23,7 @@ tokio-util.workspace = true
 
 [features]
 default = []
-ledger = ["dep:rss-ledger", "dep:rss-ledger-postgres"]
+ledger = ["rss-audit-core/ledger", "dep:rss-ledger", "dep:rss-ledger-postgres"]
 messaging = ["dep:rss-transactional-messaging-postgres", "rss-ledger-postgres?/messaging"]
 integration = []
 

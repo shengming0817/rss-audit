@@ -1,6 +1,6 @@
 # rss-audit-core
 
-Provider-free Audit V1 record values, canonical encoding and `rss-ledger` composition.
+Provider-free Audit V1 record values, canonical encoding; the optional `ledger` feature adds chain mapping and authentication.
 
 This crate does not authenticate sources, persist records or produce commit evidence.
 
@@ -52,15 +52,14 @@ assert_eq!(decoded.event().facts().action().as_str(), "read");
 # }
 ```
 
-The embedding manifest pins `rss-audit-core` to an accepted full Git commit. Because the public
-API uses the canonical RSS owners for tenant, contract, time and ledger values, the consumer
-declares `rss-contract`, `rss-ledger` and `rss-request-context` at the exact RSS revision recorded in
-this repository's `Cargo.toml`. Cargo manifests and lockfiles record dependency versions and sources;
-locked builds and cargo-deny provide the normal dependency checks.
+`PreparedAuditV1` owns the exact audit bytes, identity and recording time without Ledger types.
+The default build does not depend on Ledger. Enable `ledger` for `append_request`, authenticated
+windows and Ledger errors. Mapping is fallible and returns an owned request; it never persists data.
+The two Ledger crates live in this workspace and are not independently published. Public RSS
+contract and tenant types still use this repository's single pinned RSS commit.
 
-Use `decode_untrusted` only for structural decoding and `verify_window` when authenticating an
-exact ledger range. Both return the closed [`Error`](crate::Error) categories without
-including rejected values; callers retain ownership of retry policy, diagnostics and commit proof.
+Use `decode_untrusted` for structural decoding and optional `verify_window` for an exact
+Ledger range. Neither proves source truth, completeness or durable commit.
 
 `Outcome::Unknown` (V1 tag 4) records an unconfirmed source-operation outcome; it is not
 `Failed` or rollback evidence. Sources keep business events and per-request settlement

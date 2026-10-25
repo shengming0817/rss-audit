@@ -12,11 +12,12 @@ pub(super) async fn run(
     )?;
     assert!(empty.records().is_empty());
     assert!(empty.next().is_none());
+    let mut positions = Vec::new();
     for id in ["one", "two", "three"] {
         let p = pg
             .prepare(event(tenant, "paging", id, vec![])?, control)
             .await?;
-        committed(pg.append(&p, control).await)?;
+        positions.push(committed(pg.append(&p, control).await)?.record().position());
     }
     let mut cursor = Some(Cursor::start(tenant));
     for position in 0..3 {
@@ -37,7 +38,7 @@ pub(super) async fn run(
             })
             .await,
         )?;
-        assert_eq!(page.records()[0].position(), position);
+        assert_eq!(page.records()[0].position(), positions[position as usize]);
         cursor = page.next();
     }
     assert!(
@@ -60,7 +61,11 @@ async fn invalid_and_missing(
     assert_eq!(fresh.records().len(), 6);
     rolled_back(
         pg.read_page(
-            Cursor::resume(tenant, 0, 6)?,
+            Cursor::resume(
+                tenant,
+                fresh.records()[0].position(),
+                fresh.records()[5].position() + 1,
+            )?,
             ReadLimit::new(1, 131072)?,
             control,
         )
@@ -69,7 +74,11 @@ async fn invalid_and_missing(
     );
     let shortened = committed(
         pg.read_page(
-            Cursor::resume(tenant, 0, 1)?,
+            Cursor::resume(
+                tenant,
+                fresh.records()[0].position(),
+                fresh.records()[1].position(),
+            )?,
             ReadLimit::new(10, 131072)?,
             control,
         )
@@ -88,18 +97,24 @@ async fn invalid_and_missing(
         .await,
         |e| matches!(e, TransactionError::Operation(Error::ScopeMismatch)),
     );
-    sqlx::query("DELETE FROM rss_audit.records WHERE tenant_id=$1::uuid AND position=1")
+    sqlx::query("DELETE FROM rss_audit.records WHERE tenant_id=$1::uuid AND position=$2")
         .bind(tenant.to_string())
+        .bind(fresh.records()[1].position() as i64)
         .execute(admin)
         .await?;
-    rolled_back(
+    let page = committed(
         pg.read_page(
-            Cursor::resume(tenant, 0, 2)?,
+            Cursor::resume(
+                tenant,
+                fresh.records()[0].position(),
+                fresh.records()[2].position(),
+            )?,
             ReadLimit::new(2, 131072)?,
             control,
         )
         .await,
-        |e| matches!(e, Error::StorageContract),
-    );
+    )?;
+    assert_eq!(page.records().len(), 1, "ordinary navigation allows gaps");
+    assert_eq!(page.records()[0].position(), fresh.records()[2].position());
     Ok(())
 }

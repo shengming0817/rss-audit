@@ -38,7 +38,7 @@ pub(super) async fn run(
         })).await, |e| matches!(e, TransactionError::Operation(sql)
             if sql.as_database_error().and_then(|e| e.code()).as_deref()==Some("25006")));
     }
-    let untouched: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT FROM rss_audit.heads WHERE tenant_id=$1::uuid) AND NOT EXISTS(SELECT FROM rss_ledger.heads WHERE tenant_id=$1::uuid) AND NOT EXISTS(SELECT FROM public.business_changes WHERE id='forbidden-read-write')")
+    let untouched: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT FROM rss_audit.records WHERE tenant_id=$1::uuid) AND NOT EXISTS(SELECT FROM rss_ledger.heads WHERE tenant_id=$1::uuid) AND NOT EXISTS(SELECT FROM public.business_changes WHERE id='forbidden-read-write')")
         .bind(empty.to_string()).fetch_one(admin).await?;
     assert!(
         untouched,

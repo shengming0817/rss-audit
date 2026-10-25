@@ -1,3 +1,4 @@
+#![cfg(feature = "ledger")]
 #![allow(missing_docs)]
 
 use rss_audit_core::{
@@ -61,12 +62,12 @@ fn same_identity_and_bytes_replay_but_changed_content_conflicts()
     let first = prepare(event(tenant, "device_enrolled")?, recorded)?;
     let replay = prepare(event(tenant, "device_enrolled")?, recorded)?;
     let changed = prepare(event(tenant, "device_retired")?, recorded)?;
-    let entry = authenticator()?.append(first.append_request(), None)?;
+    let entry = authenticator()?.append(&first.append_request()?, None)?;
     assert!(replay.matches_entry(&entry));
     assert!(!changed.matches_entry(&entry));
     assert_eq!(
-        first.append_request().record_id(),
-        changed.append_request().record_id()
+        first.append_request()?.record_id(),
+        changed.append_request()?.record_id()
     );
     Ok(())
 }
@@ -79,7 +80,7 @@ fn verified_window_rechecks_audit_identity() -> Result<(), Box<dyn std::error::E
         Timepoint::try_from(1_726_000_001_i64)?,
     )?;
     let auth = authenticator()?;
-    let entry = auth.append(prepared.append_request(), None)?;
+    let entry = auth.append(&prepared.append_request()?, None)?;
     let verified = verify_window(&auth, tenant, None, std::slice::from_ref(&entry))?;
     assert_eq!(verified.ledger_verification().count(), 1);
     assert_eq!(verified.records().len(), 1);
@@ -123,7 +124,7 @@ fn verified_window_rechecks_audit_identity() -> Result<(), Box<dyn std::error::E
     )?;
     let cross_tenant_request = AppendRequest::new(
         LedgerId::new(tenant, entry.ledger().chain().clone()),
-        other_prepared.append_request().record_id().clone(),
+        other_prepared.append_request()?.record_id().clone(),
         other_prepared.canonical_bytes().to_vec(),
     )?;
     let cross_tenant_entry = auth.append(&cross_tenant_request, None)?;
@@ -156,7 +157,7 @@ fn recovery_preserves_the_exact_request_and_rejects_unknown_fields()
     let restored =
         rss_audit_core::PreparedAuditV1::from_canonical_bytes(prepared.canonical_bytes())?;
     assert_eq!(restored.canonical_bytes(), prepared.canonical_bytes());
-    assert_eq!(restored.append_request(), prepared.append_request());
+    assert_eq!(restored.append_request()?, prepared.append_request()?);
     let clone = restored.clone();
     assert_eq!(clone.canonical_bytes(), prepared.canonical_bytes());
     let mut unknown = prepared.canonical_bytes().to_vec();

@@ -61,6 +61,7 @@ pub enum Error {
     #[error("audit record identity mismatch")]
     IdentityMismatch,
     /// The composed ledger protocol rejected the operation.
+    #[cfg(feature = "ledger")]
     #[error("ledger protocol rejected audit record: {0}")]
     Ledger(#[from] rss_ledger::Error),
 }

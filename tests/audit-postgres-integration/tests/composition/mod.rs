@@ -21,8 +21,6 @@ pub(super) async fn run(
         })?;
         committed(store.write_tx_with_context(empty_tenant, control, (), move |_, tx| Box::pin(async move {
             tx.with_connection(move |c| Box::pin(async move {
-                let position: Option<i64> = sqlx::query_scalar("SELECT position FROM rss_audit.heads WHERE tenant_id=$1::uuid").bind(empty_tenant.to_string()).fetch_one(&mut *c).await?;
-                assert_eq!(position, None);
                 let records: i64 = sqlx::query_scalar("SELECT count(*) FROM rss_audit.records WHERE tenant_id=$1::uuid").bind(empty_tenant.to_string()).fetch_one(c).await?;
                 assert_eq!(records, 0);
                 Ok::<_,Error>(())

@@ -5,14 +5,13 @@ use rss_transactional_messaging::error::MessagingErrorKind;
 use rss_transactional_messaging_postgres::{PgError, PgTransaction};
 
 impl PgAudit {
-    /// Acquire Audit and optional ledger locks before business/outbox locks.
+    /// Acquire optional ledger locks before business/outbox locks.
     /// Borrows the original owner; no event, connection acquisition or settlement occurs.
     pub async fn lock_head_in(&self, tx: &mut PgTransaction<'_>) -> Result<(), Error> {
+        #[cfg(feature = "ledger")]
         let tenant = tx.tenant_id();
-        tx.with_connection(move |c| {
-            Box::pin(async move { Ok(repository::lock_head(c, tenant).await) })
-        })
-        .await??;
+        #[cfg(not(feature = "ledger"))]
+        let _ = tx;
         #[cfg(feature = "ledger")]
         if let Integrity::Ledger(auth) = &self.integrity {
             rss_ledger_postgres::lock_head_in(
@@ -36,7 +35,7 @@ impl PgAudit {
         Ok(())
     }
     /// Resolve and stage a fact on the message owner's READ COMMITTED transaction.
-    /// Acquire `lock_head_in` before deriving business facts or reading product receipts;
+    /// Acquire `lock_head_in` before business locks in Ledger mode; Plain receipt concurrency is host-owned;
     /// this method cannot retroactively protect earlier reads or business locks.
     /// The synchronous resolver returns exact bytes; product receipt rules remain caller-owned.
     pub async fn append_with_in<E, F>(
@@ -68,7 +67,7 @@ impl PgAudit {
             existing.as_ref(),
             self.integrity.is_ledger(),
         )?;
-        self.stage_in(tx, &request, existing).await.map_err(E::from)
+        self.append_in(tx, &request).await.map_err(E::from)
     }
     /// Stage Audit in the message owner's actual connection and remaining budget.
     /// Does not acquire from this adapter's pool, change GUCs, begin or settle.
@@ -78,41 +77,28 @@ impl PgAudit {
         tx: &mut PgTransaction<'_>,
         request: &PreparedAuditV1,
     ) -> Result<StagedAppend, Error> {
-        if request.append_request().ledger().tenant() != tx.tenant_id() {
+        if request.identity().tenant() != tx.tenant_id() {
             return Err(Error::ScopeMismatch);
         }
-        let request_owned = request.clone();
-        let ledger_enabled = self.integrity.is_ledger();
-        let existing = tx
-            .with_connection(move |c| {
-                Box::pin(
-                    async move { Ok(repository::reserve(c, &request_owned, ledger_enabled).await) },
-                )
-            })
-            .await??;
-        self.stage_in(tx, request, existing).await
-    }
-    async fn stage_in(
-        &self,
-        tx: &mut PgTransaction<'_>,
-        request: &PreparedAuditV1,
-        existing: Option<crate::Record>,
-    ) -> Result<StagedAppend, Error> {
         let ledger = match &self.integrity {
             Integrity::Plain => None,
             #[cfg(feature = "ledger")]
             Integrity::Ledger(auth) => {
                 let staged =
-                    rss_ledger_postgres::append_in(tx, auth.clone(), request.append_request())
+                    rss_ledger_postgres::append_in(tx, auth.clone(), &request.append_request()?)
                         .await?;
                 Some((staged.entry().sequence().get(), staged.inserted()))
             }
         };
         let request_owned = request.clone();
         tx.with_connection(move |c| {
-            Box::pin(
-                async move { Ok(repository::finish(c, &request_owned, existing, ledger).await) },
-            )
+            Box::pin(async move {
+                Ok(
+                    repository::append_batch(c, std::slice::from_ref(&request_owned), &[ledger])
+                        .await
+                        .and_then(|mut results| results.pop().ok_or(Error::StorageContract)),
+                )
+            })
         })
         .await?
     }

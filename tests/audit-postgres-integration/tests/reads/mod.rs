@@ -107,7 +107,7 @@ async fn corruption(
     one: &PreparedAuditV1,
 ) -> anyhow::Result<()> {
     ledger_metadata(ledger, admin, control).await?;
-    let other = one.append_request().ledger().tenant();
+    let other = one.identity().tenant();
     sqlx::query("UPDATE rss_audit.records SET recorded_at=0 WHERE tenant_id=$1::uuid")
         .bind(other.to_string())
         .execute(admin)

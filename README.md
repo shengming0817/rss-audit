@@ -1,7 +1,7 @@
 # rss-audit
 
 面向 RSS 产品的可嵌入审计组件。提供 provider-free 的 `rss-audit-core` V1 和
-`rss-audit-postgres` 原子持久化、可选账本组合。以及 `rss-audit-http-axum` 租户内只读查询。来源投影由后续工作项实现。
+`rss-audit-postgres` 原子持久化、可选账本组合。以及 `rss-audit-http-axum` 租户内只读查询。`rss-ledger` 与 `rss-ledger-postgres` 作为本仓可选完整性组件维护，不独立发布。
 
 - [架构决定](docs/architecture/adr/202609220001-2495-embedded-audit.md)
 - [项目范围](docs/rules/project-scope.md)
@@ -11,3 +11,6 @@
 - [PostgreSQL 接入与边界](crates/audit-postgres/README.md)
 
 本仓不提供应用装配、认证授权、密钥托管、保留策略或生产迁移。
+
+- [可选 Ledger 协议](crates/ledger/README.md)
+- [可选 Ledger PG 接入](crates/ledger-postgres/README.md)

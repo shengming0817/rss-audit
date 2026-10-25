@@ -42,8 +42,8 @@ pub(super) async fn run(
             "ALTER POLICY tenant_scope ON rss_audit.records USING (tenant_id = NULLIF(current_setting('rss.tenant_id', true), '')::uuid)",
         ),
         (
-            "ALTER FUNCTION rss_audit.reserve(uuid) SET search_path=public",
-            "ALTER FUNCTION rss_audit.reserve(uuid) SET search_path=pg_catalog,rss_audit",
+            "ALTER FUNCTION rss_audit.append_batch(uuid,text[],text[],bigint[],bytea[],bigint[]) SET search_path=public",
+            "ALTER FUNCTION rss_audit.append_batch(uuid,text[],text[],bigint[],bytea[],bigint[]) SET search_path=pg_catalog,rss_audit",
         ),
         (
             "ALTER TABLE rss_audit.records ADD COLUMN extra integer DEFAULT 1",

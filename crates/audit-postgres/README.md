@@ -1,6 +1,6 @@
 # rss-audit-postgres
 
-Fresh PostgreSQL 16+ Audit persistence. The host supplies a pool, monotonic timer,
+PostgreSQL 16+ Audit persistence. The host supplies a pool, monotonic timer,
 absolute total and operation deadlines, cancellation and explicit `Integrity::Plain` or `Integrity::Ledger(auth)`.
 No migration execution, pool shutdown, global reads, memory provider or automatic downgrade.
 The `ledger` and `messaging` features are independently additive; `integration` is test-only.
@@ -25,8 +25,7 @@ The messaging conversion preserves that classification; neither class grants ACK
 `read_tx_with_context(tenant, control, context, callback)` supplies `ReadAuditTransaction`
 inside a PostgreSQL read-only transaction. It checks tenant scope before trusted reads,
 never reserves Audit/Ledger heads, and exposes no append or lock operation.
-`write_tx_with_context` supplies `WriteAuditTransaction` after acquiring Audit then optional
-Ledger locks. It also provides the read methods. Pass `()` when no context is needed.
+`write_tx_with_context` supplies `WriteAuditTransaction` after acquiring the optional Ledger chain lock. It also provides the read methods. Pass `()` when no context is needed.
 Both borrow trusted business SQL via `with_connection`. A callback returning `Result<R, E>` produces
 `LocalTxAttempt<Committed<R>, TransactionError<E>>`: `Operation(E)` retains the original
 host reason/classification, `Audit(Error)` identifies adapter/control failures, and
@@ -36,7 +35,7 @@ explicitly to recover its typed value. `with_connection` likewise preserves its 
 error type. There is no untyped business-rejection sentinel or error side channel.
 Errors must propagate. This is not a SQL sandbox:
 do not issue transaction control, change role/tenant/session state, or swallow append errors.
-Lock order is Audit tenant head → ledger → business/outbox.
+Plain takes no tenant-wide Audit lock. In Ledger mode acquire the chain before business/outbox locks.
 `Control::new(timer, total_deadline, operation_deadline, cancel)` caps the operation cutoff
 by the total cutoff without refreshing either. Acquisition, setup and settlement use total;
 pre-locking and callback work use operation, allowing the host to reserve settlement time.
@@ -58,11 +57,9 @@ that owner; original `PgError` classification, including ownership loss, is pres
 
 ## Facts derived inside a transaction
 
-`write_tx_with_context` acquires Audit first, then the fixed Audit ledger chain in Ledger mode,
-before invoking the callback. With a borrowed message transaction, call `PgAudit::lock_head_in`
-before business/outbox locks. Both paths reserve the heads
-without writing an event. Failures propagate to the original owner; Ledger never
-falls back to Plain. An empty head is allowed and allocates no event position.
+`write_tx_with_context` acquires the fixed Audit chain only in Ledger mode, before the callback.
+For a borrowed messaging transaction, `lock_head_in` similarly pre-locks only the selected chain.
+Plain does not serialize callbacks or product receipts. The host owns their business concurrency.
 
 After deriving final facts, use `WriteAuditTransaction::append_with(identity, resolver)` or
 `PgAudit::append_with_in(tx, identity, resolver)`. The resolver is synchronous: it receives
@@ -71,11 +68,10 @@ new bytes with `rss_audit_core::prepare`. The adapter validates identity and mod
 Ledger and Audit entries, and returns `StagedAppend` with the exact persisted bytes.
 No public reservation, permission cache or second transaction is introduced.
 
-These operations require READ COMMITTED so a lookup after locking sees settled prior writes.
-The owned write callback already holds the heads. A messaging caller must call `lock_head_in`
-**before** reading product receipts or taking business/outbox locks; later locking cannot
-retroactively validate earlier reads. Resolver errors propagate unchanged; synchronous work
-must stay bounded by the caller's operation budget.
+Resolvers require READ COMMITTED. In Ledger mode the chain lock protects the preceding lookup;
+in Plain mode it is an ordinary lookup, not a reservation. The host must serialize any business
+receipt decisions that require it. Resolver errors propagate unchanged; synchronous work stays
+within the existing operation budget. A later append detects conflicting stable bytes.
 
 Product receipt consistency remains product-owned: only a valid matching pair may restore
 exact bytes. A missing or damaged side must fail, not trigger automatic repair. Save the returned
@@ -88,18 +84,17 @@ The exact `append`/`append_in` APIs remain for already-prepared durable retry/ou
 Stable identity is `(tenant, source_id, event_id)`. Exact bytes and stored integrity mode
 must agree on replay. The host may choose another mode for a new event in the same tenant;
 there is no permanent tenant-mode pin. Ledger failure aborts; it never retries plain.
-HMAC, chain ordering and key admission remain owned by RSS ledger.
+HMAC, chain ordering and key admission remain owned by the optional in-workspace Ledger components.
 
-`read_page(Cursor, ReadLimit, control)` uses a separate monotonic Audit position. It structurally
-checks bytes and index metadata without authentication. Supply 1..=1024 rows and a positive
-canonical-byte budget. SQL preflights the complete selected page before returning payloads;
-oversized pages return no partial rows. The first statement captures the tenant head as a fixed inclusive upper bound. Continuations
-use `Cursor::resume(tenant, after, through)` with `after < through`; the last page has no cursor.
-New appends, including queries auditing themselves, cannot prolong that enumeration. A future
-upper bound is invalid input; missing records within the range fail closed. This is not a
-multi-page MVCC snapshot or an authenticated checkpoint. `WriteAuditTransaction::read_page` uses
-this same implementation for atomic query/append composition. The uncommitted `Cursor::after`
-API is replaced without an alias.
+`read_page(Cursor, ReadLimit, control)` uses stable navigation positions allocated by a database
+sequence. Positions allow gaps and do not represent commit order or reliable consumer offsets.
+Supply 1..=1024 rows and a positive canonical-byte budget. SQL checks the selected page's byte
+budget before returning payloads; oversized pages return no partial rows.
+The first statement fixes the maximum currently visible position. Continuations select
+`after < position <= through` in position order. The upper bound does not freeze membership:
+a low position committed after it was passed can require a fresh query to become visible.
+Ordinary pagination does not authenticate missing rows. Ledger verified windows retain their
+separate contiguous-chain checks. Product incremental projections must choose their own contract.
 
 With `ledger`, `read_verified(tenant, Sequence, ledger::ReadLimit, control)` authenticates a window
 and checks its Audit-row association. Its budget charges ledger encoded bytes, including the
@@ -109,21 +104,28 @@ of tail truncation or an external checkpoint.
 
 ## Installation and roles
 
-`MIGRATION_SQL` creates only a fresh `rss_audit` schema: no legacy probing, backfill, compatibility
-ALTER path or automatic repair. Run it as a separately provisioned NOLOGIN NOSUPERUSER NOBYPASSRLS
-NOCREATEROLE owner. Runtime must not own objects, switch to an owner/privileged role, have
-CREATE/delegation rights, or access Audit objects through PUBLIC. Grant only:
+`MIGRATION_SQL` installs the current schema (0001 plus 0002) in a single transaction.
+For an existing 0001 installation, stop writers and execute `NAVIGATION_UPGRADE_SQL` once in a
+transaction as its existing NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE migration owner.
+It preserves canonical bytes, identities, existing positions and Ledger coordinates, starts the
+sequence above the historical maximum, transfers writer grants, and removes Audit heads/reserve.
+It does not change a product installation's integrity mode or rewrite Ledger authentication.
+Upgrade optional Ledger functions separately using its `LOCKED_HEAD_UPGRADE_SQL` before admission.
+Runtime must not own objects or reach the owner, have CREATE/delegation rights or PUBLIC access.
+Grant only:
 
 ```sql
 GRANT USAGE ON SCHEMA rss_audit TO audit_runtime;
-GRANT SELECT ON ALL TABLES IN SCHEMA rss_audit TO audit_runtime;
-GRANT EXECUTE ON FUNCTION rss_audit.reserve(uuid),
-    rss_audit.append(uuid,text,text,bigint,bytea,bigint) TO audit_runtime;
+GRANT SELECT ON rss_audit.records TO audit_runtime;
+GRANT EXECUTE ON FUNCTION rss_audit.append_batch(uuid,text[],text[],bigint[],bytea[],bigint[])
+    TO audit_runtime;
 ```
 
+No runtime sequence privileges are required or permitted.
+
 Runtime cannot INSERT/UPDATE/DELETE/TRUNCATE tables. Fixed SECURITY DEFINER functions enforce
-tenant scope, acquire the serialization lock and append. Both tables FORCE RLS, including for
-their owner. Ledger and transactional-messaging installations/grants remain separately owned.
+tenant scope and append a physical batch. The records table FORCEs RLS, including for
+its owner. Ledger and transactional-messaging installations/grants remain separately owned.
 The host must configure authenticated TLS; Audit does not accept a URL or replace pool settings.
 Admission checks actual role, inherited/switchable access, columns, constraints, RLS, definer
 bodies/configuration, durability and privileges. Incompatible configuration fails startup validation. Privileged
@@ -156,3 +158,18 @@ Product authorization and revocation remain live at their separately defined bus
 This is not protection against a database controller or a WORM guarantee.
 
 Read-only hosts use `PgAuditReader` with a separately provisioned credential that has SELECT but no Audit or Ledger append-function authority, including inherited/SET-role authority. It shares the full structural admission and existing bounded page/verified-window/read-transaction implementations, but exposes no append or writer handle. The host owns the pool, deadlines and re-admission after controlled changes.
+
+## Borrow an existing SQLx transaction
+
+`append_in_transaction(tx, prepared, control)` and `append_batch_in_transaction(tx, records, control)`
+use the same Audit write kernel as owned transactions and the messaging adapter. Batch results
+follow input order; repeated identical identities return the same record and only the first newly
+inserted occurrence has `inserted=true`. Different bytes conflict. Empty input does no DB work.
+Audit inserts and reads back sets, not a loop of complete single-record transactions. Optional
+Ledger appends still perform their necessary chain-order work; no Ledger batch throughput is claimed.
+
+The host admits the actual borrowed credential at startup, configures tenant and server timeouts,
+and owns isolation, commit/rollback and connection quarantine. The adapter never acquires a second
+connection or changes GUCs. Propagate any error and roll back the whole transaction. Under stronger
+isolation, competing writes can cause serialization failure; only the host retries the transaction.
+Prepare exact bytes with recorder-authoritative time before append and retain them after uncertainty.
