@@ -1,5 +1,5 @@
 use crate::{Cursor, Error, Page, ReadLimit, Record, StagedAppend, probe};
-use rss_audit_core::{AuditEventV1, PreparedAuditV1, RecordIdentity};
+use rss_audit_core::{AuditEventV1, PreparedAuditV1};
 use rss_request_context::TenantId;
 use sqlx::{PgConnection, Row, postgres::PgRow};
 
@@ -14,18 +14,6 @@ pub(crate) async fn prepare(
     let recorded =
         rss_contract::Timepoint::try_from(seconds).map_err(|_| Error::StorageContract)?;
     Ok(rss_audit_core::prepare(event, recorded)?)
-}
-
-async fn find_validated(
-    c: &mut PgConnection,
-    identity: &RecordIdentity,
-) -> Result<Option<Record>, Error> {
-    let row = sqlx::query("SELECT tenant_id::text,source_id,event_id,position,recorded_at,canonical,ledger_sequence FROM rss_audit.records WHERE tenant_id=$1::uuid AND source_id=$2 AND event_id=$3")
-        .bind(identity.tenant().to_string()).bind(identity.source().source_id().as_str()).bind(identity.event_id().as_str())
-        .fetch_optional(c).await?;
-    row.as_ref()
-        .map(|r| decode(r, identity.tenant()))
-        .transpose()
 }
 
 /// One tenant and exact identities per batch, before any persistence is attempted.
@@ -205,44 +193,6 @@ pub(crate) async fn page(
         .map(|r| Cursor::resume(cursor.tenant(), r.position(), through as u64))
         .transpose()?;
     Ok(Page { records, next })
-}
-
-// Resolver lookup does not serialize Plain business operations. The host owns business
-// concurrency and exact retry bytes; optional Ledger pre-locking remains chain-local.
-pub(crate) async fn resolution(
-    c: &mut PgConnection,
-    identity: &RecordIdentity,
-) -> Result<(Option<Record>, rss_contract::Timepoint), Error> {
-    probe::tenant(c, identity.tenant()).await?;
-    let (isolation, seconds): (String, i64) = sqlx::query_as(
-        "SELECT current_setting('transaction_isolation'),floor(extract(epoch FROM clock_timestamp()))::bigint")
-        .fetch_one(&mut *c).await?;
-    if isolation != "read committed" {
-        return Err(Error::StorageContract);
-    }
-    let recorded =
-        rss_contract::Timepoint::try_from(seconds).map_err(|_| Error::StorageContract)?;
-    Ok((find_validated(c, identity).await?, recorded))
-}
-
-pub(crate) fn check_resolved(
-    identity: &RecordIdentity,
-    request: &PreparedAuditV1,
-    existing: Option<&Record>,
-    ledger: bool,
-) -> Result<(), Error> {
-    let actual = request.identity();
-    if actual.tenant() != identity.tenant()
-        || actual.source().source_id().as_str() != identity.source().source_id().as_str()
-        || actual.event_id().as_str() != identity.event_id().as_str()
-        || actual.source().contract().id() != identity.source().contract().id()
-        || actual.source().contract().version() != identity.source().contract().version()
-        || actual.source().contract().schema_digest()
-            != identity.source().contract().schema_digest()
-    {
-        return Err(Error::ScopeMismatch);
-    }
-    check_existing(request, existing, ledger)
 }
 
 fn check_existing(

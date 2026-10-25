@@ -17,15 +17,6 @@ pub enum Integrity {
     #[cfg(feature = "ledger")]
     Ledger(std::sync::Arc<rss_ledger::Authenticator>),
 }
-impl Integrity {
-    pub(crate) const fn is_ledger(&self) -> bool {
-        match self {
-            Self::Plain => false,
-            #[cfg(feature = "ledger")]
-            Self::Ledger(_) => true,
-        }
-    }
-}
 
 /// Operation value after this owner's acknowledged COMMIT. Construction is private.
 ///

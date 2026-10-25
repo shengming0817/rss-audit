@@ -92,26 +92,12 @@ pub(super) async fn run(
                     "id",
                     vec![1],
                 )?;
-                let id = e.identity().clone();
+                let prepared = store.prepare(e, control).await?;
                 let staged = committed(
                     store
-                        .write_tx_with_context(
-                            cost_tenant,
-                            control,
-                            (id, Some(e)),
-                            |(id, e), tx| {
-                                Box::pin(async move {
-                                    tx.append_with(id, |previous, now| {
-                                        assert!(previous.is_none());
-                                        Ok::<_, Error>(rss_audit_core::prepare(
-                                            e.take().ok_or(Error::StorageContract)?,
-                                            now,
-                                        )?)
-                                    })
-                                    .await
-                                })
-                            },
-                        )
+                        .write_tx_with_context(cost_tenant, control, prepared, |prepared, tx| {
+                            Box::pin(async move { tx.append(prepared).await })
+                        })
                         .await,
                 )?;
                 assert!(staged.inserted());

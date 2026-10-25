@@ -49,9 +49,9 @@ prevents rollback from starting, the result is `RollbackFailed` with both causes
 Preparation errors before COMMIT also use this rollback path. `CommitUnknown` requires
 that this owner has actually started the COMMIT operation.
 
-With `messaging`, `append_in(&mut PgTransaction, &prepared)` borrows the actual message connection,
+With `messaging`, `append_in(&mut PgTransaction, &integrity, &prepared)` borrows the actual message connection,
 inherits its tenant and remaining budget, and changes no GUC, isolation level or lifecycle state.
-It does not use this Audit object's pool. Its result is staged; only the original message owner
+It does not require a `PgAudit` object or any connection pool. Its result is staged; only the original message owner
 can settle Inbox/business/Audit/ledger together and mint ACK authority. Return failures through
 that owner; original `PgError` classification, including ownership loss, is preserved.
 
@@ -61,23 +61,17 @@ that owner; original `PgError` classification, including ownership loss, is pres
 For a borrowed messaging transaction, `lock_head_in` similarly pre-locks only the selected chain.
 Plain does not serialize callbacks or product receipts. The host owns their business concurrency.
 
-After deriving final facts, use `WriteAuditTransaction::append_with(identity, resolver)` or
-`PgAudit::append_with_in(tx, identity, resolver)`. The resolver is synchronous: it receives
-`Option<&Record>` and database time, then returns an existing `PreparedAuditV1` or prepares
-new bytes with `rss_audit_core::prepare`. The adapter validates identity and mode, stages the
-Ledger and Audit entries, and returns `StagedAppend` with the exact persisted bytes.
-No public reservation, permission cache or second transaction is introduced.
+The product determines the stable identity, recording time and exact canonical bytes before
+append. Use `rss_audit_core::prepare` with recorder-authoritative time from the existing connection.
+Audit accepts prepared records; it does not call back into the product to reconstruct facts.
+Replay preserves the original bytes and timestamp. An absent read is not rollback proof, and an
+unknown business transaction must not be rerun merely to regenerate its audit input.
 
-Resolvers require READ COMMITTED. In Ledger mode the chain lock protects the preceding lookup;
-in Plain mode it is an ordinary lookup, not a reservation. The host must serialize any business
-receipt decisions that require it. Resolver errors propagate unchanged; synchronous work stays
-within the existing operation budget. A later append detects conflicting stable bytes.
-
-Product receipt consistency remains product-owned: only a valid matching pair may restore
-exact bytes. A missing or damaged side must fail, not trigger automatic repair. Save the returned
-canonical bytes in the same transaction. After commit-unknown, serialize with the previous
-transaction and restore committed materials; an unlocked absent read is not rollback evidence.
-The exact `append`/`append_in` APIs remain for already-prepared durable retry/outbox requests.
+The pool-free messaging functions are `validate_in(tx, integrity)`, `lock_head_in(tx, integrity)`,
+`append_in(tx, integrity, prepared)` and `append_batch_in(tx, integrity, records)`.
+Single-item calls delegate to the physical batch kernel. The batch retains input order and original
+transaction budget; any error must abort the enclosing transaction. No resolver or compatibility
+method remains. Native SQLx and Audit-owned transactions use the same persistence kernel.
 
 ## Integrity and reads
 
@@ -144,7 +138,7 @@ it does not prove rollback or authorize a retry.
 `PgAudit::new` validates the actual Audit pool's role, schema, RLS, ACLs and functions.
 Ledger mode validates Ledger storage on the same lease, including for a one-connection pool.
 For a different borrowed runtime, call `validate_connection(connection, control)` or
-`validate_in(message_transaction)` during startup using its **actual** credential/connection.
+`validate_in(message_transaction, integrity)` during startup using its **actual** credential/connection.
 The latter inherits the original message owner's budget; neither method changes settings,
 acquires a second connection, repairs permissions or owns settlement. Hosts must bound server
 execution and retire unconfirmed connections after cancellation.

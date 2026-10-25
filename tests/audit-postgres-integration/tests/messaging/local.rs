@@ -19,7 +19,7 @@ impl Aead for UnavailableCaptureKey {
     }
 }
 struct ProjectionEffect {
-    audit: PgAudit,
+    integrity: Integrity,
     fail: bool,
 }
 impl PgConsumerEffect<Vec<u8>> for ProjectionEffect {
@@ -31,8 +31,7 @@ impl PgConsumerEffect<Vec<u8>> for ProjectionEffect {
     ) -> Result<TerminalDisposition, PgConsumerEffectFailure> {
         let prepared = PreparedAuditV1::from_canonical_bytes(message.payload())
             .map_err(PgConsumerEffectFailure::infrastructure)?;
-        self.audit
-            .append_in(tx, &prepared)
+        rss_audit_postgres::append_in(tx, &self.integrity, &prepared)
             .await
             .map_err(PgConsumerEffectFailure::infrastructure)?;
         if self.fail {
@@ -78,10 +77,14 @@ pub(super) async fn run(
         )
         .await?,
     );
-    let validator = ledger.clone();
+    let integrity = Integrity::Ledger(auth()?);
     runtime
         .local_tx(tenant()?, deadline()?, move |tx| {
-            Box::pin(async move { validator.validate_in(tx).await.map_err(PgError::from) })
+            Box::pin(async move {
+                rss_audit_postgres::validate_in(tx, &integrity)
+                    .await
+                    .map_err(PgError::from)
+            })
         })
         .await
         .fold(Ok, Err, Err, Err, Err, Err)?;
@@ -161,7 +164,7 @@ async fn scenario(
         group.clone(),
         domain.clone(),
         ProjectionEffect {
-            audit: ledger.clone(),
+            integrity: Integrity::Ledger(auth()?),
             fail,
         },
         DeliveryBudget::new(

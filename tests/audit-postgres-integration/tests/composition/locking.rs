@@ -28,7 +28,8 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
         "after-business",
         vec![1],
     )?;
-    let identity = e.identity().clone();
+    let prepared = store.prepare(e, &control).await?;
+    let replay_prepared = prepared.clone();
     let (locked, wait_locked) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel();
     let first = store.clone();
@@ -43,12 +44,7 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
                     Box::pin(async move {
                         locked.send(()).map_err(|_| Error::StorageContract)?;
                         released.await.map_err(|_| Error::StorageContract)?;
-                        let id = e.identity().clone();
-                        let staged = tx
-                            .append_with(&id, |_, now| {
-                                Ok::<_, Error>(rss_audit_core::prepare(e, now)?)
-                            })
-                            .await?;
+                        let staged = tx.append(&prepared).await?;
                         Ok::<_, Error>(staged.record().prepared().canonical_bytes().to_vec())
                     })
                 })
@@ -127,13 +123,7 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
             store
                 .write_tx_with_context(tenant()?, &control, (), move |_, tx| {
                     Box::pin(async move {
-                        let replay = tx
-                            .append_with(&identity, |previous, _| {
-                                Ok::<_, Error>(
-                                    previous.ok_or(Error::StorageContract)?.prepared().clone(),
-                                )
-                            })
-                            .await?;
+                        let replay = tx.append(&replay_prepared).await?;
                         assert!(!replay.inserted());
                         Ok::<_, Error>(replay.record().prepared().canonical_bytes().to_vec())
                     })
