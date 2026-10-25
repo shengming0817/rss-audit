@@ -1,6 +1,6 @@
 use crate::{Control, Error, Integrity, StagedAppend, repository};
 use futures::future::BoxFuture;
-use rss_audit_core::{PreparedAuditV1, RecordIdentity};
+use rss_audit_core::PreparedAuditV1;
 use rss_request_context::{ExecutionTimer, TenantId};
 use rss_transactional_messaging::transaction::LocalTxDeadlineStage as Stage;
 use sqlx::{PgConnection, Postgres, Transaction};
@@ -172,41 +172,5 @@ impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
         .await?
         .pop()
         .ok_or(Error::StorageContract)
-    }
-    /// Resolve and append a fact with optional Ledger locking; Plain business concurrency remains host-owned.
-    /// Requires READ COMMITTED. The synchronous resolver sees the exact existing record and
-    /// database time, and must return the same stable identity. Product receipt validation
-    /// remains with the caller; persist returned canonical bytes in the same transaction.
-    /// After commit-unknown, recover exact bytes under the same locks; absence alone is not proof.
-    pub async fn append_with<E, F>(
-        &mut self,
-        identity: &RecordIdentity,
-        resolve: F,
-    ) -> Result<StagedAppend, E>
-    where
-        E: From<Error> + Send,
-        F: FnOnce(Option<&crate::Record>, rss_contract::Timepoint) -> Result<PreparedAuditV1, E>
-            + Send,
-    {
-        if identity.tenant() != self.read.tenant {
-            return Err(Error::ScopeMismatch.into());
-        }
-        let (existing, now) = self
-            .read
-            .control
-            .run(
-                Stage::Operation,
-                repository::resolution(self.read.tx, identity),
-            )
-            .await?;
-        let request = resolve(existing.as_ref(), now)?;
-        self.read.control.check(Stage::Operation)?;
-        repository::check_resolved(
-            identity,
-            &request,
-            existing.as_ref(),
-            self.read.integrity.is_ledger(),
-        )?;
-        self.append(&request).await.map_err(E::from)
     }
 }

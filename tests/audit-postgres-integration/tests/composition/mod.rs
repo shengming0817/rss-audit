@@ -2,7 +2,6 @@ use super::*;
 mod deadline;
 mod locking;
 mod readonly;
-mod resolution;
 
 pub(super) async fn run(
     plain: &PgAudit,
@@ -10,7 +9,6 @@ pub(super) async fn run(
     admin: &PgPool,
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
-    resolution::run(plain, ledger, control).await?;
     readonly::run(plain, ledger, admin, control).await?;
     deadline::run(plain).await?;
     for (mode, store) in [("compose-plain", plain), ("compose-ledger", ledger)] {
@@ -27,18 +25,12 @@ pub(super) async fn run(
             })).await
         })).await)?;
         let e = event(tenant()?, mode, "final-fact", vec![7])?;
-        let identity = e.identity().clone();
-        let recovered_identity = identity.clone();
+        let prepared = store.prepare(e, control).await?;
         let bytes = committed(
             store
                 .write_tx_with_context(tenant()?, control, (), move |_, tx| {
                     Box::pin(async move {
-                        let appended = tx
-                            .append_with(&identity, |previous, now| {
-                                assert!(previous.is_none());
-                                Ok::<_, Error>(rss_audit_core::prepare(e, now)?)
-                            })
-                            .await?;
+                        let appended = tx.append(&prepared).await?;
                         assert!(appended.inserted());
                         Ok::<_, Error>(appended.record().prepared().canonical_bytes().to_vec())
                     })
@@ -51,8 +43,8 @@ pub(super) async fn run(
                 .write_tx_with_context(
                     tenant()?,
                     control,
-                    (&recovered_identity, &bytes, &mut recovered),
-                    |(identity, expected, recovered), tx| {
+                    (&bytes, &mut recovered),
+                    |(expected, recovered), tx| {
                         Box::pin(async move {
                             tx.with_connection_context(recovered, |buffer, c| {
                                 Box::pin(async move {
@@ -65,14 +57,10 @@ pub(super) async fn run(
                             })
                             .await
                             .map_err(Error::from)?;
-                            let appended = tx
-                                .append_with(identity, |previous, _| {
-                                    let r = previous.ok_or(Error::StorageContract)?;
-                                    assert_eq!(r.prepared().canonical_bytes(), expected.as_slice());
-                                    recovered.extend_from_slice(r.prepared().canonical_bytes());
-                                    Ok::<_, Error>(r.prepared().clone())
-                                })
-                                .await?;
+                            let prepared = PreparedAuditV1::from_canonical_bytes(expected)?;
+                            let appended = tx.append(&prepared).await?;
+                            recovered
+                                .extend_from_slice(appended.record().prepared().canonical_bytes());
                             assert!(!appended.inserted());
                             Ok::<_, Error>(())
                         })
@@ -86,7 +74,6 @@ pub(super) async fn run(
 }
 
 pub(super) async fn single_connection(pool: &PgPool) -> anyhow::Result<()> {
-    resolution::isolation(pool).await?;
     locking::run(pool).await?;
     let one = PgPoolOptions::new()
         .max_connections(1)
@@ -97,32 +84,32 @@ pub(super) async fn single_connection(pool: &PgPool) -> anyhow::Result<()> {
     let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(5))?;
     let control = Control::new(&clock, cutoff, cutoff, &cancel);
     let store = PgAudit::new(one.clone(), Integrity::Ledger(auth()?), &control).await?;
-    let e = event(tenant()?, "single-connection", "id", vec![4])?;
+    let prepared = store
+        .prepare(
+            event(tenant()?, "single-connection", "id", vec![4])?,
+            &control,
+        )
+        .await?;
     committed(
         store
             .write_tx_with_context(tenant()?, &control, (), move |_, tx| {
                 Box::pin(async move {
-                    let identity = e.identity().clone();
-                    tx.append_with(&identity, |_, now| {
-                        Ok::<_, Error>(rss_audit_core::prepare(e, now)?)
-                    })
-                    .await?;
+                    tx.append(&prepared).await?;
                     Ok::<_, Error>(())
                 })
             })
             .await,
     )?;
     let wrong = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d480")?;
-    let e = event(wrong, "scope", "id", vec![])?;
+    let foreign = store
+        .prepare(event(wrong, "scope", "id", vec![])?, &control)
+        .await?;
     rolled_back(
         store
             .write_tx_with_context(tenant()?, &control, (), move |_, tx| {
                 Box::pin(async move {
                     assert!(matches!(
-                        tx.append_with(e.identity(), |_, _| Err::<PreparedAuditV1, Error>(
-                            Error::StorageContract
-                        ))
-                        .await,
+                        tx.append(&foreign).await,
                         Err(Error::ScopeMismatch)
                     ));
                     Err::<(), Error>(Error::ScopeMismatch)

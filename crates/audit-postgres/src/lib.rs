@@ -6,6 +6,8 @@ mod control;
 mod error;
 #[cfg(feature = "messaging")]
 mod messaging;
+#[cfg(feature = "messaging")]
+pub use messaging::{append_batch_in, append_in, lock_head_in, validate_in};
 mod model;
 mod probe;
 mod reader;

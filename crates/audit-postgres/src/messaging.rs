@@ -1,86 +1,66 @@
-use crate::{Error, Integrity, PgAudit, StagedAppend, repository};
-use rss_audit_core::{PreparedAuditV1, RecordIdentity};
+//! Pool-free borrowing of the existing fenced transaction and its budget.
+use crate::{Error, Integrity, StagedAppend, repository};
+use rss_audit_core::PreparedAuditV1;
 use rss_redact::RedactedSource;
 use rss_transactional_messaging::error::MessagingErrorKind;
 use rss_transactional_messaging_postgres::{PgError, PgTransaction};
 
-impl PgAudit {
-    /// Acquire optional ledger locks before business/outbox locks.
-    /// Borrows the original owner; no event, connection acquisition or settlement occurs.
-    pub async fn lock_head_in(&self, tx: &mut PgTransaction<'_>) -> Result<(), Error> {
-        #[cfg(feature = "ledger")]
-        let tenant = tx.tenant_id();
-        #[cfg(not(feature = "ledger"))]
-        let _ = tx;
-        #[cfg(feature = "ledger")]
-        if let Integrity::Ledger(auth) = &self.integrity {
-            rss_ledger_postgres::lock_head_in(
-                tx,
-                auth.clone(),
-                &crate::runtime::ledger_id(tenant)?,
-            )
+/// Validate the actual borrowed writer connection at startup; never acquires or settles.
+pub async fn validate_in(tx: &mut PgTransaction<'_>, integrity: &Integrity) -> Result<(), Error> {
+    tx.with_connection(|c| Box::pin(async move { Ok(crate::probe::validate(c).await) }))
+        .await??;
+    #[cfg(feature = "ledger")]
+    if matches!(integrity, Integrity::Ledger(_)) {
+        rss_ledger_postgres::validate_in(tx).await?;
+    }
+    #[cfg(not(feature = "ledger"))]
+    let _ = integrity;
+    Ok(())
+}
+/// Acquire the selected Ledger chain before business locks. Plain never acquires a tenant head.
+/// This is not a reservation or proof of commit; the original owner retains settlement.
+pub async fn lock_head_in(tx: &mut PgTransaction<'_>, integrity: &Integrity) -> Result<(), Error> {
+    let tenant = tx.tenant_id();
+    tx.with_connection(move |c| Box::pin(async move { Ok(crate::probe::tenant(c, tenant).await) }))
+        .await??;
+    #[cfg(feature = "ledger")]
+    if let Integrity::Ledger(auth) = integrity {
+        rss_ledger_postgres::lock_head_in(tx, auth.clone(), &crate::runtime::ledger_id(tenant)?)
             .await?;
-        }
-        Ok(())
     }
-    /// Verify this actual message owner's role and storage during startup, before accepting work.
-    /// Inherits its budget/connection and leaves all settlement to the owner.
-    pub async fn validate_in(&self, tx: &mut PgTransaction<'_>) -> Result<(), Error> {
-        tx.with_connection(|c| Box::pin(async move { Ok(crate::probe::validate(c).await) }))
-            .await??;
-        #[cfg(feature = "ledger")]
-        if matches!(self.integrity, Integrity::Ledger(_)) {
-            rss_ledger_postgres::validate_in(tx).await?;
-        }
-        Ok(())
+    #[cfg(not(feature = "ledger"))]
+    let _ = integrity;
+    Ok(())
+}
+/// Stage one exact prepared record. Propagate errors to the original transaction owner.
+pub async fn append_in(
+    tx: &mut PgTransaction<'_>,
+    integrity: &Integrity,
+    request: &PreparedAuditV1,
+) -> Result<StagedAppend, Error> {
+    append_batch_in(tx, integrity, std::slice::from_ref(request))
+        .await?
+        .pop()
+        .ok_or(Error::StorageContract)
+}
+/// Physically batch Audit writes on the original connection and remaining budget.
+/// Results follow input order. Empty input does no persistence; conflicts require whole-transaction
+/// rollback. The host supplies stable bytes and owns unknown-result recovery. No settings or
+/// settlement authority change; optional Ledger work retains its necessary chain ordering.
+pub async fn append_batch_in(
+    tx: &mut PgTransaction<'_>,
+    integrity: &Integrity,
+    requests: &[PreparedAuditV1],
+) -> Result<Vec<StagedAppend>, Error> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
     }
-    /// Resolve and stage a fact on the message owner's READ COMMITTED transaction.
-    /// Acquire `lock_head_in` before business locks in Ledger mode; Plain receipt concurrency is host-owned;
-    /// this method cannot retroactively protect earlier reads or business locks.
-    /// The synchronous resolver returns exact bytes; product receipt rules remain caller-owned.
-    pub async fn append_with_in<E, F>(
-        &self,
-        tx: &mut PgTransaction<'_>,
-        identity: &RecordIdentity,
-        resolve: F,
-    ) -> Result<StagedAppend, E>
-    where
-        E: From<Error> + Send,
-        F: FnOnce(Option<&crate::Record>, rss_contract::Timepoint) -> Result<PreparedAuditV1, E>
-            + Send,
-    {
-        if identity.tenant() != tx.tenant_id() {
-            return Err(Error::ScopeMismatch.into());
-        }
-        self.lock_head_in(tx).await?;
-        let id = identity.clone();
-        let (existing, now) = tx
-            .with_connection(move |c| {
-                Box::pin(async move { Ok(repository::resolution(c, &id).await) })
-            })
-            .await
-            .map_err(Error::from)??;
-        let request = resolve(existing.as_ref(), now)?;
-        repository::check_resolved(
-            identity,
-            &request,
-            existing.as_ref(),
-            self.integrity.is_ledger(),
-        )?;
-        self.append_in(tx, &request).await.map_err(E::from)
+    if repository::batch_tenant(requests)? != tx.tenant_id() {
+        return Err(Error::ScopeMismatch);
     }
-    /// Stage Audit in the message owner's actual connection and remaining budget.
-    /// Does not acquire from this adapter's pool, change GUCs, begin or settle.
-    /// Return failures to the message owner; only its receipt can authorize ACK.
-    pub async fn append_in(
-        &self,
-        tx: &mut PgTransaction<'_>,
-        request: &PreparedAuditV1,
-    ) -> Result<StagedAppend, Error> {
-        if request.identity().tenant() != tx.tenant_id() {
-            return Err(Error::ScopeMismatch);
-        }
-        let ledger = match &self.integrity {
+    let mut ledger = Vec::with_capacity(requests.len());
+    for request in requests {
+        let entry = match integrity {
             Integrity::Plain => None,
             #[cfg(feature = "ledger")]
             Integrity::Ledger(auth) => {
@@ -90,18 +70,14 @@ impl PgAudit {
                 Some((staged.entry().sequence().get(), staged.inserted()))
             }
         };
-        let request_owned = request.clone();
-        tx.with_connection(move |c| {
-            Box::pin(async move {
-                Ok(
-                    repository::append_batch(c, std::slice::from_ref(&request_owned), &[ledger])
-                        .await
-                        .and_then(|mut results| results.pop().ok_or(Error::StorageContract)),
-                )
-            })
-        })
-        .await?
+        #[cfg(not(feature = "ledger"))]
+        let _ = request;
+        ledger.push(entry);
     }
+    tx.with_connection_context(&mut (requests, ledger), |(requests, ledger), c| {
+        Box::pin(async move { Ok(repository::append_batch(c, requests, ledger).await) })
+    })
+    .await?
 }
 
 impl From<Error> for PgError {

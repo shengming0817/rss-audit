@@ -53,6 +53,6 @@ core 行为由现有协议和 ledger 组合测试覆盖，plain PG、ledger 与 
 
 ref: launchbadge/sqlx sqlx-core/src/transaction.rs@v0.9.0
 
-#2801 普通追加使用 append_with/append_with_in，在既有锁内统一查重、数据库时间、身份校验和追加；
-同步 resolver 只选择精确材料，产品仍拥有回执一致性和业务事实。要求 READ COMMITTED，
-单边回执损坏不得自动补写。保留精确 prepared 追加、原 owner 结算、锁顺序、位置与分页语义。
+#3008 追加只接收产品确定的稳定身份、记录时间和规范字节；删除 resolver 回调及其专用预读。
+messaging 借用入口不再挂在持有 pool 的对象上，直接使用原 PgTransaction 和显式 Integrity。
+单条委托批量内核，宿主仍拥有事实生成、事务结算与未知结果恢复；不留旧方法或双实现。
