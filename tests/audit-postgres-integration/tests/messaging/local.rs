@@ -1,5 +1,6 @@
 //! Audit/Ledger consume the same provider transaction as Inbox and source Outbox settlement.
 use super::*;
+use futures::StreamExt;
 use rss_data_protection::{Aead, AeadError, CiphertextEnvelope, DerivedAad, Plaintext};
 use rss_transactional_messaging::{
     outbox::{OutboxWriter, PendingMessage},
@@ -186,7 +187,9 @@ async fn scenario(
             deadline()?,
             Duration::from_secs(5),
         )
-        .await?;
+        .await?
+        .collect::<Vec<_>>()
+        .await;
     assert_eq!(batch.len(), 1);
     let PgProjectionOutcome::Attempt(attempt) = batch.remove(0).into_outcome()? else {
         anyhow::bail!("expected local Audit transaction attempt")
@@ -247,6 +250,8 @@ async fn scenario(
                     Duration::from_secs(5)
                 )
                 .await?
+                .collect::<Vec<_>>()
+                .await
                 .is_empty()
         );
     }

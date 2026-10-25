@@ -13,19 +13,19 @@ check:
 	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 test:
-	cargo test --locked --workspace --exclude audit-postgres-integration --all-features
+	cargo test --locked --workspace --exclude audit-postgres-integration --exclude ledger-postgres-integration --all-features
 	$(MAKE) test-postgres
 
 launcher:
 	cargo build --locked -p audit-postgres-integration --bin audit-test-launcher
 
 test-postgres: launcher
-	RSS_TEST_RUN_ID="audit-t2-$$(date +%s)-$$$$" $(CARGO_TARGET_DIR)/debug/audit-test-launcher -- cargo test --locked -p audit-postgres-integration --test suite
+	RSS_TEST_RUN_ID="audit-t2-$$(date +%s)-$$$$" $(CARGO_TARGET_DIR)/debug/audit-test-launcher -- cargo test --locked -p audit-postgres-integration -p ledger-postgres-integration --test suite
 
 coverage: launcher
 	cargo llvm-cov clean --workspace
-	cargo llvm-cov --locked --workspace --exclude audit-postgres-integration --all-features --no-report
-	RSS_TEST_RUN_ID="audit-cov-$$(date +%s)-$$$$" $(CARGO_TARGET_DIR)/debug/audit-test-launcher -- cargo llvm-cov --locked -p audit-postgres-integration --test suite --no-report
+	cargo llvm-cov --locked --workspace --exclude audit-postgres-integration --exclude ledger-postgres-integration --all-features --no-report
+	RSS_TEST_RUN_ID="audit-cov-$$(date +%s)-$$$$" $(CARGO_TARGET_DIR)/debug/audit-test-launcher -- cargo llvm-cov --locked -p audit-postgres-integration -p ledger-postgres-integration --test suite --no-report
 	cargo llvm-cov report --locked --fail-under-lines 80
 
 licenses:

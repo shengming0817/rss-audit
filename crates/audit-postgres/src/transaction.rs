@@ -120,7 +120,7 @@ impl<T: ExecutionTimer> ReadAuditTransaction<'_, '_, '_, T> {
     }
 }
 
-/// Tenant-bound write access, handed to the callback after Audit and optional Ledger locks.
+/// Tenant-bound write access, handed to the callback after optional Ledger locks.
 /// Operations share the connection, admitted storage and absolute operation cutoff.
 pub struct WriteAuditTransaction<'a, 'db, 'control, T> {
     pub(crate) read: ReadAuditTransaction<'a, 'db, 'control, T>,
@@ -137,16 +137,10 @@ impl<T> std::ops::DerefMut for WriteAuditTransaction<'_, '_, '_, T> {
     }
 }
 impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
-    /// Acquire Audit then optional ledger locks before deriving business facts.
+    /// Acquire optional ledger locks before deriving business facts.
     /// Does not append an event; only the original owner can settle this transaction.
     pub(crate) async fn lock_head(&mut self) -> Result<(), Error> {
-        self.read
-            .control
-            .run(
-                Stage::Operation,
-                repository::lock_head(self.read.tx, self.read.tenant),
-            )
-            .await?;
+        crate::probe::tenant(self.read.tx, self.read.tenant).await?;
         #[cfg(feature = "ledger")]
         if let Integrity::Ledger(auth) = self.read.integrity {
             let clock =
@@ -163,17 +157,23 @@ impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
         Ok(())
     }
     /// Stage exact canonical bytes. Propagate any error to the enclosing owner.
-    /// Acquire Audit before ledger before business/outbox locks.
+    /// In Ledger mode acquire the chain before business/outbox locks.
     pub async fn append(&mut self, request: &PreparedAuditV1) -> Result<StagedAppend, Error> {
         self.read.control.check(Stage::Operation)?;
-        if request.append_request().ledger().tenant() != self.read.tenant {
+        if request.identity().tenant() != self.read.tenant {
             return Err(Error::ScopeMismatch);
         }
-        let existing =
-            repository::reserve(self.read.tx, request, self.read.integrity.is_ledger()).await?;
-        self.stage(request, existing).await
+        crate::borrowed::append_batch(
+            self.read.tx,
+            self.read.integrity,
+            std::slice::from_ref(request),
+            self.read.control,
+        )
+        .await?
+        .pop()
+        .ok_or(Error::StorageContract)
     }
-    /// Resolve and append a fact under this owner's existing Audit/Ledger locks.
+    /// Resolve and append a fact with optional Ledger locking; Plain business concurrency remains host-owned.
     /// Requires READ COMMITTED. The synchronous resolver sees the exact existing record and
     /// database time, and must return the same stable identity. Product receipt validation
     /// remains with the caller; persist returned canonical bytes in the same transaction.
@@ -207,32 +207,6 @@ impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
             existing.as_ref(),
             self.read.integrity.is_ledger(),
         )?;
-        self.stage(&request, existing).await.map_err(E::from)
-    }
-    async fn stage(
-        &mut self,
-        request: &PreparedAuditV1,
-        existing: Option<crate::Record>,
-    ) -> Result<StagedAppend, Error> {
-        let ledger = match self.read.integrity {
-            Integrity::Plain => None,
-            #[cfg(feature = "ledger")]
-            Integrity::Ledger(auth) => {
-                let clock = crate::control::LedgerClock(
-                    self.read.control.timer,
-                    self.read.control.timer.now(),
-                );
-                let budget = clock.budget(self.read.control, Stage::Operation);
-                let staged = rss_ledger_postgres::append_in_transaction(
-                    self.read.tx,
-                    auth,
-                    request.append_request(),
-                    &budget,
-                )
-                .await?;
-                Some((staged.entry().sequence().get(), staged.inserted()))
-            }
-        };
-        repository::finish(self.read.tx, request, existing, ledger).await
+        self.append(&request).await.map_err(E::from)
     }
 }

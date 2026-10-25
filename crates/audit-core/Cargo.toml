@@ -9,10 +9,14 @@ description = "Provider-free canonical audit record protocol"
 [dependencies]
 rss-contract.workspace = true
 rss-diag-context.workspace = true
-rss-ledger.workspace = true
+rss-ledger = { workspace = true, optional = true }
 rss-redact.workspace = true
 rss-request-context.workspace = true
 thiserror.workspace = true
+
+[features]
+default = []
+ledger = ["dep:rss-ledger"]
 
 [dev-dependencies]
 serde_json = "1"

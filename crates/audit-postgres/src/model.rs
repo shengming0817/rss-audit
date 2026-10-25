@@ -67,7 +67,7 @@ pub struct Record {
     pub(crate) ledger_sequence: Option<u64>,
 }
 impl Record {
-    /// Monotonic tenant-local pagination position, independent of the ledger sequence.
+    /// Stable navigation position, allowing gaps and out-of-order commits; never a consumption offset.
     pub fn position(&self) -> u64 {
         self.position as u64
     }
@@ -98,7 +98,8 @@ impl StagedAppend {
     }
 }
 
-/// Complete ordinary page within a fixed first-page upper bound; not an MVCC snapshot.
+/// Ordinary page within a fixed first-page upper bound; not a fixed membership or MVCC snapshot.
+/// A lower position committed after it was passed may appear only in a fresh query.
 #[derive(Debug)]
 pub struct Page {
     pub(crate) records: Vec<Record>,

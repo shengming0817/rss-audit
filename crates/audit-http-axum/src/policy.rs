@@ -49,7 +49,7 @@ impl QueryGrant {
     /// for authentication, session freshness, authorization and preservation of retry bytes.
     pub fn new(tenant: TenantId, audit: SelfAudit) -> Result<Self, InvalidGrant> {
         if let SelfAudit::Required(request) = &audit
-            && request.append_request().ledger().tenant() != tenant
+            && request.identity().tenant() != tenant
         {
             return Err(InvalidGrant);
         }

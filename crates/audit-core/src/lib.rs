@@ -5,8 +5,10 @@
 mod codec;
 mod error;
 mod identity;
+#[cfg(feature = "ledger")]
 mod ledger;
 mod model;
+mod prepared;
 
 pub use codec::{MAX_PAYLOAD_BYTES, MAX_RECORD_BYTES, decode_untrusted};
 pub use error::{Error, Field};
@@ -14,11 +16,10 @@ pub use identity::{
     Action, ActorId, ActorKind, ActorRef, AuditPayload, EventId, OperationId, ResourceId,
     ResourceKind, ResourceRef, SourceContract, SourceId, SourceIdentity,
 };
-pub use ledger::{
-    AUDIT_CHAIN_ID, PreparedAuditV1, VerifiedAuditEntryV1, VerifiedAuditWindow, prepare,
-    verify_window,
-};
+#[cfg(feature = "ledger")]
+pub use ledger::{AUDIT_CHAIN_ID, VerifiedAuditEntryV1, VerifiedAuditWindow, verify_window};
 pub use model::{
     AuditEventV1, Coordinates, DecodedAuditV1, EventContext, EventFacts, Outcome, RecordIdentity,
     RecordVersion,
 };
+pub use prepared::{PreparedAuditV1, prepare};

@@ -7,10 +7,11 @@ readiness, migrations, pool ownership or implicit authorization.
 
 `GET /api/v2/audit/entries?limit=50&cursor=...` accepts only `limit` (1..=100, default 50) and
 `cursor`; query text is bounded to 1024 bytes. A cursor is unpadded canonical base64url of version
-byte 1, 16 tenant bytes, big-endian u64 after and inclusive through. It is navigation, not authority.
+byte 2, 16 tenant bytes, big-endian u64 after and inclusive through. It is navigation, not authority.
 The first page captures a fixed upper bound. The final/empty page has `nextCursor: null`.
-Concurrent appends, including self-audit, do not extend the enumeration; this is not an MVCC
-snapshot, authenticated checkpoint, or complete-history proof. Start a new query to see new records.
+The fixed bound does not freeze membership. Late commits at already-passed positions may require
+a fresh query. This is navigation, never a commit-order offset, MVCC snapshot or complete-history
+proof. Version-1 cursors are rejected; clients must start a fresh query.
 
 The response is `{tenantId, integrity: "unverified", entries, nextCursor}`. Entries contain only
 `position`, `sourceId`, `eventId`, `action`, `outcome` (`succeeded|denied|failed|unknown`), `occurredAt`,

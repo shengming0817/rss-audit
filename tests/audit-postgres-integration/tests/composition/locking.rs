@@ -69,25 +69,30 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
             })
         })
         .await;
-    assert!(
-        !started.load(std::sync::atomic::Ordering::SeqCst),
-        "write callback must not start before Audit and optional Ledger are locked"
-    );
-    attempt.fold(
-        |_| Err(anyhow::anyhow!("unexpected commit")),
-        |e| Err(anyhow::anyhow!("not started: {e:?}")),
-        |e| {
-            if operation_deadline(&e) {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("rolled back: {e:?}"))
-            }
-        },
-        |e| Err(anyhow::anyhow!("rollback failed: {e:?}")),
-        |e| Err(anyhow::anyhow!("commit unknown: {e:?}")),
-        |e| Err(anyhow::anyhow!("fenced: {e:?}")),
-    )?;
-    // A reader of the same tenant must complete while the first writer holds both heads.
+    if ledger {
+        assert!(
+            !started.load(std::sync::atomic::Ordering::SeqCst),
+            "write callback must not start before the selected Ledger chain is locked"
+        );
+        attempt.fold(
+            |_| Err(anyhow::anyhow!("unexpected commit")),
+            |e| Err(anyhow::anyhow!("not started: {e:?}")),
+            |e| {
+                if operation_deadline(&e) {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("rolled back: {e:?}"))
+                }
+            },
+            |e| Err(anyhow::anyhow!("rollback failed: {e:?}")),
+            |e| Err(anyhow::anyhow!("commit unknown: {e:?}")),
+            |e| Err(anyhow::anyhow!("fenced: {e:?}")),
+        )?;
+    } else {
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+        committed(attempt)?;
+    }
+    // A reader of the same tenant must complete while the first writer holds its optional chain head.
     let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(1))?;
     let reader = Control::new(&clock, cutoff, cutoff, &cancel);
     committed(
@@ -103,9 +108,15 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
             })
             .await,
     )?;
-    assert_head_locked(pool, false).await?;
     if ledger {
-        assert_head_locked(pool, true).await?;
+        assert_head_locked(pool).await?;
+    }
+    if !ledger {
+        release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("writer ended early"))?;
+        task.await??;
+        return Ok(());
     }
     let waiter = tokio::spawn(async move {
         let clock = TestClock;
@@ -133,7 +144,7 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let waiting: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND usename=current_user AND wait_event_type='Lock' AND query LIKE '%rss_audit.reserve%')",
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND usename=current_user AND wait_event_type='Lock' AND query LIKE '%rss_ledger.prepare_append%')",
             ).fetch_one(pool).await?;
             if waiting { return Ok::<_, sqlx::Error>(()); }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -147,7 +158,7 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn assert_head_locked(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
+async fn assert_head_locked(pool: &PgPool) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(
         "SELECT set_config('rss.tenant_id',$1,true),set_config('lock_timeout','100ms',true)",
@@ -155,18 +166,12 @@ async fn assert_head_locked(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
     .bind(tenant()?.to_string())
     .execute(&mut *tx)
     .await?;
-    let result = if ledger {
+    let result =
         sqlx::query("SELECT rss_ledger.prepare_append($1::uuid,$2,'audit-fixture',1::smallint)")
             .bind(tenant()?.to_string())
             .bind(AUDIT_CHAIN_ID)
             .execute(&mut *tx)
-            .await
-    } else {
-        sqlx::query("SELECT rss_audit.reserve($1::uuid)")
-            .bind(tenant()?.to_string())
-            .execute(&mut *tx)
-            .await
-    };
+            .await;
     let error = result
         .err()
         .ok_or_else(|| anyhow::anyhow!("head must already be locked"))?;

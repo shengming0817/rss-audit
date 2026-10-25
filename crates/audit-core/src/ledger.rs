@@ -1,5 +1,4 @@
-use crate::{AuditEventV1, DecodedAuditV1, Error, EventId, SourceId, codec};
-use rss_contract::Timepoint;
+use crate::{DecodedAuditV1, Error, EventId, PreparedAuditV1, SourceId, codec};
 use rss_ledger::{
     AppendRequest, Authenticator, ChainId, Entry, LedgerId, RecordId, Sequence, Verification,
 };
@@ -8,73 +7,12 @@ use rss_request_context::TenantId;
 /// Fixed Audit V1 chain identity. Every tenant has one V1 audit sequence.
 pub const AUDIT_CHAIN_ID: &str = "rss.audit.v1";
 
-fn audit_record_id(source: &SourceId, event: &EventId) -> Result<RecordId, Error> {
+pub(crate) fn audit_record_id(source: &SourceId, event: &EventId) -> Result<RecordId, Error> {
     Ok(RecordId::parse(&format!(
         "v1:{}:{}",
         source.as_str(),
         event.as_str()
     ))?)
-}
-
-/// Canonical Audit V1 bytes lowered to a ledger append request.
-///
-/// Preparation performs no provider I/O and is never durable-commit evidence.
-#[derive(Clone)]
-pub struct PreparedAuditV1 {
-    request: AppendRequest,
-}
-
-impl PreparedAuditV1 {
-    /// Restore an exact V1 request after applying the existing structural decoder.
-    /// This does not authenticate the bytes, their recording time or a previous commit.
-    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let (event, recorded_at) = codec::decode_untrusted(bytes)?.into_parts();
-        let prepared = prepare(event, recorded_at)?;
-        if prepared.canonical_bytes() != bytes {
-            return Err(Error::MalformedEncoding);
-        }
-        Ok(prepared)
-    }
-
-    /// Exact ledger request to stage. Preserve it unchanged after commit-unknown.
-    #[must_use]
-    pub const fn append_request(&self) -> &AppendRequest {
-        &self.request
-    }
-
-    /// Exact canonical Audit V1 bytes.
-    #[must_use]
-    pub fn canonical_bytes(&self) -> &[u8] {
-        self.request.payload()
-    }
-
-    /// Compare a returned ledger entry to this exact request.
-    #[must_use]
-    pub fn matches_entry(&self, entry: &Entry) -> bool {
-        entry.matches(&self.request)
-    }
-}
-
-impl std::fmt::Debug for PreparedAuditV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("PreparedAuditV1([redacted])")
-    }
-}
-
-/// Assign recording time and produce the one canonical ledger request.
-///
-/// The caller supplying `recorded_at` is responsible for using the recorder/provider authority.
-/// This function performs no I/O and returns no staged or committed evidence.
-pub fn prepare(event: AuditEventV1, recorded_at: Timepoint) -> Result<PreparedAuditV1, Error> {
-    let canonical = codec::encode(&event, recorded_at)?;
-    let record_id = audit_record_id(
-        event.identity().source().source_id(),
-        event.identity().event_id(),
-    )?;
-    let chain = ChainId::parse(AUDIT_CHAIN_ID)?;
-    let ledger = LedgerId::new(event.identity().tenant(), chain);
-    let request = AppendRequest::new(ledger, record_id, canonical)?;
-    Ok(PreparedAuditV1 { request })
 }
 
 /// One authenticated Audit record and its ledger sequence.
@@ -168,4 +106,21 @@ pub fn verify_window(
         });
     }
     Ok(VerifiedAuditWindow { ledger, records })
+}
+
+impl PreparedAuditV1 {
+    /// Map this exact Audit record to its optional integrity chain. Not commit evidence.
+    pub fn append_request(&self) -> Result<AppendRequest, Error> {
+        let identity = self.identity();
+        Ok(AppendRequest::new(
+            LedgerId::new(identity.tenant(), ChainId::parse(AUDIT_CHAIN_ID)?),
+            audit_record_id(identity.source().source_id(), identity.event_id())?,
+            self.canonical_bytes().to_vec(),
+        )?)
+    }
+    /// Compare an authenticated entry with the exact audit bytes and identity.
+    pub fn matches_entry(&self, entry: &Entry) -> bool {
+        self.append_request()
+            .is_ok_and(|request| entry.matches(&request))
+    }
 }

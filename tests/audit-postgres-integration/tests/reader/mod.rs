@@ -71,7 +71,7 @@ async fn read_and_reject_write(
             Box::pin(async move {
                 tx.with_connection(move |c| {
                     Box::pin(async move {
-                        sqlx::query("SELECT rss_audit.reserve($1::uuid)")
+                        sqlx::query("SELECT * FROM rss_audit.append_batch($1::uuid,ARRAY[]::text[],ARRAY[]::text[],ARRAY[]::bigint[],ARRAY[]::bytea[],ARRAY[]::bigint[])")
                             .bind(tenant_id)
                             .execute(c)
                             .await?;

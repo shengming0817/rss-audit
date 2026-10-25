@@ -445,9 +445,16 @@ async fn pages(
 ) -> anyhow::Result<()> {
     let mut cursor = None::<String>;
     let mut first_cursor = None;
+    let mut previous_position = None;
     for (position, id) in ["one", "two", "three"].into_iter().enumerate() {
         let body = audited_page(pg, app, tenant, position, cursor.as_deref(), control).await?;
         assert_entry(&body, tenant, position, id);
+        let actual = body["entries"][0]["position"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("position"))?
+            .parse::<u64>()?;
+        assert!(previous_position.is_none_or(|previous| actual > previous));
+        previous_position = Some(actual);
         cursor = body["nextCursor"].as_str().map(str::to_owned);
         if position == 0 {
             first_cursor = cursor.clone();
@@ -500,7 +507,7 @@ async fn corruption(
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "UPDATE rss_audit.records SET recorded_at=0 WHERE tenant_id=$1::uuid AND position=0",
+        "UPDATE rss_audit.records SET recorded_at=0 WHERE tenant_id=$1::uuid AND source_id='http' AND event_id='one'",
     )
     .bind(tenant.to_string())
     .execute(admin)
@@ -601,7 +608,7 @@ fn assert_entry(body: &Value, tenant: TenantId, position: usize, id: &str) {
         ])
     );
     assert_eq!(entry["eventId"], id);
-    assert_eq!(entry["position"], position.to_string());
+    assert!(entry["position"].as_str().is_some());
     assert_eq!(entry["occurredAt"], "123");
     if position == 0 {
         assert_eq!(

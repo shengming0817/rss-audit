@@ -101,19 +101,20 @@ fn golden_v1() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     ))
 }
 
+#[cfg(feature = "ledger")]
 #[test]
 fn prepares_exact_ledger_identity_and_bytes() -> Result<(), Box<dyn std::error::Error>> {
     let prepared = prepare(event()?, Timepoint::try_from(1_726_000_001_i64)?)?;
     assert_eq!(
-        prepared.append_request().ledger().chain().as_str(),
+        prepared.append_request()?.ledger().chain().as_str(),
         "rss.audit.v1"
     );
     assert_eq!(
-        prepared.append_request().record_id().as_str(),
+        prepared.append_request()?.record_id().as_str(),
         "v1:rss-identity:event-42"
     );
     assert_eq!(
-        prepared.append_request().payload(),
+        prepared.append_request()?.payload(),
         prepared.canonical_bytes()
     );
     Ok(())
