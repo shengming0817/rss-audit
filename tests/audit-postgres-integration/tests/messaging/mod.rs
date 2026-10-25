@@ -91,6 +91,10 @@ fn message(id: &str, payload: Vec<u8>) -> anyhow::Result<MessageEnvelope<Vec<u8>
     ))
 }
 
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "Keep the borrowed transaction outcomes and their durable assertions together."
+)]
 pub(super) async fn run(
     plain: &PgAudit,
     ledger: &PgAudit,

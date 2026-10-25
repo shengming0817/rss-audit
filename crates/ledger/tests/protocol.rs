@@ -1,3 +1,4 @@
+//! Ledger protocol and authentication invariants.
 use rss_ledger::*;
 use rss_request_context::TenantId;
 fn scope() -> anyhow::Result<LedgerId> {

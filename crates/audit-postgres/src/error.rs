@@ -63,7 +63,7 @@ pub enum Error {
     /// Ledger integrity failures never downgrade to plain persistence.
     #[cfg(feature = "ledger")]
     #[error(transparent)]
-    Ledger(#[from] rss_ledger_postgres::Error),
+    Ledger(rss_ledger_postgres::Error),
     /// Enclosing message owner's original classified error, including ownership loss.
     #[cfg(feature = "messaging")]
     #[error(transparent)]
@@ -166,6 +166,16 @@ impl TransactionError<Error> {
                 operation: Box::new(operation.into_audit()),
                 settlement: Box::new(settlement),
             },
+        }
+    }
+}
+
+#[cfg(feature = "ledger")]
+impl From<rss_ledger_postgres::Error> for Error {
+    fn from(error: rss_ledger_postgres::Error) -> Self {
+        match error {
+            rss_ledger_postgres::Error::Conflict => Self::Conflict,
+            other => Self::Ledger(other),
         }
     }
 }
