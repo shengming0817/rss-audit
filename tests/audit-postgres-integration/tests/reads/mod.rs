@@ -154,12 +154,13 @@ async fn corruption(
         .bind(other.to_string())
         .execute(admin)
         .await?;
-    rolled_back(
+    let empty = committed(
         plain
             .read_page(Cursor::start(other), ReadLimit::new(1, 100000)?, control)
             .await,
-        |e| matches!(e, Error::StorageContract),
-    );
+    )?;
+    assert!(empty.records().is_empty());
+    assert!(empty.next().is_none());
     Ok(())
 }
 

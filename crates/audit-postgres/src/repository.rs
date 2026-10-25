@@ -159,7 +159,7 @@ pub(crate) async fn page(
         .bind(cursor.through)
         .fetch_all(c)
         .await?;
-    let mut through = -1;
+    let mut through = -1_i64;
     let mut has_more = false;
     let mut records = Vec::new();
     let mut bytes = 0_i64;

@@ -1,4 +1,5 @@
 //! Real TLS PostgreSQL acceptance through the public adapter API.
+use anyhow::Context as _;
 use rss_audit_core::*;
 use rss_audit_postgres::{
     Committed, Control, Cursor, Error, Integrity, PgAudit, ReadLimit, TransactionError,
@@ -145,8 +146,12 @@ async fn run() -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
     let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(150))?;
     let control = Control::new(&clock, cutoff, cutoff, &cancel);
-    let plain = PgAudit::new(pool.clone(), Integrity::Plain, &control).await?;
-    let ledger = PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), &control).await?;
+    let plain = PgAudit::new(pool.clone(), Integrity::Plain, &control)
+        .await
+        .context("plain startup")?;
+    let ledger = PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), &control)
+        .await
+        .context("ledger startup")?;
     exercise(&plain, &ledger, &pool, &admin, &fixture, &control).await?;
     storage_classification(&pool).await?;
     pool.close().await;
@@ -163,17 +168,37 @@ async fn exercise(
     fixture: &testkit::PgTlsFixture,
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
-    query_cost::run(pool, admin, control).await?;
-    basic(plain, ledger, control).await?;
-    atomicity::run(plain, ledger, admin, control).await?;
-    reads::run(plain, ledger, admin, control).await?;
-    paging::run(plain, admin, control).await?;
-    messaging::run(plain, ledger, admin, fixture, control).await?;
-    http::run(plain, ledger, pool, admin, control).await?;
-    composition::run(plain, ledger, admin, control).await?;
-    composition::single_connection(pool).await?;
-    reader::run(ledger, pool, admin, control).await?;
-    admission::run(pool, admin, control).await?;
+    query_cost::run(pool, admin, control)
+        .await
+        .context("query_cost::run")?;
+    basic(plain, ledger, control).await.context("basic")?;
+    atomicity::run(plain, ledger, admin, control)
+        .await
+        .context("atomicity::run")?;
+    reads::run(plain, ledger, admin, control)
+        .await
+        .context("reads::run")?;
+    paging::run(plain, admin, control)
+        .await
+        .context("paging::run")?;
+    messaging::run(plain, ledger, admin, fixture, control)
+        .await
+        .context("messaging::run")?;
+    http::run(plain, ledger, pool, admin, control)
+        .await
+        .context("http::run")?;
+    composition::run(plain, ledger, admin, control)
+        .await
+        .context("composition::run")?;
+    composition::single_connection(pool)
+        .await
+        .context("composition::single_connection")?;
+    reader::run(ledger, pool, admin, control)
+        .await
+        .context("reader::run")?;
+    admission::run(pool, admin, control)
+        .await
+        .context("admission::run")?;
     Ok(())
 }
 async fn install(admin: &PgPool) -> anyhow::Result<()> {

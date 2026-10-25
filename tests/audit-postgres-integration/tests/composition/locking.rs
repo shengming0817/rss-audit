@@ -7,6 +7,10 @@ pub(super) async fn run(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "Keep the concurrent writer, reader and lock assertions in one ordered scenario."
+)]
 async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
     let clock = TestClock;
     let cancel = CancellationToken::new();

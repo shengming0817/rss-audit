@@ -78,7 +78,7 @@ pub(crate) async fn lock_head(
     auth: &Authenticator,
     ledger: &LedgerId,
 ) -> Result<(), Error> {
-    sqlx::query("SELECT rss_ledger.prepare_append($1::uuid,$2,$3,1::smallint)")
+    sqlx::query("SELECT 1 FROM rss_ledger.prepare_append($1::uuid,$2,$3,1::smallint)")
         .bind(ledger.tenant().to_string())
         .bind(ledger.chain().as_str())
         .bind(auth.key_id().as_str())

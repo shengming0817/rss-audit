@@ -1,3 +1,4 @@
+//! Ledger persistence and transaction integration against real PostgreSQL.
 use rss_ledger::{AppendRequest, Authenticator, ChainId, KeyId, LedgerId, RecordId, Sequence};
 use rss_ledger_postgres::*;
 use rss_request_context::TenantId;
