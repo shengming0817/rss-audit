@@ -34,7 +34,7 @@ WITH assessment AS MATERIALIZED (
                 OR coalesce(bool_or(e.seq IS NOT NULL AND ((
                     e.encoding_version IS NOT NULL AND
                     octet_length(convert_to(e.chain_id, 'UTF8')) BETWEEN 1 AND 255
-                    AND octet_length(convert_to(e.record_id, 'UTF8')) BETWEEN 1 AND 255
+                    AND octet_length(convert_to(e.record_id, 'UTF8')) BETWEEN 1 AND 514
                     AND octet_length(convert_to(e.key_id, 'UTF8')) BETWEEN 1 AND 255
                     AND octet_length(e.payload) <= $8::bigint
                     AND octet_length(e.previous_tag) = 32

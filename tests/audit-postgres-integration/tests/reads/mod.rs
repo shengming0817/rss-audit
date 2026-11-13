@@ -96,6 +96,7 @@ pub(super) async fn run(
             )
         },
     );
+    capacity(plain, ledger, control).await?;
     corruption(plain, ledger, admin, control, &one).await
 }
 
@@ -204,6 +205,97 @@ async fn ledger_metadata(
             .bind(decoded.recorded_at().unix_seconds())
             .execute(admin)
             .await?;
+    }
+    Ok(())
+}
+
+async fn capacity(
+    plain: &PgAudit,
+    ledger: &PgAudit,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let token = "a".repeat(255);
+    for (store, tenant_text, integrity) in [
+        (plain, "f47ac10b-58cc-4372-a567-0e02b2c3d500", false),
+        (ledger, "f47ac10b-58cc-4372-a567-0e02b2c3d501", true),
+    ] {
+        let tenant = TenantId::parse(tenant_text)?;
+        let make = |payload| -> anyhow::Result<AuditEventV1> {
+            let base = event(tenant, &token, &token, vec![])?;
+            Ok(AuditEventV1::new(
+                base.identity().clone(),
+                EventFacts::new(
+                    ActorRef::new(ActorKind::parse(&token)?, ActorId::parse(&"é".repeat(256))?),
+                    Action::parse(&token)?,
+                    ResourceRef::new(
+                        ResourceKind::parse(&token)?,
+                        ResourceId::parse(&"é".repeat(256))?,
+                    ),
+                    Outcome::Succeeded,
+                    base.facts().occurred_at(),
+                ),
+                EventContext::new(
+                    Coordinates::new(
+                        Some(rss_diag_context::CorrelationId::parse(&token)?),
+                        Some(rss_request_context::RequestId::parse(&"r".repeat(128))?),
+                        Some(OperationId::parse(&token)?),
+                    ),
+                    AuditPayload::new(payload)?,
+                ),
+            ))
+        };
+        let stamp = Timepoint::try_from(456_i64)?;
+        let overhead = prepare(make(vec![])?, stamp)?.canonical_bytes().len();
+        let prepared = prepare(make(vec![7; MAX_RECORD_BYTES - overhead])?, stamp)?;
+        let first = committed(store.append(&prepared, control).await)?;
+        assert!(first.inserted());
+        assert!(!committed(store.append(&prepared, control).await)?.inserted());
+        let restored =
+            PreparedAuditV1::from_canonical_bytes(first.record().prepared().canonical_bytes())?;
+        assert_eq!(restored.canonical_bytes(), prepared.canonical_bytes());
+        let page = committed(
+            store
+                .read_page(
+                    Cursor::start(tenant),
+                    ReadLimit::new(1, MAX_RECORD_BYTES as u64)?,
+                    control,
+                )
+                .await,
+        )?;
+        assert_eq!(
+            page.records()[0].prepared().canonical_bytes(),
+            prepared.canonical_bytes()
+        );
+        let changed = prepare(make(vec![8])?, stamp)?;
+        rolled_back(store.append(&changed, control).await, |e| {
+            matches!(e, Error::Conflict)
+        });
+        if integrity {
+            let request = prepared.append_request()?;
+            assert_eq!(request.record_id().as_str().len(), 514);
+            let bytes = auth()?.append(&request, None)?.encoded_len() as u64;
+            let window = committed(
+                store
+                    .read_verified(
+                        tenant,
+                        Sequence::new(0),
+                        rss_ledger_postgres::ReadLimit::new(1, bytes)?,
+                        control,
+                    )
+                    .await,
+            )?;
+            assert_eq!(
+                window.records()[0]
+                    .record()
+                    .event()
+                    .context()
+                    .coordinates()
+                    .correlation_id()
+                    .ok_or_else(|| anyhow::anyhow!("correlation missing"))?
+                    .as_str(),
+                token
+            );
+        }
     }
     Ok(())
 }

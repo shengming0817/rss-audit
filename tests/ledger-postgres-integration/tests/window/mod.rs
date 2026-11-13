@@ -54,15 +54,17 @@ pub async fn run(
     ring::rand::SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| anyhow::anyhow!("fixture random bytes unavailable"))?;
-    let ledger = request("预算链", "前驱", &bytes)?.ledger().clone();
+    let ledger = request("预算链", &"é".repeat(257), &bytes)?
+        .ledger()
+        .clone();
     let first = committed(
         store
-            .append(&request("预算链", "前驱", &bytes)?, control)
+            .append(&request("预算链", &"é".repeat(257), &bytes)?, control)
             .await,
     )?;
     let second = committed(
         store
-            .append(&request("预算链", "记录", &bytes)?, control)
+            .append(&request("预算链", &"r".repeat(514), &bytes)?, control)
             .await,
     )?;
     let one = first.entry().encoded_len() as u64;
@@ -322,6 +324,10 @@ async fn malformed(
         assert_status_only(&raw, expected)?;
         restore_constraint(owner, result, expected).await?;
     }
+    sqlx::raw_sql("ALTER TABLE rss_ledger.entries DROP CONSTRAINT entries_record_id_check; UPDATE rss_ledger.entries SET record_id=repeat('r',515) WHERE chain_id='window-malformed'").execute(owner).await?;
+    let invalid = raw_window(owner, r.ledger(), 0, 1, 1).await?;
+    sqlx::raw_sql("UPDATE rss_ledger.entries SET record_id='r' WHERE chain_id='window-malformed'; ALTER TABLE rss_ledger.entries ADD CONSTRAINT entries_record_id_check CHECK(octet_length(record_id) BETWEEN 1 AND 514)").execute(owner).await?;
+    assert_status_only(&invalid, 3)?;
     Ok(())
 }
 

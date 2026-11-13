@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rss_audit_postgres::Cursor;
+use rss_audit_postgres::{Cursor, ReadLimit};
 use rss_request_context::TenantId;
 use serde::Deserialize;
 
@@ -26,8 +26,8 @@ impl AuditQuery {
             return Err(InvalidQuery);
         }
         let wire: WireQuery = serde_urlencoded::from_str(query).map_err(|_| InvalidQuery)?;
-        let limit = wire.limit.unwrap_or(50);
-        if !(1..=100).contains(&limit) {
+        let limit = wire.limit.unwrap_or(1000);
+        if !(1..=ReadLimit::MAX_ROWS).contains(&limit) {
             return Err(InvalidQuery);
         }
         Ok(Self {

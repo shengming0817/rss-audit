@@ -39,9 +39,6 @@ pub enum Error {
     /// A field contained a character outside its grammar.
     #[error("audit field has an invalid character: {0:?}")]
     InvalidCharacter(Field),
-    /// The payload exceeded the Audit V1 bound.
-    #[error("audit payload is too large")]
-    PayloadTooLarge,
     /// The complete canonical record exceeded the Audit V1 bound.
     #[error("audit record is too large")]
     RecordTooLarge,

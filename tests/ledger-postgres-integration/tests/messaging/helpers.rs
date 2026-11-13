@@ -9,7 +9,10 @@ impl rss_transactional_messaging::transaction::IngressValidator<Vec<u8>> for Val
         rss_transactional_messaging::transaction::VerifiedIngress,
         rss_transactional_messaging::transaction::EnvelopeValidationFailure,
     > {
-        Ok(challenge.verified())
+        let tenant = rss_request_context::TenantId::parse(crate::TENANT).map_err(|_| {
+            rss_transactional_messaging::transaction::EnvelopeValidationFailure::MalformedIdentity
+        })?;
+        Ok(challenge.verified(fence_fixture::binding(tenant)))
     }
 }
 #[allow(clippy::expect_used, clippy::panic)]

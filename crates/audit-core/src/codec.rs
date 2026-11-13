@@ -11,8 +11,6 @@ const DOMAIN: &[u8] = b"rss.audit.record\0";
 const CONTRACT_ID_MAX_BYTES: usize = 255;
 const SCHEMA_DIGEST_BYTES: usize = 71;
 const REQUEST_ID_MAX_BYTES: usize = 128;
-/// Maximum exact source payload bytes in Audit V1.
-pub const MAX_PAYLOAD_BYTES: usize = 65_536;
 /// Maximum complete canonical Audit V1 bytes.
 pub const MAX_RECORD_BYTES: usize = 131_072;
 
@@ -22,7 +20,7 @@ pub(crate) fn encode(event: &AuditEventV1, recorded_at: Timepoint) -> Result<Vec
     let contract = source.contract();
     let facts = event.facts();
     let coordinates = event.context().coordinates();
-    let mut bytes = Vec::with_capacity(event.context().payload().as_bytes().len() + 512);
+    let mut bytes = Vec::new();
     bytes.extend_from_slice(DOMAIN);
     bytes.extend_from_slice(&RecordVersion::V1.tag().to_be_bytes());
     bytes.extend_from_slice(&identity.tenant().octets());
@@ -61,6 +59,14 @@ fn push_text(output: &mut Vec<u8>, value: &str) -> Result<(), Error> {
 
 fn push_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), Error> {
     let len = u32::try_from(value.len()).map_err(|_| Error::RecordTooLarge)?;
+    let end = output
+        .len()
+        .checked_add(4)
+        .and_then(|size| size.checked_add(value.len()))
+        .ok_or(Error::RecordTooLarge)?;
+    if end > MAX_RECORD_BYTES {
+        return Err(Error::RecordTooLarge);
+    }
     output.extend_from_slice(&len.to_be_bytes());
     output.extend_from_slice(value);
     Ok(())
@@ -134,7 +140,7 @@ pub fn decode_untrusted(bytes: &[u8]) -> Result<DecodedAuditV1, Error> {
         .optional_text(Field::OperationId, OperationId::MAX_BYTES)?
         .map(OperationId::parse)
         .transpose()?;
-    let payload = AuditPayload::new(reader.bytes(Field::Payload, MAX_PAYLOAD_BYTES)?.to_vec())?;
+    let payload = AuditPayload::new(reader.bytes(Field::Payload, MAX_RECORD_BYTES)?.to_vec())?;
     if !reader.is_finished() {
         return Err(Error::UnknownField);
     }
@@ -221,7 +227,7 @@ impl<'a> Reader<'a> {
         let len = usize::try_from(self.u32()?).map_err(|_| Error::MalformedEncoding)?;
         if len > max {
             return Err(if field == Field::Payload {
-                Error::PayloadTooLarge
+                Error::RecordTooLarge
             } else {
                 Error::TooLong(field)
             });

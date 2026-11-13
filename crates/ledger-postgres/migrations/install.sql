@@ -16,7 +16,7 @@ CREATE TABLE rss_ledger.heads (
 CREATE TABLE rss_ledger.entries (
     tenant_id uuid NOT NULL,
     chain_id text NOT NULL,
-    record_id text NOT NULL CHECK(octet_length(record_id) BETWEEN 1 AND 255),
+    record_id text NOT NULL CHECK(octet_length(record_id) BETWEEN 1 AND 514),
     seq bigint NOT NULL CHECK(seq>=0),
     previous_tag bytea NOT NULL CHECK(octet_length(previous_tag)=32),
     tag bytea NOT NULL CHECK(octet_length(tag)=32),
@@ -39,7 +39,7 @@ CREATE POLICY tenant_scope ON rss_ledger.entries
 USING(tenant_id=nullif(current_setting('rss.tenant_id',true),'')::uuid)
 WITH CHECK(tenant_id=nullif(current_setting('rss.tenant_id',true),'')::uuid);
 
-CREATE FUNCTION rss_ledger.prepare_append(t uuid,c text,k text,v smallint) RETURNS void
+CREATE FUNCTION rss_ledger.prepare_append(t uuid,c text,k text,v smallint) RETURNS rss_ledger.heads
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,rss_ledger AS $$
 DECLARE h rss_ledger.heads;
 BEGIN
@@ -50,14 +50,14 @@ BEGIN
     SELECT * INTO STRICT h FROM rss_ledger.heads WHERE tenant_id=t AND chain_id=c FOR UPDATE;
     IF h.key_id<>k THEN RAISE EXCEPTION 'ledger key mismatch' USING ERRCODE='PL002'; END IF;
     IF h.encoding_version<>v THEN RAISE EXCEPTION 'ledger version mismatch' USING ERRCODE='PL003'; END IF;
+    RETURN h;
 END $$;
 
 CREATE FUNCTION rss_ledger.insert_entry(t uuid,c text,r text,s bigint,p bytea,a bytea,b bytea,k text,v smallint) RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,rss_ledger AS $$
 DECLARE h rss_ledger.heads;
 BEGIN
-    PERFORM rss_ledger.prepare_append(t,c,k,v);
-    SELECT * INTO STRICT h FROM rss_ledger.heads WHERE tenant_id=t AND chain_id=c FOR UPDATE;
+    SELECT * INTO STRICT h FROM rss_ledger.prepare_append(t,c,k,v);
     IF h.seq=9223372036854775807 THEN RAISE EXCEPTION 'ledger exhausted' USING ERRCODE='PL004'; END IF;
     IF s IS DISTINCT FROM coalesce(h.seq+1,0) OR p IS DISTINCT FROM h.tag THEN
         RAISE EXCEPTION 'ledger predecessor mismatch' USING ERRCODE='PL005';

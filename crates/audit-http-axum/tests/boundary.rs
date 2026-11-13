@@ -3,12 +3,17 @@ use rss_audit_http_axum::AuditQuery;
 #[test]
 fn query_defaults_are_bounded() -> anyhow::Result<()> {
     let query = AuditQuery::parse(None)?;
-    assert_eq!(query.limit(), 50);
+    assert_eq!(query.limit(), 1000);
     assert!(!query.is_continuation());
-    assert_eq!(AuditQuery::parse(Some("limit=100"))?.limit(), 100);
+    for limit in [1, 101, 1000, 1024] {
+        assert_eq!(
+            AuditQuery::parse(Some(&format!("limit={limit}")))?.limit(),
+            limit
+        );
+    }
     for value in [
         "limit=0",
-        "limit=101",
+        "limit=1025",
         "limit=1&limit=2",
         "tenantId=foreign",
         "limit=-1",

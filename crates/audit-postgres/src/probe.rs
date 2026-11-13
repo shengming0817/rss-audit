@@ -1,4 +1,4 @@
-use crate::{AdmissionViolation as Violation, Error, NAVIGATION_UPGRADE_SQL};
+use crate::{AdmissionViolation as Violation, Error, MIGRATION_SQL};
 use rss_request_context::TenantId;
 use sqlx::{PgConnection, Row};
 
@@ -19,13 +19,13 @@ pub(crate) async fn validate_read(connection: &mut PgConnection) -> Result<(), E
     inspect(connection, false).await
 }
 async fn inspect(connection: &mut PgConnection, require_append: bool) -> Result<(), Error> {
-    let append_body = NAVIGATION_UPGRADE_SQL
+    let append_body = MIGRATION_SQL
         .split("$append$")
         .nth(1)
         .ok_or(Error::StorageContract)?;
     let mut expected = vec![
-        "records:CHECK (((octet_length(source_id) >= 1) AND (octet_length(source_id) <= 64)))",
-        "records:CHECK (((octet_length(event_id) >= 1) AND (octet_length(event_id) <= 128)))",
+        "records:CHECK (((octet_length(source_id) >= 1) AND (octet_length(source_id) <= 255)))",
+        "records:CHECK (((octet_length(event_id) >= 1) AND (octet_length(event_id) <= 255)))",
         "records:CHECK ((\"position\" >= 0))",
         "records:CHECK ((recorded_at >= 0))",
         "records:CHECK (((octet_length(canonical) >= 1) AND (octet_length(canonical) <= 131072)))",

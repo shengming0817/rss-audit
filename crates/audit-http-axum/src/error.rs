@@ -47,7 +47,7 @@ fn code(error: &TransactionError<Error>) -> SafeErrorCode {
             SafeErrorCode::Unavailable
         }
         TransactionError::Audit(e) | TransactionError::Operation(e) => match e {
-            Error::InvalidBound => SafeErrorCode::InvalidInput,
+            Error::InvalidBound | Error::ReadBudgetExceeded => SafeErrorCode::InvalidInput,
             Error::Storage { .. } | Error::Admission(_) => SafeErrorCode::Unavailable,
             _ => SafeErrorCode::Internal,
         },
@@ -95,7 +95,7 @@ mod tests {
             (Error::InvalidBound, 400),
             (Error::ScopeMismatch, 500),
             (Error::StorageContract, 500),
-            (Error::ReadBudgetExceeded, 500),
+            (Error::ReadBudgetExceeded, 400),
             (Error::Conflict, 500),
             (Error::Deadline(Stage::Operation), 503),
             (Error::Cancelled(Stage::Operation), 503),

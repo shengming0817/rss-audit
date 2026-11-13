@@ -48,7 +48,7 @@ WITH reachable AS (
     ('entries','CHECK ((octet_length(payload) <= 1048576))'),
     ('entries','PRIMARY KEY (tenant_id, chain_id, seq)'),
     ('entries','CHECK ((octet_length(previous_tag) = 32))'),
-    ('entries','CHECK (((octet_length(record_id) >= 1) AND (octet_length(record_id) <= 255)))'),
+    ('entries','CHECK (((octet_length(record_id) >= 1) AND (octet_length(record_id) <= 514)))'),
     ('entries','CHECK ((seq >= 0))'),('entries','CHECK ((octet_length(tag) = 32))'),
     ('entries','FOREIGN KEY (tenant_id, chain_id) REFERENCES rss_ledger.heads(tenant_id, chain_id)'),
     ('entries','UNIQUE (tenant_id, chain_id, record_id)'),

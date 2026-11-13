@@ -27,8 +27,9 @@ assert_eq!(auth.verify_chain(&ledger, &[entry])?.count(), 1);
 6. payload 的 `u64 BE` 字节长度和精确 payload 字节。
 
 认证值为完整 HMAC-SHA256 输出。首条 seq=0、前驱全零；后继 checked 加一。
-身份非空、最多 255 UTF-8 字节、不含 NUL；payload 允许为空、最大 1 MiB，不做 JSON 规范化。
-上限、字段顺序、字节序和版本均属于 V1 存储协议，未来变更须独立版本化。
+身份非空、不含 NUL；ChainId/KeyId 最多 255 UTF-8 字节，RecordId 最多 514 字节，
+可原样容纳 Audit 的 `v1:{source}:{event}`。payload 允许为空、最大 1 MiB，不做 JSON 规范化。
+本轮扩大接纳范围，V1 字段顺序、长度前缀、字节序、身份映射和认证字节不变。
 
 每个 Authenticator 固定一个 key_id 及至少 32 字节的密钥。密钥输入用完清零，Debug 脱敏；
 不宣称编译器/密码原语的全部内部临时状态均可清零。产品拥有随机密钥生成、注入、托管及轮转策略。

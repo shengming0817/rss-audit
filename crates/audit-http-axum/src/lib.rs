@@ -92,10 +92,10 @@ where
         Ok(c) => c,
         Err(_) => return error::safe(SafeErrorCode::InvalidInput),
     };
-    let limit = match ReadLimit::new(
-        query.limit(),
-        u64::from(query.limit()) * rss_audit_core::MAX_RECORD_BYTES as u64,
-    ) {
+    if query.limit() > grant.read_limit.rows() {
+        return error::safe(SafeErrorCode::InvalidInput);
+    }
+    let limit = match ReadLimit::new(query.limit(), grant.read_limit.bytes()) {
         Ok(limit) => limit,
         Err(_) => return error::safe(SafeErrorCode::Internal),
     };
