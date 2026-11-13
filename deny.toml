@@ -3,7 +3,15 @@ all-features = true
 
 [advisories]
 yanked = "deny"
-ignore = []
+# #3183/#3184: same bounded acceptance as the fixed RSS candidate.
+# Owners: RSS testkit / RSS dependency owner. Expires 2026-12-13 00:00 UTC.
+# Make licenses calls the candidate's checker: exact package identities/parents,
+# SQLite inactive on all workspace features/targets, and scanner consistency.
+# Revoke when maintained fixes are adopted, dependencies exit, or SQLite activates.
+ignore = [
+  { id = "RUSTSEC-2026-0440", reason = "#3183: RSS testkit owns temporary unmaintained risk; expires 2026-12-13 UTC; revoke when upstream #1007 is resolved." },
+  { id = "RUSTSEC-2026-0459", reason = "#3184: RSS dependency owner accepts inactive SQLx SQLite lock entries only; expires 2026-12-13 UTC; revoke on activation or a compatible SQLx fix." },
+]
 
 [licenses]
 confidence-threshold = 0.93
