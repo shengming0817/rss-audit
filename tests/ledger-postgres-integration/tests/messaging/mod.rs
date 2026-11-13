@@ -95,7 +95,7 @@ pub async fn run(
         PgPrivateCa::from_pem(fixture.ca_pem().as_bytes().to_vec())?,
     );
     let runtime =
-        Arc::new(PgRuntime::connect(config, super::Clock::new(), fence_fixture::binding()).await?);
+        Arc::new(PgRuntime::connect(config, super::Clock::new(), fence_fixture::storage()).await?);
     let inbox = PgInboxStore::new(
         runtime.clone(),
         LeaseRenewalPolicy::from_ttl(Duration::from_secs(30))?,
@@ -118,7 +118,13 @@ pub async fn run(
     ] {
         let m = message(id);
         let b = binding(&m);
-        let IdempotencyDisposition::Acquired(claim) = inbox.claim(b.identity(), deadline()).await?
+        let IdempotencyDisposition::Acquired(claim) = inbox
+            .claim(
+                fence_fixture::binding(b.identity().tenant_id()),
+                b.identity(),
+                deadline(),
+            )
+            .await?
         else {
             anyhow::bail!("expected inbox claim")
         };
@@ -152,7 +158,11 @@ pub async fn run(
         assert_eq!(row.is_some(), !fail);
         assert_eq!(
             inbox
-                .read_terminal(b.identity(), deadline())
+                .read_terminal(
+                    fence_fixture::binding(b.identity().tenant_id()),
+                    b.identity(),
+                    deadline()
+                )
                 .await?
                 .is_some(),
             !fail
@@ -161,7 +171,13 @@ pub async fn run(
             let retry = committed(store.append(&r, &control).await)?;
             assert!(!retry.inserted());
             assert!(!matches!(
-                inbox.claim(b.identity(), deadline()).await?,
+                inbox
+                    .claim(
+                        fence_fixture::binding(b.identity().tenant_id()),
+                        b.identity(),
+                        deadline()
+                    )
+                    .await?,
                 IdempotencyDisposition::Acquired(_)
             ));
         }
@@ -172,7 +188,13 @@ pub async fn run(
         let b = binding(&m);
         let r = request("inbox", id, b"original")?;
         committed(store.append(&r, &control).await)?;
-        let IdempotencyDisposition::Acquired(claim) = inbox.claim(b.identity(), deadline()).await?
+        let IdempotencyDisposition::Acquired(claim) = inbox
+            .claim(
+                fence_fixture::binding(b.identity().tenant_id()),
+                b.identity(),
+                deadline(),
+            )
+            .await?
         else {
             anyhow::bail!("expected claim")
         };
@@ -188,7 +210,13 @@ pub async fn run(
             .execute(&claim, &m, b.receipt_intent(), deadline())
             .await;
         use rss_transactional_messaging::observability::TransactionalMessagingTransactionStatus as Status;
-        let receipt = inbox.read_terminal(b.identity(), deadline()).await?;
+        let receipt = inbox
+            .read_terminal(
+                fence_fixture::binding(b.identity().tenant_id()),
+                b.identity(),
+                deadline(),
+            )
+            .await?;
         assert_eq!(outcome.status(), Status::Committed);
         let receipt = receipt.ok_or_else(|| anyhow::anyhow!("missing rejection"))?;
         assert_eq!(
@@ -198,7 +226,13 @@ pub async fn run(
             )
         );
         assert!(!matches!(
-            inbox.claim(b.identity(), deadline()).await?,
+            inbox
+                .claim(
+                    fence_fixture::binding(b.identity().tenant_id()),
+                    b.identity(),
+                    deadline()
+                )
+                .await?,
             IdempotencyDisposition::Acquired(_)
         ));
         assert_eq!(
@@ -214,8 +248,13 @@ pub async fn run(
     )?;
     let m = message("lease-expired");
     let b = binding(&m);
-    let IdempotencyDisposition::Acquired(claim) =
-        short_inbox.claim(b.identity(), deadline()).await?
+    let IdempotencyDisposition::Acquired(claim) = short_inbox
+        .claim(
+            fence_fixture::binding(b.identity().tenant_id()),
+            b.identity(),
+            deadline(),
+        )
+        .await?
     else {
         anyhow::bail!("expected short claim")
     };
@@ -240,7 +279,7 @@ pub async fn run(
 async fn startup(runtime: &PgRuntime) -> anyhow::Result<()> {
     runtime
         .local_tx(
-            rss_request_context::TenantId::parse(super::TENANT)?,
+            fence_fixture::binding(rss_request_context::TenantId::parse(super::TENANT)?),
             deadline(),
             |tx| {
                 Box::pin(async move {

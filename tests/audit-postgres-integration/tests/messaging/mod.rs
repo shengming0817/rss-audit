@@ -9,6 +9,13 @@ use rss_transactional_messaging::{
 use rss_transactional_messaging_postgres::*;
 mod local;
 
+fn execution() -> anyhow::Result<ExecutionBinding> {
+    Ok(ExecutionBinding::new(
+        StorageIdentity::new([1; 16], [2; 16])?,
+        tenant()?,
+        Epoch::new(1)?,
+    ))
+}
 fn deadline() -> anyhow::Result<OperationDeadline> {
     Ok(OperationDeadline::from_cutoff(
         Deadline::from_timeout(&TestClock, Duration::from_secs(10))?,
@@ -118,7 +125,7 @@ pub(super) async fn run(
         let writer = integrity.clone();
         let request = prepared.clone();
         runtime
-            .local_tx(tenant()?, deadline()?, move |tx| {
+            .local_tx(execution()?, deadline()?, move |tx| {
                 Box::pin(async move {
                     rss_audit_postgres::validate_in(tx, &writer).await?;
                     rss_audit_postgres::lock_head_in(tx, &writer).await?;
@@ -137,7 +144,7 @@ pub(super) async fn run(
             .fold(Ok, Err, Err, Err, Err, Err)?;
         let writer = integrity.clone();
         runtime
-            .local_tx(tenant()?, deadline()?, move |tx| {
+            .local_tx(execution()?, deadline()?, move |tx| {
                 Box::pin(async move {
                     assert!(
                         !rss_audit_postgres::append_in(tx, &writer, &prepared)
@@ -154,7 +161,7 @@ pub(super) async fn run(
             .prepare(event(wrong, "scope", "foreign", vec![])?, control)
             .await?;
         runtime
-            .local_tx(tenant()?, deadline()?, move |tx| {
+            .local_tx(execution()?, deadline()?, move |tx| {
                 Box::pin(async move {
                     assert!(matches!(
                         rss_audit_postgres::append_in(tx, &integrity, &foreign).await,
@@ -224,8 +231,9 @@ async fn scenario(
         &envelope,
     )
     .map_err(|_| anyhow::anyhow!("fixture ingress rejected"))?;
-    let IdempotencyDisposition::Acquired(claim) =
-        inbox.claim(binding.identity(), deadline()?).await?
+    let IdempotencyDisposition::Acquired(claim) = inbox
+        .claim(execution()?, binding.identity(), deadline()?)
+        .await?
     else {
         anyhow::bail!("expected new claim")
     };
@@ -245,7 +253,7 @@ async fn scenario(
     assert_eq!(outcome.status(), expected_status(reject, unknown));
     assert_eq!(
         inbox
-            .read_terminal(binding.identity(), deadline()?)
+            .read_terminal(execution()?, binding.identity(), deadline()?)
             .await?
             .is_some(),
         !reject
@@ -260,7 +268,9 @@ async fn scenario(
     assert_eq!(retry.inserted(), reject);
     if unknown {
         assert!(matches!(
-            inbox.claim(binding.identity(), deadline()?).await?,
+            inbox
+                .claim(execution()?, binding.identity(), deadline()?)
+                .await?,
             IdempotencyDisposition::Terminal(_)
         ));
     }
@@ -295,7 +305,7 @@ async fn fenced(
     let staged = request.clone();
     let integrity = Integrity::Ledger(auth()?);
     let outcome = runtime
-        .local_tx(tenant()?, deadline()?, move |tx| {
+        .local_tx(execution()?, deadline()?, move |tx| {
             Box::pin(async move {
                 rss_audit_postgres::append_in(tx, &integrity, &staged)
                     .await
@@ -351,10 +361,7 @@ async fn connect(fixture: &testkit::PgTlsFixture, role: &str) -> anyhow::Result<
                 PgPrivateCa::from_pem(fixture.ca_pem().as_bytes().to_vec())?,
             ),
             TestClock,
-            ExecutionBinding::new(
-                StorageIdentity::new([1; 16], [2; 16])?,
-                vec![(tenant()?, Epoch::new(1)?)],
-            )?,
+            StorageIdentity::new([1; 16], [2; 16])?,
         )
         .await?,
     ))
@@ -390,7 +397,7 @@ async fn startup(
             Integrity::Plain
         };
         runtime
-            .local_tx(tenant()?, deadline()?, move |tx| {
+            .local_tx(execution()?, deadline()?, move |tx| {
                 Box::pin(async move {
                     let result = rss_audit_postgres::validate_in(tx, &integrity).await;
                     if is_ledger {
@@ -418,7 +425,7 @@ async fn startup(
             Integrity::Plain
         };
         runtime
-            .local_tx(tenant()?, deadline()?, move |tx| {
+            .local_tx(execution()?, deadline()?, move |tx| {
                 Box::pin(async move {
                     rss_audit_postgres::validate_in(tx, &integrity)
                         .await

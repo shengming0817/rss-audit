@@ -26,21 +26,13 @@ const TENANTS: &[&str] = &[
     "f47ac10b-58cc-4372-a567-0e02b2c3d479",
     "f47ac10b-58cc-4372-a567-0e02b2c3d480",
 ];
-#[allow(clippy::expect_used)] // reason: fixed test authority, independent of restored database state.
-pub fn binding() -> ExecutionBinding {
-    ExecutionBinding::new(
-        StorageIdentity::new([1; 16], [2; 16]).expect("storage"),
-        TENANTS
-            .iter()
-            .map(|id| {
-                (
-                    rss_request_context::TenantId::parse(id).expect("tenant"),
-                    Epoch::new(1).expect("epoch"),
-                )
-            })
-            .collect(),
-    )
-    .expect("binding")
+#[allow(clippy::expect_used)] // reason: fixed fixture storage, independent of database state.
+pub fn storage() -> StorageIdentity {
+    StorageIdentity::new([1; 16], [2; 16]).expect("storage")
+}
+#[allow(clippy::expect_used)] // reason: fixture authority for the explicitly selected tenant.
+pub fn binding(tenant: rss_request_context::TenantId) -> ExecutionBinding {
+    ExecutionBinding::new(storage(), tenant, Epoch::new(1).expect("epoch"))
 }
 #[allow(dead_code)] // reason: compile-only consumers do not install a schema.
 pub async fn provision(owner: &sqlx::PgPool) -> anyhow::Result<()> {

@@ -70,16 +70,13 @@ pub(super) async fn run(
                 PgPrivateCa::from_pem(fixture.ca_pem().as_bytes().to_vec())?,
             ),
             TestClock,
-            ExecutionBinding::new(
-                StorageIdentity::new([1; 16], [2; 16])?,
-                vec![(tenant()?, Epoch::new(1)?)],
-            )?,
+            StorageIdentity::new([1; 16], [2; 16])?,
         )
         .await?,
     );
     let integrity = Integrity::Ledger(auth()?);
     runtime
-        .local_tx(tenant()?, deadline()?, move |tx| {
+        .local_tx(execution()?, deadline()?, move |tx| {
             Box::pin(async move {
                 rss_audit_postgres::validate_in(tx, &integrity)
                     .await
@@ -135,7 +132,7 @@ async fn scenario(
     let writer = PgOutboxWriter::new(producer.clone(), domain.clone());
     producer
         .local_tx_with_context(
-            tenant()?,
+            execution()?,
             deadline()?,
             (writer, Some(pending)),
             |(writer, pending), tx| {
@@ -185,6 +182,7 @@ async fn scenario(
     }
     let mut batch = projection
         .project_batch(
+            execution()?,
             &Validator,
             std::num::NonZeroUsize::MIN,
             deadline()?,
@@ -247,6 +245,7 @@ async fn scenario(
         assert!(
             projection
                 .project_batch(
+                    execution()?,
                     &Validator,
                     std::num::NonZeroUsize::MIN,
                     deadline()?,
