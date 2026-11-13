@@ -16,6 +16,8 @@ struct Session {
     tenant: TenantId,
     rejection: Option<QueryPolicyError>,
     audit: Option<PreparedAuditV1>,
+    rows: u32,
+    bytes: u64,
 }
 struct Policy;
 impl AuditQueryPolicy<Session> for Policy {
@@ -33,6 +35,7 @@ impl AuditQueryPolicy<Session> for Policy {
             s.audit
                 .clone()
                 .map_or(SelfAudit::NotRequired, SelfAudit::Required),
+            ReadLimit::new(s.rows, s.bytes).map_err(|_| QueryPolicyError::Unavailable)?,
         )
         .map_err(|_| QueryPolicyError::Unavailable)
     }
@@ -42,6 +45,8 @@ fn session(tenant: TenantId) -> Session {
         tenant,
         rejection: None,
         audit: None,
+        rows: 1024,
+        bytes: 2 * 1024 * 1024,
     }
 }
 fn request(
@@ -125,6 +130,7 @@ pub(super) async fn run(
     corruption(&app, admin, tenant, &cancel).await?;
     interruptions(pg, admin, other, false).await?;
     interruptions(pg, admin, other, true).await?;
+    capacity(pg, ledger, pool, admin, control).await?;
     unavailable(pool, other, &cancel, control).await?;
     Ok(())
 }
@@ -235,7 +241,14 @@ async fn unknown_commit(
     let wrong = pg
         .prepare(event(super::tenant()?, "query", "wrong", vec![])?, control)
         .await?;
-    assert!(QueryGrant::new(tenant, SelfAudit::Required(wrong)).is_err());
+    assert!(
+        QueryGrant::new(
+            tenant,
+            SelfAudit::Required(wrong),
+            ReadLimit::new(1024, 2 * 1024 * 1024)?
+        )
+        .is_err()
+    );
     Ok(())
 }
 async fn interruptions(
@@ -618,4 +631,136 @@ fn assert_entry(body: &Value, tenant: TenantId, position: usize, id: &str) {
     } else {
         assert!(entry["ledger"].is_null());
     }
+}
+
+async fn capacity(
+    pg: &PgAudit,
+    ledger: &PgAudit,
+    pool: &PgPool,
+    admin: &PgPool,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let tenant = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d502")?;
+    let token = "a".repeat(255);
+    let base = event(tenant, &token, &token, vec![])?;
+    let maximal = AuditEventV1::new(
+        base.identity().clone(),
+        EventFacts::new(
+            ActorRef::new(ActorKind::parse("user")?, ActorId::parse("actor")?),
+            Action::parse(&token)?,
+            ResourceRef::new(
+                ResourceKind::parse("device")?,
+                ResourceId::parse("resource")?,
+            ),
+            Outcome::Succeeded,
+            Timepoint::try_from(123_i64)?,
+        ),
+        EventContext::new(
+            Coordinates::new(None, None, None),
+            AuditPayload::new(vec![])?,
+        ),
+    );
+    let first = prepare(maximal, Timepoint::try_from(456_i64)?)?;
+    committed(ledger.append(&first, control).await)?;
+    let rows = (1..1024)
+        .map(|n| -> anyhow::Result<PreparedAuditV1> {
+            Ok(prepare(
+                event(tenant, "capacity", &format!("event-{n:04}"), vec![])?,
+                Timepoint::try_from(456_i64)?,
+            )?)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let total_bytes = first.canonical_bytes().len() as u64
+        + rows
+            .iter()
+            .map(|p| p.canonical_bytes().len() as u64)
+            .sum::<u64>();
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "SELECT set_config('rss.tenant_id',$1,true),set_config('statement_timeout','5000',true)",
+    )
+    .bind(tenant.to_string())
+    .execute(&mut *tx)
+    .await?;
+    pg.append_batch_in_transaction(&mut tx, &rows, control)
+        .await?;
+    tx.commit().await?;
+    let app = router::<Session, _, _>(pg.clone(), Policy, TestClock);
+    let cancel = CancellationToken::new();
+    for (path, expected) in [
+        ("/api/v2/audit/entries", 1000),
+        ("/api/v2/audit/entries?limit=1024", 1024),
+    ] {
+        let (status, body, outcome) = inspect(
+            app.clone()
+                .oneshot(request(
+                    path,
+                    Some(Session {
+                        bytes: total_bytes,
+                        ..session(tenant)
+                    }),
+                    Some(budget(&cancel)?),
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!((status, outcome), (200, Some("committed")));
+        assert_eq!(body["entries"].as_array().map(Vec::len), Some(expected));
+        assert_eq!(body["entries"][0]["sourceId"], token);
+        assert_eq!(body["entries"][0]["eventId"], token);
+        assert_eq!(body["entries"][0]["action"], token);
+        assert_eq!(
+            body["entries"][0]["ledger"]["recordId"],
+            format!("v1:{token}:{token}")
+        );
+        assert_eq!(body["nextCursor"].is_null(), expected == 1024);
+    }
+    for path in ["/api/v2/audit/entries", "/api/v2/audit/entries?limit=1024"] {
+        let (status, body, outcome) = inspect(
+            app.clone()
+                .oneshot(request(
+                    path,
+                    Some(Session {
+                        rows: 100,
+                        ..session(tenant)
+                    }),
+                    Some(budget(&cancel)?),
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!((status, outcome), (400, None));
+        assert!(body.get("entries").is_none());
+    }
+    let query_audit = prepare(
+        event(tenant, "query", "capacity-query", vec![])?,
+        Timepoint::try_from(456_i64)?,
+    )?;
+    for audit in [None, Some(query_audit)] {
+        let (status, body, outcome) = inspect(
+            app.clone()
+                .oneshot(request(
+                    "/api/v2/audit/entries?limit=1024",
+                    Some(Session {
+                        audit,
+                        bytes: total_bytes - 1,
+                        ..session(tenant)
+                    }),
+                    Some(budget(&cancel)?),
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!((status, outcome), (400, Some("rolled-back")));
+        assert_eq!(body["error"]["code"], "invalid-input");
+        assert!(body.get("entries").is_none());
+    }
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rss_audit.records WHERE tenant_id=$1::uuid AND source_id='query'",
+    )
+    .bind(tenant.to_string())
+    .fetch_one(admin)
+    .await?;
+    assert_eq!(audited, 0);
+    Ok(())
 }

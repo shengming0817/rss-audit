@@ -5,7 +5,7 @@ Embeddable tenant-only audit queries. The host supplies an admitted `PgAudit`, a
 and `AuditRequestBudget` extensions. No Identity dependency, credential parsing, listener, TLS,
 readiness, migrations, pool ownership or implicit authorization.
 
-`GET /api/v2/audit/entries?limit=50&cursor=...` accepts only `limit` (1..=100, default 50) and
+`GET /api/v2/audit/entries?limit=1000&cursor=...` accepts only `limit` (1..=1024, default 1000) and
 `cursor`; query text is bounded to 1024 bytes. A cursor is unpadded canonical base64url of version
 byte 2, 16 tenant bytes, big-endian u64 after and inclusive through. It is navigation, not authority.
 The first page captures a fixed upper bound. The final/empty page has `nextCursor: null`.
@@ -23,8 +23,15 @@ responsible for non-secret source/event/action identifiers. Responses carry `Cac
 
 Policy checks session freshness and whole-tenant query permission on every request. It is a
 bounded synchronous decision, not blocking I/O. Authentication and preparation happen in the host,
-using the same incoming deadline. The grant explicitly selects `SelfAudit::NotRequired` or
-`SelfAudit::Required(prepared)`. For Required, the host durably preserves the exact prepared bytes
+using the same incoming deadline. `QueryGrant::new(tenant, audit, read_limit)` requires an explicit PostgreSQL `ReadLimit` from
+trusted host policy: a finite row ceiling and a positive canonical-byte budget. The adapter
+never derives byte authority by multiplying the requested rows by the per-record maximum.
+Requests above the granted row ceiling return 400, including the default 1000 when `limit`
+is omitted. Hosts granting fewer rows require clients to request that smaller limit explicitly.
+The database selects the requested complete page; exceeding its byte budget returns 400,
+never a successful shorter page. These bounds charge canonical records, not exact process memory.
+
+The grant explicitly selects `SelfAudit::NotRequired` or `SelfAudit::Required(prepared)`. For Required, the host durably preserves the exact prepared bytes
 and stable event ID before dispatch. This type does not prove durable preservation. In one tenant
 transaction the adapter selects the page, then appends the query attempt. Only a confirmed COMMIT
 permits returning the page. An audit record must not claim the HTTP client received the response.
@@ -37,7 +44,7 @@ A dropped handler has no response or extension; the provider retires its unresol
 and the host must recover uncertainty from its durable original intent without changing bytes.
 Denied/failed-request auditing, retry orchestration and client-delivery evidence are host-owned.
 
-Safe errors use RSS `{error:{code,message}}`: input/cursor 400, missing/expired authentication 401,
+Safe errors use RSS `{error:{code,message}}`: input/cursor/read budget 400, missing/expired authentication 401,
 policy denial 403, internal/storage contract violations 500, unavailable/timeout/cancel/uncertain
 settlement 503. Hosts add the appropriate 401 challenge. Missing budget is a host error (500).
 No old route, DTO, hash algorithm, admin pool, cross-tenant API or verified-query API is provided.

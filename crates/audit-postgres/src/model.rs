@@ -47,15 +47,25 @@ pub struct ReadLimit {
     pub(crate) bytes: i64,
 }
 impl ReadLimit {
+    /// Maximum complete-page row capacity shared by protocol adapters.
+    pub const MAX_ROWS: u32 = 1024;
     /// Select 1..=1024 rows and a positive PostgreSQL-representable byte budget.
     pub fn new(rows: u32, bytes: u64) -> Result<Self, Error> {
-        if !(1..=1024).contains(&rows) || bytes == 0 {
+        if !(1..=Self::MAX_ROWS).contains(&rows) || bytes == 0 {
             return Err(Error::InvalidBound);
         }
         Ok(Self {
             rows: i64::from(rows),
             bytes: i64::try_from(bytes).map_err(|_| Error::InvalidBound)?,
         })
+    }
+    /// Maximum rows authorized for this read.
+    pub const fn rows(&self) -> u32 {
+        self.rows as u32
+    }
+    /// Maximum total canonical bytes authorized for the complete selected page.
+    pub const fn bytes(&self) -> u64 {
+        self.bytes as u64
     }
 }
 
