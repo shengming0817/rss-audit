@@ -1,5 +1,8 @@
 SHELL := /bin/bash
 REPOSITORY_ROOT := $(shell /usr/bin/dirname "$$(/usr/bin/git rev-parse --path-format=absolute --git-common-dir)")
+# Preserve the caller's Python before PATH selects system Git for Cargo.
+PYTHON ?= $(shell command -v python3)
+PYTHON := $(PYTHON)
 export PATH := /usr/bin:$(PATH)
 CARGO_TARGET_DIR ?= $(REPOSITORY_ROOT)/target
 export CARGO_TARGET_DIR
@@ -30,8 +33,8 @@ coverage: launcher
 
 licenses:
 	@set -o pipefail; \
-	manifest="$$(cargo metadata --locked --all-features --format-version 1 | python3 -c 'import json,sys; manifest, = (p["manifest_path"] for p in json.load(sys.stdin)["packages"] if p["name"] == "testkit"); print(manifest)')" || exit $$?; \
+	manifest="$$(cargo metadata --locked --all-features --format-version 1 | "$(PYTHON)" -c 'import json,sys; manifest, = (p["manifest_path"] for p in json.load(sys.stdin)["packages"] if p["name"] == "testkit"); print(manifest)')" || exit $$?; \
 	status=0; \
-	python3 "$$(/usr/bin/dirname "$$manifest")/check-advisory.py" --audit || status=$$?; \
+	"$(PYTHON)" "$$(/usr/bin/dirname "$$manifest")/check-advisory.py" --audit || status=$$?; \
 	cargo deny --locked check advisories licenses sources || status=$$?; \
 	exit $$status
