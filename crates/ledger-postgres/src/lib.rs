@@ -20,9 +20,4 @@ pub use repository::{ReadLimit, StagedAppend, Window};
 pub use transaction::PgFault;
 pub use transaction::{Committed, LedgerTransaction, PgLedger};
 /// Fresh V1 schema. Execute externally under a dedicated non-superuser, non-BYPASSRLS owner.
-pub const MIGRATION_SQL: &str = concat!(
-    include_str!("../migrations/0001_create_ledger.sql"),
-    include_str!("../migrations/0002_return_locked_head.sql")
-);
-/// Upgrade existing Ledger functions without changing entries, keys or authentication bytes.
-pub const LOCKED_HEAD_UPGRADE_SQL: &str = include_str!("../migrations/0002_return_locked_head.sql");
+pub const MIGRATION_SQL: &str = include_str!("../migrations/install.sql");

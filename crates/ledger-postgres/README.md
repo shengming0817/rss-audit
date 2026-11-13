@@ -127,7 +127,7 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA rss_ledger TO application_runtime;
 变更后重新验证再恢复服务；失败不接流。不承诺在下一次内部操作主动发现带外 GRANT/DDL。
 SQL 权限、RLS、租户与数据完整性检查仍生效；产品业务撤权不由这项部署检查替代。
 
-V1 是新的持久格式，无历史 audit migration 导入或双读兼容；必要后续升级由本 adapter 提供版本化 SQL，产品执行。
+仅支持全新安装，无历史导入、升级或双读兼容；宿主持有安装执行。RecordId 最多 514 字节，ChainId/KeyId 仍为 255 字节。
 具有管理员或持钥权限的主体仍处于信任边界内；该模型不能宣称防管理员重写或 WORM。
 
 ## 窗口与资源
@@ -163,9 +163,8 @@ T1：协议向量、篡改、边界、窗口和 SQL 转换；T2：`ledger-postgr
 验证最大 payload、精确预算边界、前驱计费、拒绝响应无 payload、并发读取快照、幂等、RLS、权限/结构篡改、连接终止、结算未知、取消及 inbox 原子性。
 既有 provider 场景迁入本仓，复用现有 testkit launcher；不维护独立 package/artifact 证明入口。
 
-`MIGRATION_SQL` 在事务中安装当前结构。已安装 0001 的宿主停写后执行一次
-`LOCKED_HEAD_UPGRADE_SQL`，再重新进行角色/schema admission。升级只替换函数并保留执行授权，
-不更改链身份、历史记录、HMAC 或 schema 名称。生产迁移由宿主持有。
+`MIGRATION_SQL` 在事务中直接安装当前结构和返回锁定 head 的追加函数。
+已存在 schema 时拒绝安装，不自动修补或清理数据；没有历史函数替换和授权迁移入口。
 
 ref: launchbadge/sqlx sqlx-core/src/transaction.rs@v0.9.0
 

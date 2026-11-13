@@ -1,4 +1,4 @@
-use crate::{AdmissionViolation, Control, Error, LOCKED_HEAD_UPGRADE_SQL, Timer, error::sql_error};
+use crate::{AdmissionViolation, Control, Error, MIGRATION_SQL, Timer, error::sql_error};
 use sqlx::{PgConnection, PgPool, Row};
 pub(crate) async fn validate(pool: &PgPool) -> Result<(), Error> {
     let mut connection = pool.acquire().await.map_err(sql_error)?;
@@ -52,7 +52,7 @@ async fn inspect_profile(connection: &mut PgConnection, append: bool) -> Result<
         return Err(Error::Admission(kind));
     }
     // Function source identity is derived from the shipped migration, never a second copy.
-    let expected: Vec<&str> = LOCKED_HEAD_UPGRADE_SQL
+    let expected: Vec<&str> = MIGRATION_SQL
         .split(" AS $$")
         .skip(1)
         .filter_map(|s| s.split("$$;").next())

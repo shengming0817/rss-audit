@@ -98,13 +98,12 @@ of tail truncation or an external checkpoint.
 
 ## Installation and roles
 
-`MIGRATION_SQL` installs the current schema (0001 plus 0002) in a single transaction.
-For an existing 0001 installation, stop writers and execute `NAVIGATION_UPGRADE_SQL` once in a
-transaction as its existing NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE migration owner.
-It preserves canonical bytes, identities, existing positions and Ledger coordinates, starts the
-sequence above the historical maximum, transfers writer grants, and removes Audit heads/reserve.
-It does not change a product installation's integrity mode or rewrite Ledger authentication.
-Upgrade optional Ledger functions separately using its `LOCKED_HEAD_UPGRADE_SQL` before admission.
+`MIGRATION_SQL` installs the current fresh schema in a single transaction, as its separately
+provisioned NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE owner. Audit directly creates the
+navigation sequence, records table and batch append function. Source/event IDs accept 255 bytes;
+complete canonical records remain bounded to 128 KiB. Optional Ledger is installed separately.
+Only fresh installation is supported: existing schemas are rejected, with no upgrade, repair,
+import or compatibility path. The host owns installation and runtime grants.
 Runtime must not own objects or reach the owner, have CREATE/delegation rights or PUBLIC access.
 Grant only:
 
