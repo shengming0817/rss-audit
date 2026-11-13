@@ -74,7 +74,8 @@ impl IngressValidator<Vec<u8>> for Validator {
         challenge: IngressChallenge<'_, Vec<u8>>,
     ) -> Result<VerifiedIngress, EnvelopeValidationFailure> {
         // Explicit fixture authority; production source authentication remains host-owned.
-        Ok(challenge.verified())
+        Ok(challenge
+            .verified(execution().map_err(|_| EnvelopeValidationFailure::MalformedIdentity)?))
     }
 }
 fn message(id: &str, payload: Vec<u8>) -> anyhow::Result<MessageEnvelope<Vec<u8>>> {
