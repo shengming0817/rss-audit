@@ -226,14 +226,17 @@ fn length_prefixes_prevent_adjacent_field_ambiguity() -> Result<(), Box<dyn std:
 
 #[test]
 fn token_boundaries_are_byte_exact_and_fail_closed() {
-    assert!(matches!(
-        SourceId::parse(""),
-        Err(Error::Empty(Field::SourceId))
-    ));
+    assert_eq!(
+        SourceId::parse("").err(),
+        Some(Error::Empty(Field::SourceId))
+    );
     macro_rules! check_token {
         ($token:ty, $field:expr) => {
-            assert!(<$token>::parse(&"a".repeat(255)).is_ok());
-            assert!(matches!(<$token>::parse(&"a".repeat(256)), Err(Error::TooLong(field)) if field == $field));
+            assert_eq!(<$token>::parse(&"a".repeat(255)).err(), None);
+            assert_eq!(
+                <$token>::parse(&"a".repeat(256)).err(),
+                Some(Error::TooLong($field))
+            );
         };
     }
     check_token!(SourceId, Field::SourceId);
@@ -242,10 +245,10 @@ fn token_boundaries_are_byte_exact_and_fail_closed() {
     check_token!(EventId, Field::EventId);
     check_token!(Action, Field::Action);
     check_token!(OperationId, Field::OperationId);
-    assert!(matches!(
-        SourceId::parse("RSS"),
-        Err(Error::InvalidCharacter(Field::SourceId))
-    ));
+    assert_eq!(
+        SourceId::parse("RSS").err(),
+        Some(Error::InvalidCharacter(Field::SourceId))
+    );
 }
 
 #[test]
@@ -326,10 +329,10 @@ fn complete_record_budget_charges_payload_headers_and_identities()
             .canonical_bytes(),
         prepared.canonical_bytes()
     );
-    assert!(matches!(
-        prepare(maximal_event(vec![7; payload_size + 1])?, recorded),
-        Err(Error::RecordTooLarge)
-    ));
+    assert_eq!(
+        prepare(maximal_event(vec![7; payload_size + 1])?, recorded).err(),
+        Some(Error::RecordTooLarge)
+    );
     assert!(matches!(
         AuditPayload::new(vec![0; MAX_RECORD_BYTES + 1]),
         Err(Error::RecordTooLarge)

@@ -640,6 +640,48 @@ async fn capacity(
     admin: &PgPool,
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
+    let (tenant, total_bytes) = seed_capacity(pg, ledger, pool, control).await?;
+    let token = "a".repeat(255);
+    let app = router::<Session, _, _>(pg.clone(), Policy, TestClock);
+    let cancel = CancellationToken::new();
+    for (path, expected) in [
+        ("/api/v2/audit/entries", 1000),
+        ("/api/v2/audit/entries?limit=1024", 1024),
+    ] {
+        let (status, body, outcome) = inspect(
+            app.clone()
+                .oneshot(request(
+                    path,
+                    Some(Session {
+                        bytes: total_bytes,
+                        ..session(tenant)
+                    }),
+                    Some(budget(&cancel)?),
+                )?)
+                .await?,
+        )
+        .await?;
+        assert_eq!((status, outcome), (200, Some("committed")));
+        assert_eq!(body["entries"].as_array().map(Vec::len), Some(expected));
+        assert_eq!(body["entries"][0]["sourceId"], token);
+        assert_eq!(body["entries"][0]["eventId"], token);
+        assert_eq!(body["entries"][0]["action"], token);
+        assert_eq!(
+            body["entries"][0]["ledger"]["recordId"],
+            format!("v1:{token}:{token}")
+        );
+        assert_eq!(body["nextCursor"].is_null(), expected == 1024);
+    }
+    capacity_failures(&app, admin, tenant, total_bytes, &cancel).await?;
+    Ok(())
+}
+
+async fn seed_capacity(
+    pg: &PgAudit,
+    ledger: &PgAudit,
+    pool: &PgPool,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<(TenantId, u64)> {
     let tenant = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d502")?;
     let token = "a".repeat(255);
     let base = event(tenant, &token, &token, vec![])?;
@@ -685,36 +727,16 @@ async fn capacity(
     pg.append_batch_in_transaction(&mut tx, &rows, control)
         .await?;
     tx.commit().await?;
-    let app = router::<Session, _, _>(pg.clone(), Policy, TestClock);
-    let cancel = CancellationToken::new();
-    for (path, expected) in [
-        ("/api/v2/audit/entries", 1000),
-        ("/api/v2/audit/entries?limit=1024", 1024),
-    ] {
-        let (status, body, outcome) = inspect(
-            app.clone()
-                .oneshot(request(
-                    path,
-                    Some(Session {
-                        bytes: total_bytes,
-                        ..session(tenant)
-                    }),
-                    Some(budget(&cancel)?),
-                )?)
-                .await?,
-        )
-        .await?;
-        assert_eq!((status, outcome), (200, Some("committed")));
-        assert_eq!(body["entries"].as_array().map(Vec::len), Some(expected));
-        assert_eq!(body["entries"][0]["sourceId"], token);
-        assert_eq!(body["entries"][0]["eventId"], token);
-        assert_eq!(body["entries"][0]["action"], token);
-        assert_eq!(
-            body["entries"][0]["ledger"]["recordId"],
-            format!("v1:{token}:{token}")
-        );
-        assert_eq!(body["nextCursor"].is_null(), expected == 1024);
-    }
+    Ok((tenant, total_bytes))
+}
+
+async fn capacity_failures(
+    app: &Router,
+    admin: &PgPool,
+    tenant: TenantId,
+    total_bytes: u64,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
     for path in ["/api/v2/audit/entries", "/api/v2/audit/entries?limit=1024"] {
         let (status, body, outcome) = inspect(
             app.clone()
@@ -724,7 +746,7 @@ async fn capacity(
                         rows: 100,
                         ..session(tenant)
                     }),
-                    Some(budget(&cancel)?),
+                    Some(budget(cancel)?),
                 )?)
                 .await?,
         )
@@ -746,7 +768,7 @@ async fn capacity(
                         bytes: total_bytes - 1,
                         ..session(tenant)
                     }),
-                    Some(budget(&cancel)?),
+                    Some(budget(cancel)?),
                 )?)
                 .await?,
         )
