@@ -10,7 +10,7 @@ mod ledger;
 mod model;
 mod prepared;
 
-pub use codec::{MAX_PAYLOAD_BYTES, MAX_RECORD_BYTES, decode_untrusted};
+pub use codec::{MAX_RECORD_BYTES, decode_untrusted};
 pub use error::{Error, Field};
 pub use identity::{
     Action, ActorId, ActorKind, ActorRef, AuditPayload, EventId, OperationId, ResourceId,

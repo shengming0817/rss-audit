@@ -7,14 +7,16 @@ pub const MAX_PAYLOAD_BYTES: usize = 1_048_576;
 /// Identity UTF-8 bytes and payload bytes are charged separately.
 pub const V1_ENTRY_FIXED_BYTES: usize = b"rss.ledger.entry\0".len() + 2 + 16 + 12 + 8 + 32 + 8 + 32;
 macro_rules! identity {
-    ($name:ident, $doc:literal) => {
+    ($name:ident, $max:expr, $doc:literal) => {
         #[doc = $doc]
         #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
         pub struct $name(Box<str>);
         impl $name {
-            /// Parse a nonempty UTF-8 identity of at most 255 bytes, without NUL.
+            /// Maximum identity length in UTF-8 bytes.
+            pub const MAX_BYTES: usize = $max;
+            /// Parse a nonempty UTF-8 identity within its byte bound, without NUL.
             pub fn parse(value: &str) -> Result<Self, Error> {
-                if value.is_empty() || value.len() > 255 || value.contains('\0') {
+                if value.is_empty() || value.len() > Self::MAX_BYTES || value.contains('\0') {
                     return Err(Error::InvalidInput);
                 }
                 Ok(Self(value.into()))
@@ -31,10 +33,11 @@ macro_rules! identity {
         }
     };
 }
-identity!(ChainId, "Chain identity scoped to one tenant.");
-identity!(RecordId, "Stable record identity scoped to one chain.");
+identity!(ChainId, 255, "Chain identity scoped to one tenant.");
+identity!(RecordId, 514, "Stable record identity scoped to one chain.");
 identity!(
     KeyId,
+    255,
     "Exact injected key identity; not a rotation implementation."
 );
 

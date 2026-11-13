@@ -42,7 +42,12 @@ fn links_and_idempotent_content() -> anyhow::Result<()> {
 fn malformed_boundaries_fail() -> anyhow::Result<()> {
     assert!(ChainId::parse("").is_err());
     assert!(RecordId::parse("a\0b").is_err());
-    assert!(KeyId::parse(&"x".repeat(256)).is_err());
+    for length in [255, 256] {
+        assert_eq!(KeyId::parse(&"x".repeat(length)).is_ok(), length == 255);
+        assert_eq!(ChainId::parse(&"x".repeat(length)).is_ok(), length == 255);
+    }
+    assert!(RecordId::parse(&"é".repeat(257)).is_ok());
+    assert!(RecordId::parse(&format!("{}a", "é".repeat(257))).is_err());
     assert!(Authenticator::new(KeyId::parse("key")?, vec![1; 31]).is_err());
     assert_eq!(
         Sequence::new(u64::MAX).next(),
@@ -224,10 +229,14 @@ fn encoded_read_charge_matches_canonical_bytes() -> anyhow::Result<()> {
     let ledger = LedgerId::new(scope()?.tenant(), ChainId::parse("链")?);
     for size in [0, 1, MAX_PAYLOAD_BYTES] {
         let entry = a.append(
-            &AppendRequest::new(ledger.clone(), RecordId::parse("记录")?, vec![9; size])?,
+            &AppendRequest::new(
+                ledger.clone(),
+                RecordId::parse(&"é".repeat(257))?,
+                vec![9; size],
+            )?,
             None,
         )?;
-        assert_eq!(entry.encoded_len(), 127 + 3 + 6 + 6 + size);
+        assert_eq!(entry.encoded_len(), 127 + 3 + 514 + 6 + size);
         assert_eq!(
             entry.encoded_len(),
             Authenticator::canonical_bytes(&entry)?.len() + 32

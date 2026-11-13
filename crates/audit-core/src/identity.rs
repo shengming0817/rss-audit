@@ -1,9 +1,8 @@
-use crate::{Error, Field, MAX_PAYLOAD_BYTES};
+use crate::{Error, Field, MAX_RECORD_BYTES};
 use rss_contract::{ContractId, ContractVersion, SchemaDigest};
 use rss_redact::RedactedBytes;
 
-const KIND_MAX_BYTES: usize = 64;
-const TOKEN_MAX_BYTES: usize = 128;
+const TOKEN_MAX_BYTES: usize = 255;
 const REFERENCE_MAX_BYTES: usize = 512;
 
 fn validate_token(
@@ -113,7 +112,7 @@ macro_rules! reference_type {
 token_type!(
     SourceId,
     Field::SourceId,
-    KIND_MAX_BYTES,
+    TOKEN_MAX_BYTES,
     true,
     "Stable producer identity. It is not proof that the producer is authentic."
 );
@@ -127,7 +126,7 @@ token_type!(
 token_type!(
     ActorKind,
     Field::ActorKind,
-    KIND_MAX_BYTES,
+    TOKEN_MAX_BYTES,
     true,
     "Source-owned actor reference kind."
 );
@@ -141,7 +140,7 @@ token_type!(
 token_type!(
     ResourceKind,
     Field::ResourceKind,
-    KIND_MAX_BYTES,
+    TOKEN_MAX_BYTES,
     true,
     "Source-owned resource reference kind."
 );
@@ -318,10 +317,12 @@ impl std::fmt::Debug for ResourceRef {
 pub struct AuditPayload(RedactedBytes);
 
 impl AuditPayload {
-    /// Adopt at most 64 KiB of exact payload bytes.
+    /// Adopt exact payload bytes within the complete-record bound.
+    /// Preparation also charges all headers and identities, so a payload of this size
+    /// alone cannot fit in a canonical record.
     pub fn new(bytes: Vec<u8>) -> Result<Self, Error> {
-        if bytes.len() > MAX_PAYLOAD_BYTES {
-            return Err(Error::PayloadTooLarge);
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(Error::RecordTooLarge);
         }
         Ok(Self(RedactedBytes::new(bytes)))
     }

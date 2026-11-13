@@ -2,9 +2,9 @@
 
 use rss_audit_core::{
     Action, ActorId, ActorKind, ActorRef, AuditEventV1, AuditPayload, Coordinates, Error,
-    EventContext, EventFacts, EventId, Field, MAX_PAYLOAD_BYTES, MAX_RECORD_BYTES, OperationId,
-    Outcome, RecordIdentity, RecordVersion, ResourceId, ResourceKind, ResourceRef, SourceContract,
-    SourceId, SourceIdentity, decode_untrusted, prepare,
+    EventContext, EventFacts, EventId, Field, MAX_RECORD_BYTES, OperationId, Outcome,
+    RecordIdentity, RecordVersion, ResourceId, ResourceKind, ResourceRef, SourceContract, SourceId,
+    SourceIdentity, decode_untrusted, prepare,
 };
 use rss_contract::{ContractId, ContractVersion, SchemaDigest, Timepoint};
 use rss_diag_context::CorrelationId;
@@ -230,18 +230,21 @@ fn token_boundaries_are_byte_exact_and_fail_closed() {
         SourceId::parse(""),
         Err(Error::Empty(Field::SourceId))
     ));
-    assert!(matches!(
-        SourceId::parse(&"a".repeat(65)),
-        Err(Error::TooLong(Field::SourceId))
-    ));
+    macro_rules! check_token {
+        ($token:ty, $field:expr) => {
+            assert!(<$token>::parse(&"a".repeat(255)).is_ok());
+            assert!(matches!(<$token>::parse(&"a".repeat(256)), Err(Error::TooLong(field)) if field == $field));
+        };
+    }
+    check_token!(SourceId, Field::SourceId);
+    check_token!(ActorKind, Field::ActorKind);
+    check_token!(ResourceKind, Field::ResourceKind);
+    check_token!(EventId, Field::EventId);
+    check_token!(Action, Field::Action);
+    check_token!(OperationId, Field::OperationId);
     assert!(matches!(
         SourceId::parse("RSS"),
         Err(Error::InvalidCharacter(Field::SourceId))
-    ));
-    assert!(EventId::parse(&"a".repeat(128)).is_ok());
-    assert!(matches!(
-        EventId::parse(&"a".repeat(129)),
-        Err(Error::TooLong(Field::EventId))
     ));
 }
 
@@ -258,13 +261,100 @@ fn reference_boundaries_are_byte_exact_and_fail_closed() {
     ));
 }
 
+fn maximal_event(payload: Vec<u8>) -> Result<AuditEventV1, Box<dyn std::error::Error>> {
+    let base = event()?;
+    let token = "a".repeat(255);
+    Ok(AuditEventV1::new(
+        RecordIdentity::new(
+            base.identity().tenant(),
+            SourceIdentity::new(
+                SourceId::parse(&token)?,
+                base.identity().source().contract().clone(),
+            ),
+            EventId::parse(&token)?,
+        ),
+        EventFacts::new(
+            ActorRef::new(ActorKind::parse(&token)?, ActorId::parse(&"é".repeat(256))?),
+            Action::parse(&token)?,
+            ResourceRef::new(
+                ResourceKind::parse(&token)?,
+                ResourceId::parse(&"é".repeat(256))?,
+            ),
+            Outcome::Succeeded,
+            base.facts().occurred_at(),
+        ),
+        EventContext::new(
+            Coordinates::new(
+                Some(CorrelationId::parse(&token)?),
+                Some(RequestId::parse(&"r".repeat(128))?),
+                Some(OperationId::parse(&token)?),
+            ),
+            AuditPayload::new(payload)?,
+        ),
+    ))
+}
+
 #[test]
-fn payload_boundaries_are_exact_and_fail_closed() {
-    assert!(AuditPayload::new(vec![0; MAX_PAYLOAD_BYTES]).is_ok());
+fn complete_record_budget_charges_payload_headers_and_identities()
+-> Result<(), Box<dyn std::error::Error>> {
+    let recorded = Timepoint::try_from(1_726_000_001_i64)?;
+    let overhead = prepare(maximal_event(vec![])?, recorded)?
+        .canonical_bytes()
+        .len();
+    let payload_size = MAX_RECORD_BYTES - overhead;
+    assert!(payload_size > 65_536);
+    let prepared = prepare(maximal_event(vec![7; payload_size])?, recorded)?;
+    assert_eq!(prepared.canonical_bytes().len(), MAX_RECORD_BYTES);
+    let decoded = decode_untrusted(prepared.canonical_bytes())?;
+    assert_eq!(
+        decoded.event().context().payload().as_bytes(),
+        vec![7; payload_size]
+    );
+    assert_eq!(
+        decoded
+            .event()
+            .context()
+            .coordinates()
+            .correlation_id()
+            .ok_or("correlation")?
+            .as_str()
+            .len(),
+        255
+    );
+    assert_eq!(
+        rss_audit_core::PreparedAuditV1::from_canonical_bytes(prepared.canonical_bytes())?
+            .canonical_bytes(),
+        prepared.canonical_bytes()
+    );
     assert!(matches!(
-        AuditPayload::new(vec![0; MAX_PAYLOAD_BYTES + 1]),
-        Err(Error::PayloadTooLarge)
+        prepare(maximal_event(vec![7; payload_size + 1])?, recorded),
+        Err(Error::RecordTooLarge)
     ));
+    assert!(matches!(
+        AuditPayload::new(vec![0; MAX_RECORD_BYTES + 1]),
+        Err(Error::RecordTooLarge)
+    ));
+    assert!(CorrelationId::parse(&"a".repeat(256)).is_err());
+    assert!(RequestId::parse(&"a".repeat(129)).is_err());
+    #[cfg(feature = "ledger")]
+    {
+        let request = prepared.append_request()?;
+        assert_eq!(
+            request.record_id().as_str(),
+            format!("v1:{}:{}", "a".repeat(255), "a".repeat(255))
+        );
+        assert_eq!(request.record_id().as_str().len(), 514);
+        let auth = rss_ledger::Authenticator::new(rss_ledger::KeyId::parse("key")?, vec![7; 32])?;
+        let entry = auth.append(&request, None)?;
+        assert!(prepared.matches_entry(&entry));
+        assert_eq!(
+            rss_audit_core::verify_window(&auth, prepared.identity().tenant(), None, &[entry])?
+                .records()
+                .len(),
+            1
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -321,10 +411,10 @@ fn decoder_rejects_version_tags_truncation_and_unknown_fields()
         .ok_or("payload fixture missing")?;
     let mut oversized_payload = canonical.clone();
     oversized_payload[payload_offset - 4..payload_offset]
-        .copy_from_slice(&((MAX_PAYLOAD_BYTES + 1) as u32).to_be_bytes());
+        .copy_from_slice(&((MAX_RECORD_BYTES + 1) as u32).to_be_bytes());
     assert!(matches!(
         decode_untrusted(&oversized_payload),
-        Err(Error::PayloadTooLarge)
+        Err(Error::RecordTooLarge)
     ));
 
     let mut truncated = canonical.clone();
