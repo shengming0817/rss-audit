@@ -29,4 +29,9 @@ coverage: launcher
 	cargo llvm-cov report --locked --fail-under-lines 80
 
 licenses:
-	cargo deny --locked check advisories licenses sources
+	@set -o pipefail; \
+	manifest="$$(cargo metadata --locked --all-features --format-version 1 | python3 -c 'import json,sys; manifest, = (p["manifest_path"] for p in json.load(sys.stdin)["packages"] if p["name"] == "testkit"); print(manifest)')" || exit $$?; \
+	status=0; \
+	python3 "$$(/usr/bin/dirname "$$manifest")/check-advisory.py" --audit || status=$$?; \
+	cargo deny --locked check advisories licenses sources || status=$$?; \
+	exit $$status

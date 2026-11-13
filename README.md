@@ -10,6 +10,8 @@
 - [HTTP 接入与合同](crates/audit-http-axum/README.md)
 - [PostgreSQL 接入与边界](crates/audit-postgres/README.md)
 
+开发检查：`make ci` 使用 Python 3.11+ 执行固定 RSS 候选中的临时依赖风险校验；真实 PostgreSQL 测试另需 Docker。
+
 本仓不提供应用装配、认证授权、密钥托管、保留策略或生产迁移。
 
 - [可选 Ledger 协议](crates/ledger/README.md)
