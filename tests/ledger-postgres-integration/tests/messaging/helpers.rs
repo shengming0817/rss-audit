@@ -1,5 +1,6 @@
 use super::*;
 use rss_transactional_messaging::policy::OperationDeadline;
+use rss_transactional_messaging_postgres::PgInboxClaim;
 pub(super) struct Validator;
 impl rss_transactional_messaging::transaction::IngressValidator<Vec<u8>> for Validator {
     fn validate(
@@ -69,4 +70,30 @@ pub(super) fn deadline() -> rss_transactional_messaging::policy::OperationDeadli
         Deadline::from_timeout(&clock, Duration::from_secs(5)).expect("deadline"),
         &clock,
     )
+}
+
+pub(super) async fn claim(
+    inbox: &PgInboxStore,
+    binding: &rss_transactional_messaging::transaction::VerifiedConsumerBinding,
+) -> anyhow::Result<IdempotencyDisposition<PgInboxClaim>> {
+    let permit = inbox
+        .reserve_claim(binding.execution(), binding.identity(), deadline())?
+        .acquire()
+        .await?;
+    Ok(inbox.claim(permit).await?)
+}
+
+pub(super) async fn assert_terminal(
+    inbox: &PgInboxStore,
+    binding: &rss_transactional_messaging::transaction::VerifiedConsumerBinding,
+    expected: TerminalDisposition,
+) -> anyhow::Result<()> {
+    let IdempotencyDisposition::Terminal(receipt) = claim(inbox, binding).await? else {
+        anyhow::bail!("expected durable terminal receipt on redelivery");
+    };
+    let settlement = binding
+        .validate_terminal(receipt)
+        .map_err(|_| anyhow::anyhow!("terminal receipt does not match the verified message"))?;
+    assert_eq!(settlement.disposition(), expected);
+    Ok(())
 }

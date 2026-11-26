@@ -206,6 +206,17 @@ pub(super) async fn run(
     Ok(())
 }
 
+async fn claim_inbox(
+    inbox: &PgInboxStore,
+    binding: &VerifiedConsumerBinding,
+) -> anyhow::Result<IdempotencyDisposition<PgInboxClaim>> {
+    let permit = inbox
+        .reserve_claim(binding.execution(), binding.identity(), deadline()?)?
+        .acquire()
+        .await?;
+    Ok(inbox.claim(permit).await?)
+}
+
 async fn scenario(
     store: &PgAudit,
     admin: &PgPool,
@@ -232,10 +243,8 @@ async fn scenario(
         &envelope,
     )
     .map_err(|_| anyhow::anyhow!("fixture ingress rejected"))?;
-    let IdempotencyDisposition::Acquired(claim) = inbox
-        .claim(execution()?, binding.identity(), deadline()?)
-        .await?
-    else {
+
+    let IdempotencyDisposition::Acquired(claim) = claim_inbox(inbox, &binding).await? else {
         anyhow::bail!("expected new claim")
     };
     if unknown {
@@ -269,9 +278,7 @@ async fn scenario(
     assert_eq!(retry.inserted(), reject);
     if unknown {
         assert!(matches!(
-            inbox
-                .claim(execution()?, binding.identity(), deadline()?)
-                .await?,
+            claim_inbox(inbox, &binding).await?,
             IdempotencyDisposition::Terminal(_)
         ));
     }
