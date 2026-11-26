@@ -118,14 +118,7 @@ pub async fn run(
     ] {
         let m = message(id);
         let b = binding(&m);
-        let IdempotencyDisposition::Acquired(claim) = inbox
-            .claim(
-                fence_fixture::binding(b.identity().tenant_id()),
-                b.identity(),
-                deadline(),
-            )
-            .await?
-        else {
+        let IdempotencyDisposition::Acquired(claim) = helpers::claim(&inbox, &b).await? else {
             anyhow::bail!("expected inbox claim")
         };
         let consumer = PgConsumerTx::receipt_only(
@@ -171,13 +164,7 @@ pub async fn run(
             let retry = committed(store.append(&r, &control).await)?;
             assert!(!retry.inserted());
             assert!(!matches!(
-                inbox
-                    .claim(
-                        fence_fixture::binding(b.identity().tenant_id()),
-                        b.identity(),
-                        deadline()
-                    )
-                    .await?,
+                helpers::claim(&inbox, &b).await?,
                 IdempotencyDisposition::Acquired(_)
             ));
         }
@@ -188,14 +175,7 @@ pub async fn run(
         let b = binding(&m);
         let r = request("inbox", id, b"original")?;
         committed(store.append(&r, &control).await)?;
-        let IdempotencyDisposition::Acquired(claim) = inbox
-            .claim(
-                fence_fixture::binding(b.identity().tenant_id()),
-                b.identity(),
-                deadline(),
-            )
-            .await?
-        else {
+        let IdempotencyDisposition::Acquired(claim) = helpers::claim(&inbox, &b).await? else {
             anyhow::bail!("expected claim")
         };
         let consumer = PgConsumerTx::receipt_only(
@@ -226,13 +206,7 @@ pub async fn run(
             )
         );
         assert!(!matches!(
-            inbox
-                .claim(
-                    fence_fixture::binding(b.identity().tenant_id()),
-                    b.identity(),
-                    deadline()
-                )
-                .await?,
+            helpers::claim(&inbox, &b).await?,
             IdempotencyDisposition::Acquired(_)
         ));
         assert_eq!(
@@ -248,14 +222,7 @@ pub async fn run(
     )?;
     let m = message("lease-expired");
     let b = binding(&m);
-    let IdempotencyDisposition::Acquired(claim) = short_inbox
-        .claim(
-            fence_fixture::binding(b.identity().tenant_id()),
-            b.identity(),
-            deadline(),
-        )
-        .await?
-    else {
+    let IdempotencyDisposition::Acquired(claim) = helpers::claim(&short_inbox, &b).await? else {
         anyhow::bail!("expected short claim")
     };
     let consumer = PgConsumerTx::receipt_only(

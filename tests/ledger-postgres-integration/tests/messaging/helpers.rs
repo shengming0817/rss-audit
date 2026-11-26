@@ -1,5 +1,6 @@
 use super::*;
 use rss_transactional_messaging::policy::OperationDeadline;
+use rss_transactional_messaging_postgres::PgInboxClaim;
 pub(super) struct Validator;
 impl rss_transactional_messaging::transaction::IngressValidator<Vec<u8>> for Validator {
     fn validate(
@@ -69,4 +70,15 @@ pub(super) fn deadline() -> rss_transactional_messaging::policy::OperationDeadli
         Deadline::from_timeout(&clock, Duration::from_secs(5)).expect("deadline"),
         &clock,
     )
+}
+
+pub(super) async fn claim(
+    inbox: &PgInboxStore,
+    binding: &rss_transactional_messaging::transaction::VerifiedConsumerBinding,
+) -> anyhow::Result<IdempotencyDisposition<PgInboxClaim>> {
+    let permit = inbox
+        .reserve_claim(binding.execution(), binding.identity(), deadline())?
+        .acquire()
+        .await?;
+    Ok(inbox.claim(permit).await?)
 }

@@ -232,10 +232,11 @@ async fn scenario(
         &envelope,
     )
     .map_err(|_| anyhow::anyhow!("fixture ingress rejected"))?;
-    let IdempotencyDisposition::Acquired(claim) = inbox
-        .claim(execution()?, binding.identity(), deadline()?)
-        .await?
-    else {
+    let permit = inbox
+        .reserve_claim(binding.execution(), binding.identity(), deadline()?)?
+        .acquire()
+        .await?;
+    let IdempotencyDisposition::Acquired(claim) = inbox.claim(permit).await? else {
         anyhow::bail!("expected new claim")
     };
     if unknown {
@@ -268,10 +269,12 @@ async fn scenario(
     let retry = committed(store.append(&request, control).await)?;
     assert_eq!(retry.inserted(), reject);
     if unknown {
+        let permit = inbox
+            .reserve_claim(binding.execution(), binding.identity(), deadline()?)?
+            .acquire()
+            .await?;
         assert!(matches!(
-            inbox
-                .claim(execution()?, binding.identity(), deadline()?)
-                .await?,
+            inbox.claim(permit).await?,
             IdempotencyDisposition::Terminal(_)
         ));
     }
