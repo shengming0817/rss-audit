@@ -82,3 +82,18 @@ pub(super) async fn claim(
         .await?;
     Ok(inbox.claim(permit).await?)
 }
+
+pub(super) async fn assert_terminal(
+    inbox: &PgInboxStore,
+    binding: &rss_transactional_messaging::transaction::VerifiedConsumerBinding,
+    expected: TerminalDisposition,
+) -> anyhow::Result<()> {
+    let IdempotencyDisposition::Terminal(receipt) = claim(inbox, binding).await? else {
+        anyhow::bail!("expected durable terminal receipt on redelivery");
+    };
+    let settlement = binding
+        .validate_terminal(receipt)
+        .map_err(|_| anyhow::anyhow!("terminal receipt does not match the verified message"))?;
+    assert_eq!(settlement.disposition(), expected);
+    Ok(())
+}

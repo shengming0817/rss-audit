@@ -11,7 +11,10 @@ use rss_transactional_messaging_postgres::{
     PgConfig, PgConsumerEffect, PgConsumerEffectFailure, PgConsumerTx, PgInboxStore, PgPassword,
     PgPrivateCa, PgRuntime, PgTransaction, PgTransactionFault,
 };
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 mod helpers;
 use helpers::{binding, deadline, message};
 impl MessageClock for super::Clock {
@@ -30,7 +33,7 @@ impl ExecutionTimer for super::Clock {
 struct Effect {
     auth: Arc<rss_ledger::Authenticator>,
     fail: bool,
-    expire: bool,
+    expired_after_append: Option<Arc<AtomicBool>>,
 }
 impl PgConsumerEffect<Vec<u8>> for Effect {
     async fn apply(
@@ -49,18 +52,29 @@ impl PgConsumerEffect<Vec<u8>> for Effect {
                     rss_transactional_messaging_postgres::PgError::from(e),
                 )
             })?;
-        if let Err(error) = rss_ledger_postgres::append_in(tx, self.auth.clone(), &r).await {
-            return match error {
-                rss_ledger_postgres::Error::Conflict => Ok(TerminalDisposition::Rejected(
+        let staged = match rss_ledger_postgres::append_in(tx, self.auth.clone(), &r).await {
+            Ok(staged) => staged,
+            Err(rss_ledger_postgres::Error::Conflict) => {
+                return Ok(TerminalDisposition::Rejected(
                     rss_transactional_messaging::transaction::RejectKind::Permanent,
-                )),
-                error => Err(PgConsumerEffectFailure::infrastructure(
+                ));
+            }
+            Err(error) => {
+                return Err(PgConsumerEffectFailure::infrastructure(
                     rss_transactional_messaging_postgres::PgError::from(error),
-                )),
-            };
-        }
-        if self.expire {
-            tokio::time::sleep(Duration::from_millis(120)).await;
+                ));
+            }
+        };
+        if let Some(observed) = &self.expired_after_append {
+            assert!(staged.inserted());
+            let tenant = tx.tenant_id().to_string();
+            let message = m.id().as_str().to_owned();
+            tx.with_connection(move |c| Box::pin(async move {
+                sqlx::query("SELECT pg_sleep_until(lease_until + interval '1 millisecond') FROM rss_transactional_messaging.inbox WHERE tenant_id=$1::uuid AND message_id=$2 AND consumer_group='suite' AND disposition IS NULL AND isfinite(lease_until)")
+                    .bind(tenant).bind(message).fetch_one(c).await?;
+                Ok(())
+            })).await.map_err(PgConsumerEffectFailure::infrastructure)?;
+            observed.store(true, Ordering::Release);
         }
         if self.fail {
             return Err(PgConsumerEffectFailure::infrastructure(
@@ -126,7 +140,7 @@ pub async fn run(
             Effect {
                 auth: Arc::new(auth()?),
                 fail,
-                expire: false,
+                expired_after_append: None,
             },
         );
         if unknown {
@@ -163,10 +177,7 @@ pub async fn run(
         if unknown {
             let retry = committed(store.append(&r, &control).await)?;
             assert!(!retry.inserted());
-            assert!(!matches!(
-                helpers::claim(&inbox, &b).await?,
-                IdempotencyDisposition::Acquired(_)
-            ));
+            helpers::assert_terminal(&inbox, &b, TerminalDisposition::Succeeded).await?;
         }
     }
     {
@@ -183,7 +194,7 @@ pub async fn run(
             Effect {
                 auth: Arc::new(auth()?),
                 fail: false,
-                expire: false,
+                expired_after_append: None,
             },
         );
         let outcome = consumer
@@ -205,10 +216,7 @@ pub async fn run(
                 rss_transactional_messaging::transaction::RejectKind::Permanent
             )
         );
-        assert!(!matches!(
-            helpers::claim(&inbox, &b).await?,
-            IdempotencyDisposition::Acquired(_)
-        ));
+        helpers::assert_terminal(&inbox, &b, receipt.disposition()).await?;
         assert_eq!(
             committed(store.find(r.ledger(), r.record_id(), &control).await)?
                 .ok_or_else(|| anyhow::anyhow!("missing original"))?
@@ -216,9 +224,10 @@ pub async fn run(
             b"original"
         );
     }
+    let expired_after_append = Arc::new(AtomicBool::new(false));
     let short_inbox = PgInboxStore::new(
         runtime.clone(),
-        LeaseRenewalPolicy::from_ttl(Duration::from_millis(50))?,
+        LeaseRenewalPolicy::from_ttl(Duration::from_secs(2))?,
     )?;
     let m = message("lease-expired");
     let b = binding(&m);
@@ -230,13 +239,23 @@ pub async fn run(
         Effect {
             auth: Arc::new(auth()?),
             fail: false,
-            expire: true,
+            expired_after_append: Some(expired_after_append.clone()),
         },
     );
     let result = consumer
         .execute(&claim, &m, b.receipt_intent(), deadline())
         .await;
-    assert_ne!(result.status(),rss_transactional_messaging::observability::TransactionalMessagingTransactionStatus::Committed);
+    assert!(expired_after_append.load(Ordering::Acquire));
+    assert_eq!(
+        result.status(),
+        rss_transactional_messaging::observability::TransactionalMessagingTransactionStatus::Fenced
+    );
+    assert!(
+        short_inbox
+            .read_terminal(b.execution(), b.identity(), deadline())
+            .await?
+            .is_none()
+    );
     let r = request("inbox", "lease-expired", m.payload())?;
     assert!(committed(store.find(r.ledger(), r.record_id(), &control).await)?.is_none());
     runtime.close().await;
