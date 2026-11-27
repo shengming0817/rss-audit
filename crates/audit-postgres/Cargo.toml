@@ -18,7 +18,7 @@ rss-transactional-messaging-postgres = { workspace = true, optional = true }
 sqlx.workspace = true
 thiserror.workspace = true
 futures.workspace = true
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "sync"] }
 tokio-util.workspace = true
 
 [features]

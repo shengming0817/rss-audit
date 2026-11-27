@@ -48,6 +48,12 @@ pub enum Error {
     /// The complete selected page exceeds the canonical byte budget; no partial page is returned.
     #[error("audit read byte budget exceeded")]
     ReadBudgetExceeded,
+    /// Invalid write budget, reservation or batch dimensions.
+    #[error("audit write limit exceeded")]
+    WriteLimit,
+    /// The shared preparation capacity cannot admit this write immediately.
+    #[error("audit write capacity busy")]
+    WriteBusy,
     /// A ledger-only operation was requested from an explicitly plain owner.
     #[error("audit ledger integrity is not enabled")]
     IntegrityRequired,
