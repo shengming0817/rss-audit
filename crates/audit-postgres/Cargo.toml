@@ -7,6 +7,7 @@ publish.workspace = true
 description = "Atomic tenant-scoped PostgreSQL audit persistence"
 
 [dependencies]
+tracing = { workspace = true, optional = true }
 rss-audit-core.workspace = true
 rss-contract.workspace = true
 rss-request-context.workspace = true
@@ -25,7 +26,7 @@ tokio-util.workspace = true
 default = []
 ledger = ["rss-audit-core/ledger", "dep:rss-ledger", "dep:rss-ledger-postgres"]
 messaging = ["dep:rss-transactional-messaging-postgres", "rss-ledger-postgres?/messaging"]
-integration = []
+integration = ["dep:tracing"]
 
 [dev-dependencies]
 anyhow.workspace = true

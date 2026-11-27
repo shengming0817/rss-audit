@@ -60,34 +60,44 @@ impl crate::WriteBudget {
         batch: crate::AdmittedBatch<'_>,
     ) -> Result<Vec<StagedAppend>, Error> {
         self.check_domain(&batch)?;
-        let requests = batch.records;
-        if requests.is_empty() {
+        let Some(tenant) = batch.tenant else {
             return Ok(Vec::new());
-        }
-        if batch.tenant != Some(tx.tenant_id()) {
+        };
+        if tenant != tx.tenant_id() {
             return Err(Error::ScopeMismatch);
         }
-        let mut ledger = Vec::with_capacity(requests.len());
-        for request in requests {
-            let entry = match integrity {
-                Integrity::Plain => None,
-                #[cfg(feature = "ledger")]
-                Integrity::Ledger(auth) => {
-                    let staged = rss_ledger_postgres::append_in(
-                        tx,
-                        auth.clone(),
-                        &request.append_request()?,
-                    )
-                    .await?;
-                    Some((staged.entry().sequence().get(), staged.inserted()))
-                }
-            };
-            #[cfg(not(feature = "ledger"))]
-            let _ = request;
-            ledger.push(entry);
-        }
-        tx.with_connection_context(&mut (batch, ledger), |(batch, ledger), c| {
-            Box::pin(async move { Ok(repository::append_batch(c, batch, ledger).await) })
+        // Fencing and expiry belong to the message owner, including on invalid input.
+        let mut records = batch.records;
+        let plain = matches!(integrity, Integrity::Plain);
+        let input = tx
+            .with_connection_context(&mut records, move |records, c| {
+                let records = *records;
+                Box::pin(async move {
+                    let input = crate::append::Batch::new(records);
+                    if plain && input.conflict.is_some() {
+                        return Ok(crate::probe::tenant(c, tenant)
+                            .await
+                            .and(Err(Error::Conflict)));
+                    }
+                    Ok(Ok(input))
+                })
+            })
+            .await??;
+        let ledger: Option<Vec<(u64, bool)>> = match integrity {
+            Integrity::Plain => None,
+            #[cfg(feature = "ledger")]
+            Integrity::Ledger(auth) => {
+                let positions =
+                    rss_ledger_postgres::append_batch_in(tx, auth, &input.ledger_requests()?)
+                        .await?;
+                Some(crate::append::coordinates(positions))
+            }
+        };
+        // The context borrow carries the owner's cutoff and can include non-static prepared input.
+        tx.with_connection_context(&mut (input, ledger), move |(input, ledger), c| {
+            Box::pin(async move {
+                Ok(repository::append_batch(c, tenant, input, ledger.as_deref()).await)
+            })
         })
         .await?
     }

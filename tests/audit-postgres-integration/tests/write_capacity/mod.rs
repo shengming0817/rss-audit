@@ -392,9 +392,9 @@ async fn mixed_corruption(
 
 // The fixture advances only the operation cutoff after observing an actual blocked
 // PostgreSQL writer. The server timeout and owner settlement deadline remain ample.
-struct StepClock {
-    cutoff: Deadline,
-    advance: CancellationToken,
+pub(super) struct StepClock {
+    pub(super) cutoff: Deadline,
+    pub(super) advance: CancellationToken,
 }
 impl Clock for StepClock {
     fn now(&self) -> Instant {

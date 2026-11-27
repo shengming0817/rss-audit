@@ -16,6 +16,7 @@ axum = { version = "=0.8.9", default-features = false, features = ["json", "quer
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tower = { version = "0.5", features = ["util"] }
+bytes = "1"
 base64 = "0.22"
 rss-audit-core = { path = "crates/audit-core" }
 rss-contract = { git = "https://dev.azure.com/shengming0923/rss/_git/rss", rev = "9843ec49d96c71c64854b6676c9c41fe6d40712a", default-features = false }

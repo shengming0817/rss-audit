@@ -20,7 +20,8 @@ pub(super) async fn run(
     settlement::run(plain, ledger, admin, control).await?;
     unknown(plain, "unknown-plain", control).await?;
     unknown(ledger, "unknown-ledger", control).await?;
-    racing(ledger, control).await?;
+    racing(plain, "racing-plain", control).await?;
+    racing(ledger, "racing-ledger", control).await?;
     termination(plain, control).await?;
     Ok(())
 }
@@ -154,9 +155,13 @@ async fn unknown(
     Ok(())
 }
 
-async fn racing(store: &PgAudit, control: &Control<'_, TestClock>) -> anyhow::Result<()> {
+async fn racing(
+    store: &PgAudit,
+    source: &str,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
     let request = store
-        .prepare(event(tenant()?, "racing", "same", vec![7])?, control)
+        .prepare(event(tenant()?, source, "same", vec![7])?, control)
         .await?;
     let all = futures::future::join_all((0..8).map(|_| store.append(&request, control))).await;
     let mut inserted = 0;
@@ -165,10 +170,10 @@ async fn racing(store: &PgAudit, control: &Control<'_, TestClock>) -> anyhow::Re
     }
     assert_eq!(inserted, 1);
     let first = store
-        .prepare(event(tenant()?, "racing", "conflict", vec![1])?, control)
+        .prepare(event(tenant()?, source, "conflict", vec![1])?, control)
         .await?;
     let second = store
-        .prepare(event(tenant()?, "racing", "conflict", vec![2])?, control)
+        .prepare(event(tenant()?, source, "conflict", vec![2])?, control)
         .await?;
     let (a, b) = tokio::join!(
         store.append(&first, control),

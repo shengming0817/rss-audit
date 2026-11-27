@@ -53,6 +53,26 @@ pub async fn append_in(
     .await
     .map_err(Error::Messaging)?
 }
+/// Stage a same-chain batch under the original message fence and remaining budget.
+/// A later chunk can fail after earlier entries were staged. Propagate every batch error,
+/// including a stable-ID conflict, and roll back the entire owner transaction.
+pub async fn append_batch_in(
+    tx: &mut PgTransaction<'_>,
+    auth: &Authenticator,
+    requests: &[AppendRequest],
+) -> Result<Vec<(rss_ledger::Sequence, bool)>, Error> {
+    if requests
+        .first()
+        .is_some_and(|r| r.ledger().tenant() != tx.tenant_id())
+    {
+        return Err(rss_ledger::Error::ScopeMismatch.into());
+    }
+    tx.with_connection_context(&mut (auth, requests), |(auth, requests), c| {
+        Box::pin(async move { Ok(borrowed::append_positions(c, auth, requests).await) })
+    })
+    .await
+    .map_err(Error::Messaging)?
+}
 impl From<Error> for PgError {
     fn from(error: Error) -> Self {
         let error = match error {

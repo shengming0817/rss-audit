@@ -7,12 +7,15 @@ readme = "README.md"
 description = "Canonical authenticated append-only ledger protocol"
 publish.workspace = true
 [dependencies]
+tracing = { workspace = true, optional = true }
+bytes.workspace = true
 rss-request-context.workspace = true
 thiserror.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
 [features]
+integration = ["dep:tracing"]
 default = []
 [dev-dependencies]
 anyhow.workspace = true

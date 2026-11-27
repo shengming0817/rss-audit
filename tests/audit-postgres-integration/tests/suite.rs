@@ -19,6 +19,8 @@ use std::{
 use tokio_util::sync::CancellationToken;
 mod admission;
 mod atomicity;
+mod batch;
+mod batch_cost;
 mod composition;
 mod http;
 mod ledger_index;
@@ -128,7 +130,14 @@ async fn audit_measurement() -> anyhow::Result<()> {
 async fn audit_write_pressure() -> anyhow::Result<()> {
     run(Workload::Pressure).await
 }
+#[tokio::test]
+#[ignore = "release-mode batch cost comparison"]
+async fn audit_batch_cost() -> anyhow::Result<()> {
+    run(Workload::BatchCost).await
+}
+
 enum Workload {
+    BatchCost,
     Acceptance,
     Pages,
     Pressure,
@@ -144,26 +153,7 @@ async fn run(workload: Workload) -> anyhow::Result<()> {
         testkit::PgTlsServerIdentity::MatchingHost,
     )
     .await?;
-    let p = fixture.params();
-    let options = PgConnectOptions::new()
-        .host(&p.host)
-        .port(p.port)
-        .database(&p.database)
-        .ssl_mode(PgSslMode::VerifyFull)
-        .ssl_root_cert_from_pem(fixture.ca_pem().as_bytes().to_vec());
-    let admin = PgPoolOptions::new()
-        .max_connections(3)
-        .connect_with(options.clone().username(&p.username).password(&p.password))
-        .await?;
-    install(&admin).await?;
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect_with(
-            options
-                .username("audit_runtime")
-                .password("fixture-password"),
-        )
-        .await?;
+    let (admin, pool) = install_pools(&fixture).await?;
     let clock = TestClock;
     let cancel = CancellationToken::new();
     let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(150))?;
@@ -176,6 +166,7 @@ async fn run(workload: Workload) -> anyhow::Result<()> {
         .await
         .context("ledger startup")?;
     match workload {
+        Workload::BatchCost => batch_cost::measure(&plain, &ledger, &pool, &control).await?,
         Workload::Pages => http::measure(&plain, &ledger, &pool, &control).await?,
         Workload::Pressure => write_capacity::measure(&pool, &control).await?,
         Workload::Acceptance => {
@@ -200,6 +191,7 @@ async fn exercise(
     query_cost::run(pool, admin, control)
         .await
         .context("query_cost::run")?;
+    batch::semantics(plain, ledger, pool, admin, control).await?;
     basic(plain, ledger, control).await.context("basic")?;
     atomicity::run(plain, ledger, admin, control)
         .await
@@ -385,4 +377,28 @@ async fn storage_classification(pool: &PgPool) -> anyhow::Result<()> {
     );
     tx.rollback().await?;
     Ok(())
+}
+
+async fn install_pools(fixture: &testkit::PgTlsFixture) -> anyhow::Result<(PgPool, PgPool)> {
+    let p = fixture.params();
+    let options = PgConnectOptions::new()
+        .host(&p.host)
+        .port(p.port)
+        .database(&p.database)
+        .ssl_mode(PgSslMode::VerifyFull)
+        .ssl_root_cert_from_pem(fixture.ca_pem().as_bytes().to_vec());
+    let admin = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(options.clone().username(&p.username).password(&p.password))
+        .await?;
+    install(&admin).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect_with(
+            options
+                .username("audit_runtime")
+                .password("fixture-password"),
+        )
+        .await?;
+    Ok((admin, pool))
 }

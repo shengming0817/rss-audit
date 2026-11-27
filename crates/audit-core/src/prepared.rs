@@ -11,7 +11,7 @@ struct RecordData {
     occurred_at: Timepoint,
     action: Action,
     outcome: Outcome,
-    canonical: Vec<u8>,
+    canonical: bytes::Bytes,
 }
 impl PreparedAuditV1 {
     /// Restore a canonical record. An owned buffer is adopted after validation.
@@ -33,7 +33,7 @@ impl PreparedAuditV1 {
             outcome: facts.outcome(),
             occurred_at: facts.occurred_at(),
             recorded_at,
-            canonical,
+            canonical: canonical.into(),
         }))
     }
     /// Stable tenant, source and event identity.
@@ -55,6 +55,10 @@ impl PreparedAuditV1 {
     /// Recording time supplied by the recorder authority.
     pub fn recorded_at(&self) -> Timepoint {
         self.0.recorded_at
+    }
+    #[cfg(feature = "ledger")]
+    pub(crate) fn shared_bytes(&self) -> bytes::Bytes {
+        self.0.canonical.clone()
     }
     /// Exact retry bytes, including the original recording time.
     pub fn canonical_bytes(&self) -> &[u8] {

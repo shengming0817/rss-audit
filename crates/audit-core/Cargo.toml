@@ -7,6 +7,7 @@ publish.workspace = true
 description = "Provider-free canonical audit record protocol"
 
 [dependencies]
+bytes.workspace = true
 rss-contract.workspace = true
 rss-diag-context.workspace = true
 rss-ledger = { workspace = true, optional = true }

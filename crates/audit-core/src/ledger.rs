@@ -112,10 +112,10 @@ impl PreparedAuditV1 {
     /// Map this exact Audit record to its optional integrity chain. Not commit evidence.
     pub fn append_request(&self) -> Result<AppendRequest, Error> {
         let identity = self.identity();
-        Ok(AppendRequest::new(
+        Ok(AppendRequest::from_bytes(
             LedgerId::new(identity.tenant(), ChainId::parse(AUDIT_CHAIN_ID)?),
             audit_record_id(identity.source().source_id(), identity.event_id())?,
-            self.canonical_bytes().to_vec(),
+            self.shared_bytes(),
         )?)
     }
     /// Compare an authenticated entry with the exact audit bytes and identity.

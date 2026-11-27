@@ -44,6 +44,8 @@ async fn business<T: Timer>(store: &PgLedger, request: AppendRequest, c: &Contro
 
 `StagedAppend` 不是提交证明；只有外层 `Committed<T>` 回执确认独立事务提交。回执构造器私有。
 独立重试按稳定身份返回原始记录和认证值，不增加序号；同身份不同 payload 冲突。
+同链批可通过 `append_batch_in_transaction` 或消息事务 `append_batch_in` 追加，按输入顺序返回暂存的序号和新增标志。单条和批量共用追加实现。批初始化时认证起始链尾，历史 ID 命中时另外验证对应条目，每组最多 32 个请求集合查重和持久化，全部使用同一实际事务。显式授予写函数的宿主使用 `rss_ledger.prepare_append(uuid,text,text,smallint)` 和 `rss_ledger.insert_entries(uuid,text,text,smallint,text[],bigint[],bytea[],bytea[],bytea[])`。
+
 身份/配置检查和记录认证先于幂等返回。同链行锁、checked 分配、写入和链头更新保持在同一个事务。
 PG 序号范围为 `0..=i64::MAX`，耗尽显式拒绝。
 
@@ -101,6 +103,8 @@ async fn consumer_effect(
     }
 }
 ```
+
+普通 SQLx 或消息 `local_tx` 的批量追加可能在前块已暂存后返回冲突。批入口的任何错误（包括 `Conflict`、取消或超时）都要传播给原 owner，以便整笔回滚。上述 consumer 示例由消息 owner 在终态拒绝时回滚整个 effect savepoint。
 
 既有 consumer owner 核验 inbox lease、完成记录并结算。消息提交证据仍由该 owner 产生。
 

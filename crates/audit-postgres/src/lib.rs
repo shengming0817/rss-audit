@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
+mod append;
 mod borrowed;
 mod budget;
 pub use budget::{AdmittedBatch, WriteBudget, WriteReservation};

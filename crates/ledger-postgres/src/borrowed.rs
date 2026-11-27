@@ -49,6 +49,33 @@ pub async fn append_in_transaction<T: Timer>(
         .await
 }
 
+/// Append one same-chain batch in input order and return its staged sequence and insertion flags.
+/// A later chunk can fail after earlier entries were staged. Propagate every batch error,
+/// including a stable-ID conflict, and roll back the entire owner transaction.
+pub async fn append_batch_in_transaction<T: Timer>(
+    tx: &mut Transaction<'_, Postgres>,
+    auth: &Authenticator,
+    requests: &[AppendRequest],
+    control: &Control<'_, T>,
+) -> Result<Vec<(Sequence, bool)>, Error> {
+    control
+        .run_stage(
+            LocalTxDeadlineStage::Operation,
+            append_positions(tx, auth, requests),
+        )
+        .await
+}
+pub(crate) async fn append_positions(
+    c: &mut PgConnection,
+    auth: &Authenticator,
+    requests: &[AppendRequest],
+) -> Result<Vec<(Sequence, bool)>, Error> {
+    if let Some(first) = requests.first() {
+        validate(c, first.ledger().tenant()).await?;
+    }
+    crate::append::positions(c, auth, requests).await
+}
+
 /// Authenticate a bounded window inside the caller's current transaction snapshot.
 ///
 /// The window can include this transaction's uncommitted appends. It is not commit
@@ -88,7 +115,7 @@ pub(crate) async fn append(
     request: &AppendRequest,
 ) -> Result<StagedAppend, Error> {
     validate(connection, request.ledger().tenant()).await?;
-    repository::append(connection, auth, request).await
+    crate::append::one(connection, auth, request).await
 }
 
 pub(crate) async fn window(

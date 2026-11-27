@@ -1,14 +1,18 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+mod append;
 mod borrowed;
 mod control;
-pub use borrowed::{append_in_transaction, lock_head_in_transaction, read_window_in_transaction};
+pub use borrowed::{
+    append_batch_in_transaction, append_in_transaction, lock_head_in_transaction,
+    read_window_in_transaction,
+};
 mod error;
 #[cfg(feature = "messaging")]
 mod messaging;
 #[cfg(feature = "messaging")]
-pub use messaging::{append_in, lock_head_in, validate_in};
+pub use messaging::{append_batch_in, append_in, lock_head_in, validate_in};
 mod probe;
 pub use probe::{validate_connection, validate_read_connection};
 mod repository;

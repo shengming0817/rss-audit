@@ -15,69 +15,99 @@ pub(crate) async fn recording_time(c: &mut PgConnection) -> Result<rss_contract:
 /// Shared physical Audit write. The enclosing owner must roll back on any error.
 pub(crate) async fn append_batch(
     c: &mut PgConnection,
-    batch: &crate::AdmittedBatch<'_>,
-    ledger: &[Option<(u64, bool)>],
+    tenant: TenantId,
+    batch: &crate::append::Batch<'_>,
+    ledger: Option<&[(u64, bool)]>,
 ) -> Result<Vec<StagedAppend>, Error> {
-    use std::collections::{BTreeMap, BTreeSet};
-    let requests = batch.records;
-    let Some(tenant) = batch.tenant else {
-        return Ok(Vec::new());
-    };
-    if ledger.len() != requests.len() {
+    let count = batch.unique.len();
+    if ledger.is_some_and(|entries| entries.len() != count) {
         return Err(Error::StorageContract);
     }
-    let key = |r: &PreparedAuditV1| {
-        (
-            r.identity().source().source_id().as_str().to_owned(),
-            r.identity().event_id().as_str().to_owned(),
-        )
-    };
-    let mut unique = BTreeMap::new();
-    for (i, request) in requests.iter().enumerate() {
-        if let Some(previous) = unique.insert(key(request), i) {
-            if requests[previous].canonical_bytes() != request.canonical_bytes() {
-                return Err(Error::Conflict);
-            }
-            // Preserve the first insertion flag when one input repeats its identity.
-            unique.insert(key(request), previous);
-        }
-    }
-    let mut sources = Vec::with_capacity(unique.len());
-    let mut events = Vec::with_capacity(unique.len());
-    let mut recorded = Vec::with_capacity(unique.len());
-    let mut canonical = Vec::with_capacity(unique.len());
-    let mut lengths = Vec::with_capacity(unique.len());
-    let mut sequences = Vec::with_capacity(unique.len());
-    for ((source, event), &i) in &unique {
-        sources.push(source.as_str());
-        events.push(event.as_str());
-        recorded.push(requests[i].recorded_at().unix_seconds());
-        canonical.push(requests[i].canonical_bytes());
-        lengths.push(
-            i32::try_from(requests[i].canonical_bytes().len())
-                .map_err(|_| Error::StorageContract)?,
-        );
+    let mut sources = Vec::with_capacity(count);
+    let mut events = Vec::with_capacity(count);
+    let mut recorded = Vec::with_capacity(count);
+    let mut canonical = Vec::with_capacity(count);
+    let mut sequences = Vec::with_capacity(count);
+    for (slot, request) in batch.unique.iter().enumerate() {
+        sources.push(request.identity().source().source_id().as_str());
+        events.push(request.identity().event_id().as_str());
+        recorded.push(request.recorded_at().unix_seconds());
+        canonical.push(request.canonical_bytes());
         sequences.push(
-            ledger[i]
-                .map(|(seq, _)| i64::try_from(seq))
+            ledger
+                .map(|entries| i64::try_from(entries[slot].0))
                 .transpose()
                 .map_err(|_| Error::StorageContract)?,
         );
     }
-    let inserted: Vec<(String, String)> = sqlx::query_as(
-        "SELECT source_id,event_id FROM rss_audit.append_batch($1::uuid,$2,$3,$4,$5,$6)",
+    let inserted: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT source_id,event_id,position FROM rss_audit.append_batch($1::uuid,$2,$3,$4,$5,$6)",
     )
     .bind(tenant.to_string())
-    .bind(&sources)
-    .bind(&events)
+    .bind(sources)
+    .bind(events)
     .bind(recorded)
     .bind(canonical)
     .bind(sequences)
     .fetch_all(&mut *c)
     .await?;
-    let mut inserted: BTreeSet<_> = inserted.into_iter().collect();
-    // A new READ COMMITTED snapshot sees competing inserts waited for by ON CONFLICT.
-    // Stronger isolation may instead report serialization failure; only the host retries.
+    let mut stored = vec![None; count];
+    let fresh = inserted.len();
+    for (source, event, position) in inserted {
+        let slot = batch.slot(&source, &event)?;
+        if position < 0 || stored[slot].is_some() {
+            return Err(Error::StorageContract);
+        }
+        stored[slot] = Some((
+            Record {
+                position,
+                prepared: batch.unique[slot].clone(),
+                ledger_sequence: ledger.map(|entries| entries[slot].0),
+            },
+            true,
+        ));
+    }
+    let first_different = if fresh < count {
+        read_replays(c, tenant, batch, &mut stored).await?
+    } else {
+        None
+    };
+    // Stable first-occurrence order also determines the public semantic error classification.
+    for (slot, row) in stored.iter().enumerate() {
+        let (record, added) = row.as_ref().ok_or(Error::StorageContract)?;
+        if Some(slot) == first_different || record.ledger_sequence.is_some() != ledger.is_some() {
+            return Err(Error::Conflict);
+        }
+        if let (Some(seq), Some(entries)) = (record.ledger_sequence, ledger)
+            && entries[slot] != (seq, *added)
+        {
+            return Err(Error::StorageContract);
+        }
+    }
+    batch.receipts(stored)
+}
+
+// A separate READ COMMITTED statement sees the winner after an INSERT waited on its key.
+// Stream and validate every historical row before reporting an ordinary replay conflict.
+async fn read_replays(
+    c: &mut PgConnection,
+    tenant: TenantId,
+    batch: &crate::append::Batch<'_>,
+    stored: &mut [Option<(Record, bool)>],
+) -> Result<Option<usize>, Error> {
+    let mut sources = Vec::new();
+    let mut events = Vec::new();
+    let mut lengths = Vec::new();
+    for (slot, request) in batch.unique.iter().enumerate() {
+        if stored[slot].is_none() {
+            sources.push(request.identity().source().source_id().as_str());
+            events.push(request.identity().event_id().as_str());
+            lengths.push(
+                i32::try_from(request.canonical_bytes().len())
+                    .map_err(|_| Error::StorageContract)?,
+            );
+        }
+    }
     let mut rows = sqlx::query(include_str!("append_readback.sql"))
         .bind(tenant.to_string())
         .bind(sources)
@@ -85,45 +115,48 @@ pub(crate) async fn append_batch(
         .bind(lengths)
         .bind(i32::try_from(rss_audit_core::MAX_HEADER_BYTES).map_err(|_| Error::StorageContract)?)
         .fetch(c);
-    let mut records = BTreeMap::new();
-    let mut oversized = 0usize;
+    let mut oversized = false;
+    let mut first_different: Option<usize> = None;
     while let Some(row) = rows.try_next().await? {
-        if row.try_get("oversized")? {
-            let prefix: &[u8] = row.try_get("canonical")?;
-            let len = usize::try_from(row.try_get::<i32, _>("stored_bytes")?)
-                .map_err(|_| Error::StorageContract)?;
-            let (identity, at) = rss_audit_core::inspect_canonical_header(prefix, len)
-                .map_err(|_| Error::StorageContract)?;
-            coordinates(&row, tenant, &identity, at)?;
-            oversized += 1;
-        } else {
-            let record = decode(&row, tenant)?;
-            records.insert(key(record.prepared()), record);
-        }
-    }
-    if records.len() + oversized != unique.len() {
-        return Err(Error::StorageContract);
-    }
-    if oversized != 0 {
-        return Err(Error::Conflict);
-    }
-    let mut result = Vec::with_capacity(requests.len());
-    for (request, expected) in requests.iter().zip(ledger) {
-        let id = key(request);
-        let record = records.get(&id).ok_or(Error::StorageContract)?;
-        check_existing(request, Some(record), expected.is_some())?;
-        let added = inserted.remove(&id);
-        if record.ledger_sequence != expected.map(|(seq, _)| seq)
-            || expected.is_some_and(|(_, was_inserted)| was_inserted != added)
-        {
+        let slot = batch.slot(row.try_get("source_id")?, row.try_get("event_id")?)?;
+        if stored[slot].is_some() {
             return Err(Error::StorageContract);
         }
-        result.push(StagedAppend {
-            record: record.clone(),
-            inserted: added,
-        });
+        let request = batch.unique[slot];
+        let bytes: &[u8] = row.try_get("canonical")?;
+        #[cfg(feature = "integration")]
+        tracing::trace!(target: "batch_cost::audit_body", bytes = bytes.len() as u64);
+        let longer: bool = row.try_get("oversized")?;
+        oversized |= longer;
+        let same = !longer && bytes == request.canonical_bytes();
+        let (position, sequence) = if same {
+            coordinates(&row, tenant, request.identity(), request.recorded_at())?
+        } else {
+            let len = usize::try_from(row.try_get::<i32, _>("stored_bytes")?)
+                .map_err(|_| Error::StorageContract)?;
+            let (identity, at) = rss_audit_core::inspect_canonical_header(bytes, len)
+                .map_err(|_| Error::StorageContract)?;
+            coordinates(&row, tenant, &identity, at)?
+        };
+        if !same {
+            first_different = Some(first_different.map_or(slot, |first| first.min(slot)));
+        }
+        stored[slot] = Some((
+            Record {
+                position,
+                prepared: request.clone(),
+                ledger_sequence: sequence,
+            },
+            false,
+        ));
     }
-    Ok(result)
+    if stored.iter().any(Option::is_none) {
+        return Err(Error::StorageContract);
+    }
+    if oversized {
+        return Err(Error::Conflict);
+    }
+    Ok(first_different)
 }
 
 fn decode(row: &PgRow, tenant: TenantId) -> Result<Record, Error> {
@@ -212,18 +245,4 @@ pub(crate) async fn page(
         .map(|r| Cursor::resume(cursor.tenant(), r.position(), through as u64))
         .transpose()?;
     Ok(Page { records, next })
-}
-
-fn check_existing(
-    request: &PreparedAuditV1,
-    existing: Option<&Record>,
-    ledger: bool,
-) -> Result<(), Error> {
-    if let Some(record) = existing
-        && (record.prepared.canonical_bytes() != request.canonical_bytes()
-            || record.ledger_sequence.is_some() != ledger)
-    {
-        return Err(Error::Conflict);
-    }
-    Ok(())
 }
