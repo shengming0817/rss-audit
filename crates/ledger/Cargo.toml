@@ -7,6 +7,7 @@ readme = "README.md"
 description = "Canonical authenticated append-only ledger protocol"
 publish.workspace = true
 [dependencies]
+bytes.workspace = true
 rss-request-context.workspace = true
 thiserror.workspace = true
 hmac.workspace = true

@@ -39,8 +39,8 @@ impl ReadLimit {
 /// A record staged in a borrowed transaction, never a durable commit receipt.
 #[derive(Debug)]
 pub struct StagedAppend {
-    entry: Entry,
-    inserted: bool,
+    pub(crate) entry: Entry,
+    pub(crate) inserted: bool,
 }
 impl StagedAppend {
     /// Staged record, including its stable recovery identity.
@@ -88,68 +88,6 @@ pub(crate) async fn lock_head(
     Ok(())
 }
 
-pub(crate) async fn append(
-    connection: &mut PgConnection,
-    auth: &Authenticator,
-    request: &AppendRequest,
-) -> Result<StagedAppend, Error> {
-    let ledger = request.ledger();
-    let head = sqlx::query("SELECT * FROM rss_ledger.prepare_append($1::uuid,$2,$3,1::smallint)")
-        .bind(ledger.tenant().to_string())
-        .bind(ledger.chain().as_str())
-        .bind(auth.key_id().as_str())
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(sql_error)?;
-    let seq: Option<i64> = head.try_get("seq").map_err(sql_error)?;
-    let previous = match seq {
-        Some(seq) => {
-            let row=sqlx::query("SELECT *,tenant_id::text AS tenant_text FROM rss_ledger.entries WHERE tenant_id=$1::uuid AND chain_id=$2 AND seq=$3")
-                .bind(ledger.tenant().to_string()).bind(ledger.chain().as_str()).bind(seq)
-                .fetch_optional(&mut *connection).await.map_err(sql_error)?.ok_or(Error::StorageContract)?;
-            let entry = decode(row)?;
-            auth.verify(&entry)?;
-            let tag: Vec<u8> = head.try_get("tag").map_err(sql_error)?;
-            if tag != entry.tag().as_bytes() {
-                return Err(Error::StorageContract);
-            }
-            Some(entry)
-        }
-        None => None,
-    };
-    if let Some(existing) = find(connection, auth, ledger, request.record_id()).await? {
-        if !existing.matches(request) {
-            return Err(Error::Conflict);
-        }
-        if previous
-            .as_ref()
-            .is_none_or(|p| existing.sequence() > p.sequence())
-        {
-            return Err(Error::StorageContract);
-        }
-        return Ok(StagedAppend {
-            entry: existing,
-            inserted: false,
-        });
-    }
-    let entry = auth.append(request, previous.as_ref())?;
-    sqlx::query("SELECT rss_ledger.insert_entry($1::uuid,$2,$3,$4,$5,$6,$7,$8,1::smallint)")
-        .bind(ledger.tenant().to_string())
-        .bind(ledger.chain().as_str())
-        .bind(entry.record_id().as_str())
-        .bind(encode_sequence(entry.sequence())?)
-        .bind(entry.previous_tag().as_bytes().as_slice())
-        .bind(entry.tag().as_bytes().as_slice())
-        .bind(entry.payload())
-        .bind(entry.key_id().as_str())
-        .execute(connection)
-        .await
-        .map_err(sql_error)?;
-    Ok(StagedAppend {
-        entry,
-        inserted: true,
-    })
-}
 pub(crate) async fn find(
     connection: &mut PgConnection,
     auth: &Authenticator,
@@ -262,7 +200,7 @@ fn read_header(row: &PgRow) -> Result<(Option<Sequence>, usize, u64), Error> {
     Ok((tail, expected, bytes))
 }
 
-fn decode(row: PgRow) -> Result<Entry, Error> {
+pub(crate) fn decode(row: PgRow) -> Result<Entry, Error> {
     let tenant: String = row
         .try_get("tenant_text")
         .map_err(|_| Error::StorageContract)?;
@@ -281,7 +219,7 @@ fn decode(row: PgRow) -> Result<Entry, Error> {
                 .map_err(|_| Error::StorageContract)?,
         )
         .map_err(|_| Error::StorageContract)?,
-        row.try_get("payload").map_err(|_| Error::StorageContract)?,
+        row.try_get::<Vec<u8>,_>("payload").map_err(|_| Error::StorageContract)?,
     )
     .map_err(|_| Error::StorageContract)?;
     let encoding = u16::try_from(

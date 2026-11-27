@@ -252,7 +252,7 @@ impl LedgerTransaction<'_> {
         if request.ledger().tenant() != self.tenant {
             return Err(rss_ledger::Error::ScopeMismatch.into());
         }
-        repository::append(self.connection, self.auth, request).await
+        crate::append::one(self.connection, self.auth, request).await
     }
     /// Borrow trusted business SQL. The connection cannot escape the callback. This is not a
     /// SQL sandbox: transaction control and changing tenant/session settings are forbidden.

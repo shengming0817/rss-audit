@@ -115,7 +115,7 @@ impl PreparedAuditV1 {
         Ok(AppendRequest::new(
             LedgerId::new(identity.tenant(), ChainId::parse(AUDIT_CHAIN_ID)?),
             audit_record_id(identity.source().source_id(), identity.event_id())?,
-            self.canonical_bytes().to_vec(),
+            self.shared_bytes(),
         )?)
     }
     /// Compare an authenticated entry with the exact audit bytes and identity.

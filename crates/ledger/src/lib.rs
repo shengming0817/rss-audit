@@ -4,7 +4,7 @@
 mod model;
 mod protocol;
 pub use model::*;
-pub use protocol::{Authenticator, Verification};
+pub use protocol::{Authenticator, ChainAppender, Verification};
 
 /// Closed protocol errors; never include payload, identifiers or key material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

@@ -522,7 +522,7 @@ async fn definer_scope(
 ) -> anyhow::Result<()> {
     for statement in [
         "SELECT rss_ledger.prepare_append($1::uuid,'cross-sql','fixture-key',1::smallint)",
-        "SELECT rss_ledger.insert_entry($1::uuid,'cross-sql','r',0,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),''::bytea,'fixture-key',1::smallint)",
+        "SELECT rss_ledger.insert_entries($1::uuid,'cross-sql','fixture-key',1::smallint,ARRAY['r'],ARRAY[0::bigint],ARRAY[decode(repeat('00',32),'hex')],ARRAY[decode(repeat('00',32),'hex')],ARRAY[''::bytea])",
     ] {
         let result: LocalTxAttempt<Committed<()>, Error> = store
             .local_tx(TenantId::parse(TENANT)?, control, move |tx| {

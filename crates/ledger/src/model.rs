@@ -129,18 +129,19 @@ impl std::fmt::Debug for AuthenticationTag {
 pub struct AppendRequest {
     ledger: LedgerId,
     record_id: RecordId,
-    payload: Box<[u8]>,
+    payload: bytes::Bytes,
 }
 impl AppendRequest {
     /// Validate bounded input without changing any payload bytes.
-    pub fn new(ledger: LedgerId, record_id: RecordId, payload: Vec<u8>) -> Result<Self, Error> {
+    pub fn new(ledger: LedgerId, record_id: RecordId, payload: impl Into<bytes::Bytes>) -> Result<Self, Error> {
+        let payload = payload.into();
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(Error::InvalidInput);
         }
         Ok(Self {
             ledger,
             record_id,
-            payload: payload.into_boxed_slice(),
+            payload,
         })
     }
     /// Ledger identity.
@@ -167,7 +168,7 @@ pub struct Entry {
     request: AppendRequest,
     sequence: Sequence,
     previous_tag: AuthenticationTag,
-    tag: AuthenticationTag,
+    pub(crate) tag: AuthenticationTag,
     encoding: EncodingVersion,
     key_id: KeyId,
 }
