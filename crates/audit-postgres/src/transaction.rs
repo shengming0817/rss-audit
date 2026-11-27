@@ -165,7 +165,10 @@ impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
         let batch = self
             .write_budget
             .ok_or(Error::StorageContract)?
-            .try_admit(std::slice::from_ref(request))?;
+            .try_with_held(
+                std::slice::from_ref(request),
+                self.held.as_ref().map_or(0, |held| held.num_permits()),
+            )?;
         self.append_admitted(batch)
             .await?
             .pop()

@@ -197,3 +197,9 @@ budget.append_batch_in(message_tx, integrity, batch).await?;
 When PostgreSQL supplies the recording time via `PgAudit::prepare`, that method obtains
 its own preparation capacity, releases the connection after the clock query, and returns
 the retry record. Use it without an outstanding reservation for the same input.
+
+The write budget rejects configuration whose row/byte maxima could exceed a PostgreSQL
+Bind frame, including repeated source/event strings, array elements and framing. Aggregate
+in-flight capacity is configured separately. When an owned transaction already retains
+enough bytes to make its next append impossible even in an otherwise idle domain, the
+append reports `WriteLimit`. Another writer's temporary occupation reports `WriteBusy`.

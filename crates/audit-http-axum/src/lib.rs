@@ -113,7 +113,10 @@ where
                 .await
         }
         SelfAudit::Required(prepared) => {
-            let batch = match app.pg.try_admit(std::slice::from_ref(&prepared)) {
+            let batch = match control
+                .check(rss_transactional_messaging::transaction::LocalTxDeadlineStage::Acquire)
+                .and_then(|()| app.pg.try_admit(std::slice::from_ref(&prepared)))
+            {
                 Ok(batch) => batch,
                 Err(e) => {
                     return error::settle(

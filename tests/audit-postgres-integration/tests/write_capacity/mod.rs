@@ -24,6 +24,7 @@ pub(super) async fn run(
         batch_limits(&pg, &capacity, &rows, bytes, control).await?;
         late_conflict(pool, &pg, t, source, control).await?;
     }
+    owner_capacity(pool, control).await?;
     interrupted_stage(pool, admin, control).await?;
     corrupted_replay(pool, admin, control).await?;
     Ok(())
@@ -226,50 +227,80 @@ pub(super) async fn measure(pool: &PgPool, control: &Control<'_, TestClock>) -> 
     let limit = u32::try_from(MAX_RECORD_BYTES)?;
     let capacity = WriteBudget::new(8, limit, limit)?;
     let store = PgAudit::new(pool.clone(), Integrity::Plain, capacity.clone(), control).await?;
-    let granted = capacity.reserve(1, MAX_RECORD_BYTES, control).await?;
-    let rows = [prepare(
-        event(t, "pressure", "large", vec![0; MAX_RECORD_BYTES - size])?,
-        at,
-    )?];
-    let admitted = granted.bind(&rows)?;
-    let small_len = canonical_len(&event(t, "pressure", "small", vec![0; 32])?)? * 8;
-    use sqlx::Acquire;
-    let lease = Instant::now();
-    let mut conn = pool.acquire().await?;
-    let begin = lease.elapsed();
-    let hold = Instant::now();
-    let mut tx = conn.begin().await?;
-    let checked_out = || pool.size() as usize - pool.num_idle();
-    let before = checked_out();
-    let mut pending = Box::pin(capacity.reserve(8, small_len, control));
-    let start = Instant::now();
-    assert!(pending.as_mut().now_or_never().is_none());
-    let with_waiter = checked_out();
-    assert_eq!(before, with_waiter);
-    sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
-        .bind(t.to_string())
-        .execute(&mut *tx)
+    let small_bytes = canonical_len(&event(t, "pressure", "small-0", vec![0; 32])?)? * 8;
+    let ready = tokio::sync::Notify::new();
+    let polled = tokio::sync::Notify::new();
+    let large = async {
+        use sqlx::Acquire;
+        let grant = capacity.reserve(1, MAX_RECORD_BYTES, control).await?;
+        let rows = [prepare(
+            event(t, "pressure", "large", vec![0; MAX_RECORD_BYTES - size])?,
+            at,
+        )?];
+        let batch = grant.bind(&rows)?;
+        let start = Instant::now();
+        let mut conn = pool.acquire().await?;
+        let checkout = start.elapsed();
+        let hold = Instant::now();
+        let mut tx = conn.begin().await?;
+        set_tenant(&mut tx, t).await?;
+        let before = pool.size() as usize - pool.num_idle();
+        ready.notify_one();
+        polled.notified().await;
+        let waiting = pool.size() as usize - pool.num_idle();
+        assert_eq!(before, waiting);
+        assert!(
+            store
+                .append_batch_in_transaction(&mut tx, batch, control)
+                .await?[0]
+                .inserted()
+        );
+        tx.rollback().await?;
+        drop(conn);
+        Ok::<_, anyhow::Error>((checkout, hold.elapsed(), before, waiting))
+    };
+    let small = async {
+        use std::{
+            future::{Future, poll_fn},
+            pin::pin,
+        };
+        ready.notified().await;
+        let start = Instant::now();
+        let mut reserve = pin!(capacity.reserve(8, small_bytes, control));
+        let next = poll_fn(|cx| {
+            let result = reserve.as_mut().poll(cx);
+            if result.is_pending() {
+                polled.notify_one();
+            }
+            result
+        })
         .await?;
-    store
-        .append_batch_in_transaction(&mut tx, admitted, control)
-        .await?;
-    let next = pending.await?;
-    let waited = start.elapsed();
-    tx.rollback().await?;
-    drop(conn);
-    let large_hold = hold.elapsed();
-    let (second_begin, second_held) = stage_small(pool, &store, next, t, at, control).await?;
+        let waited = start.elapsed();
+        let (checkout, held) = stage_small(pool, &store, next, t, at, control).await?;
+        Ok::<_, anyhow::Error>((waited, checkout, held))
+    };
+    let ((large_checkout, large_hold, before, waiting), (waited, small_checkout, small_hold)) =
+        tokio::try_join!(large, small)?;
     eprintln!(
-        "PRESSURE logical_peak={limit} small_bytes={small_len} queued=1 occupied_before={before} occupied_waiting={with_waiter} wait_us={} large_checkout_us={} large_hold_us={} small_checkout_us={} small_hold_us={}",
+        "PRESSURE physical_small=8 logical_peak={limit} small_bytes={small_bytes} queued=1 occupied_before={before} occupied_waiting={waiting} wait_us={} large_checkout_us={} large_hold_us={} small_checkout_us={} small_hold_us={}",
         waited.as_micros(),
-        begin.as_micros(),
+        large_checkout.as_micros(),
         large_hold.as_micros(),
-        second_begin.as_micros(),
-        second_held.as_micros()
+        small_checkout.as_micros(),
+        small_hold.as_micros()
     );
     Ok(())
 }
-
+async fn set_tenant(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    t: TenantId,
+) -> anyhow::Result<()> {
+    sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
+        .bind(t.to_string())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
 async fn stage_small(
     pool: &PgPool,
     store: &PgAudit,
@@ -279,23 +310,28 @@ async fn stage_small(
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<(Duration, Duration)> {
     use sqlx::Acquire;
-    let small = vec![prepare(event(t, "pressure", "small", vec![0; 32])?, at)?; 8];
-    let batch = next.bind(&small)?;
-    let second = Instant::now();
+    let rows = (0..8)
+        .map(|i| -> anyhow::Result<_> {
+            Ok(prepare(
+                event(t, "pressure", &format!("small-{i}"), vec![0; 32])?,
+                at,
+            )?)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let batch = next.bind(&rows)?;
+    let start = Instant::now();
     let mut conn = pool.acquire().await?;
-    let second_begin = second.elapsed();
-    let second_hold = Instant::now();
+    let checkout = start.elapsed();
+    let hold = Instant::now();
     let mut tx = conn.begin().await?;
-    sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
-        .bind(t.to_string())
-        .execute(&mut *tx)
-        .await?;
-    store
+    set_tenant(&mut tx, t).await?;
+    let receipts = store
         .append_batch_in_transaction(&mut tx, batch, control)
         .await?;
+    assert_eq!(receipts.iter().filter(|r| r.inserted()).count(), 8);
     tx.rollback().await?;
     drop(conn);
-    Ok((second_begin, second_hold.elapsed()))
+    Ok((checkout, hold.elapsed()))
 }
 
 async fn corrupted_replay(
@@ -321,6 +357,24 @@ async fn corrupted_replay(
         rolled_back(store.append(&short, control).await, |e| {
             matches!(e, Error::StorageContract)
         });
+    }
+    let other = prepare(event(t, "corrupt", "other", vec![7; 100_000])?, at)?;
+    committed(store.append(&other, control).await)?;
+    let input = [short, prepare(event(t, "corrupt", "other", vec![])?, at)?];
+    for (good, bad) in [(&long, &other), (&other, &long)] {
+        for (record, bytes) in [(good, good.canonical_bytes()), (bad, &[1u8][..])] {
+            sqlx::query("UPDATE rss_audit.records SET canonical=$1 WHERE tenant_id=$2::uuid AND event_id=$3")
+                .bind(bytes).bind(t.to_string()).bind(record.identity().event_id().as_str()).execute(admin).await?;
+        }
+        let mut tx = pool.begin().await?;
+        set_tenant(&mut tx, t).await?;
+        assert!(matches!(
+            store
+                .append_batch_in_transaction(&mut tx, store.try_admit(&input)?, control)
+                .await,
+            Err(Error::StorageContract)
+        ));
+        tx.rollback().await?;
     }
     Ok(())
 }
@@ -413,5 +467,35 @@ async fn interrupted_stage(
         )
     });
     budget.try_admit(std::slice::from_ref(&record))?;
+    Ok(())
+}
+
+async fn owner_capacity(pool: &PgPool, control: &Control<'_, TestClock>) -> anyhow::Result<()> {
+    let t = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d518")?;
+    let row = prepare(
+        event(t, "capacity", "owned", vec![])?,
+        Timepoint::try_from(456_i64)?,
+    )?;
+    let bytes = u32::try_from(row.canonical_bytes().len())?;
+    let budget = WriteBudget::new(1, bytes, bytes)?;
+    let store = PgAudit::new(pool.clone(), Integrity::Plain, budget.clone(), control).await?;
+    let run = |retain: bool| {
+        store.write_tx_with_context(t, control, &row, move |row, tx| {
+            Box::pin(async move {
+                if retain {
+                    tx.append(row).await?;
+                }
+                tx.append(row).await?;
+                Ok::<_, Error>(())
+            })
+        })
+    };
+    rolled_back(run(true).await, |e| {
+        matches!(e, TransactionError::Operation(Error::WriteLimit))
+    });
+    let _elsewhere = budget.try_admit(std::slice::from_ref(&row))?;
+    rolled_back(run(false).await, |e| {
+        matches!(e, TransactionError::Operation(Error::WriteBusy))
+    });
     Ok(())
 }

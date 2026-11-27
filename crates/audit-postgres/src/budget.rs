@@ -13,6 +13,7 @@ pub struct WriteBudget {
     rows: usize,
     bytes: u32,
     capacity: Arc<Semaphore>,
+    total: usize,
 }
 impl WriteBudget {
     /// All limits are positive; a legal batch must fit in the shared capacity.
@@ -24,7 +25,9 @@ impl WriteBudget {
         {
             return Err(Error::WriteLimit);
         }
+        check_bind_limit(rows, bytes as usize)?;
         Ok(Self {
+            total: in_flight_bytes as usize,
             rows,
             bytes,
             capacity: Arc::new(Semaphore::new(in_flight_bytes as usize)),
@@ -93,7 +96,16 @@ impl WriteBudget {
         &self,
         records: &'a [PreparedAuditV1],
     ) -> Result<AdmittedBatch<'a>, Error> {
+        self.try_with_held(records, 0)
+    }
+
+    pub(crate) fn try_with_held<'a>(
+        &self,
+        records: &'a [PreparedAuditV1],
+        held: usize,
+    ) -> Result<AdmittedBatch<'a>, Error> {
         let (bytes, tenant) = dimensions(records, self.rows, self.bytes as usize)?;
+        add_length(held, bytes, self.total)?;
         let reservation = self.try_reserve(records.len(), bytes)?;
         Ok(AdmittedBatch {
             records,
@@ -144,6 +156,23 @@ impl AdmittedBatch<'_> {
     }
 }
 
+// Bound the largest Bind we can produce at the configured maxima. The six
+// arguments are tenant text and five one-dimensional arrays. 256 covers names,
+// formats, length words, the UUID and five 20-byte array headers. Each row adds
+// five element lengths, two int8 values and both text IDs outside its canonical.
+// ref: postgres src/include/libpq/libpq.h (PQ_LARGE_MESSAGE_LIMIT = MaxAllocSize - 1)
+// ref: sqlx-postgres/src/message/bind.rs and types/array.rs@v0.9.0
+const MAX_BIND: usize = (1 << 30) - 2;
+const FIXED_BIND: usize = 256;
+const ROW_BIND: usize =
+    5 * 4 + 2 * 8 + rss_audit_core::SourceId::MAX_BYTES + rss_audit_core::EventId::MAX_BYTES;
+fn check_bind_limit(rows: usize, canonical: usize) -> Result<(), Error> {
+    let elements = rows.checked_mul(ROW_BIND).ok_or(Error::WriteLimit)?;
+    let envelope = add_length(FIXED_BIND, elements, MAX_BIND)?;
+    add_length(envelope, canonical, MAX_BIND)?;
+    Ok(())
+}
+
 fn add_length(total: usize, next: usize, max: usize) -> Result<usize, Error> {
     total
         .checked_add(next)
@@ -171,6 +200,22 @@ fn dimensions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bind_framing_limits_a_batch_before_it_can_reserve_capacity() -> anyhow::Result<()> {
+        let rows = 1_100_000;
+        let bytes = u32::try_from(MAX_BIND - FIXED_BIND - rows * ROW_BIND)?;
+        let total = u32::try_from((Semaphore::MAX_PERMITS).min(u32::MAX as usize))?;
+        WriteBudget::new(rows, bytes, total)?;
+        assert!(matches!(
+            WriteBudget::new(rows, bytes + 1, total),
+            Err(Error::WriteLimit)
+        ));
+        assert!(matches!(
+            check_bind_limit(usize::MAX, 1),
+            Err(Error::WriteLimit)
+        ));
+        Ok(())
+    }
     #[test]
     fn rejects_overflow_and_individually_impossible_requests() -> anyhow::Result<()> {
         let budget = WriteBudget::new(8, 64, 128)?;

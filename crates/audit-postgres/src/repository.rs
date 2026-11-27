@@ -1,4 +1,5 @@
 use crate::{Cursor, Error, Page, ReadLimit, Record, StagedAppend, probe};
+use futures::TryStreamExt;
 use rss_audit_core::PreparedAuditV1;
 use rss_request_context::TenantId;
 use sqlx::{PgConnection, Row, postgres::PgRow};
@@ -77,28 +78,34 @@ pub(crate) async fn append_batch(
     let mut inserted: BTreeSet<_> = inserted.into_iter().collect();
     // A new READ COMMITTED snapshot sees competing inserts waited for by ON CONFLICT.
     // Stronger isolation may instead report serialization failure; only the host retries.
-    let rows = sqlx::query("SELECT r.tenant_id::text,r.source_id,r.event_id,r.position,r.recorded_at,CASE WHEN octet_length(r.canonical)<=i.bytes THEN r.canonical END AS canonical,r.ledger_sequence FROM rss_audit.records r JOIN unnest($2::text[],$3::text[],$4::integer[]) AS i(source_id,event_id,bytes) ON r.source_id=i.source_id AND r.event_id=i.event_id WHERE r.tenant_id=$1::uuid")
-        .bind(tenant.to_string()).bind(sources).bind(events).bind(lengths).fetch_all(&mut *c).await?;
+    let mut rows = sqlx::query(include_str!("append_readback.sql"))
+        .bind(tenant.to_string())
+        .bind(sources)
+        .bind(events)
+        .bind(lengths)
+        .bind(i32::try_from(rss_audit_core::MAX_HEADER_BYTES).map_err(|_| Error::StorageContract)?)
+        .fetch(c);
     let mut records = BTreeMap::new();
-    for row in rows {
-        if row.try_get::<Option<&[u8]>, _>("canonical")?.is_none() {
-            // Diagnose only the first oversized conflict. Its opaque payload never
-            // has to cross the wire to validate V1 framing and stored coordinates.
-            let (prefix, len): (Vec<u8>, i32) = sqlx::query_as(
-                "SELECT substring(canonical FROM 1 FOR $3),octet_length(canonical) FROM rss_audit.records WHERE tenant_id=$1::uuid AND position=$2"
-            ).bind(tenant.to_string()).bind(row.try_get::<i64,_>("position")?)
-             .bind(i32::try_from(rss_audit_core::MAX_HEADER_BYTES).map_err(|_|Error::StorageContract)?)
-             .fetch_optional(&mut *c).await?.ok_or(Error::StorageContract)?;
-            let (identity, at) = rss_audit_core::inspect_canonical_header(
-                &prefix,
-                usize::try_from(len).map_err(|_| Error::StorageContract)?,
-            )
-            .map_err(|_| Error::StorageContract)?;
+    let mut oversized = 0usize;
+    while let Some(row) = rows.try_next().await? {
+        if row.try_get("oversized")? {
+            let prefix: &[u8] = row.try_get("canonical")?;
+            let len = usize::try_from(row.try_get::<i32, _>("stored_bytes")?)
+                .map_err(|_| Error::StorageContract)?;
+            let (identity, at) = rss_audit_core::inspect_canonical_header(prefix, len)
+                .map_err(|_| Error::StorageContract)?;
             coordinates(&row, tenant, &identity, at)?;
-            return Err(Error::Conflict);
+            oversized += 1;
+        } else {
+            let record = decode(&row, tenant)?;
+            records.insert(key(record.prepared()), record);
         }
-        let record = decode(&row, tenant)?;
-        records.insert(key(record.prepared()), record);
+    }
+    if records.len() + oversized != unique.len() {
+        return Err(Error::StorageContract);
+    }
+    if oversized != 0 {
+        return Err(Error::Conflict);
     }
     let mut result = Vec::with_capacity(requests.len());
     for (request, expected) in requests.iter().zip(ledger) {

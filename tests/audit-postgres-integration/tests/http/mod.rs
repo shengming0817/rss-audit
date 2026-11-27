@@ -1,3 +1,4 @@
+mod interrupt_admission;
 mod measurement;
 use super::*;
 use axum::{
@@ -132,6 +133,7 @@ pub(super) async fn run(
     corruption(&app, admin, tenant, &cancel).await?;
     interruptions(pg, admin, other, false).await?;
     interruptions(pg, admin, other, true).await?;
+    interrupt_admission::run(pool, tenant, control).await?;
     capacity(pg, ledger, pool, admin, control).await?;
     unavailable(pool, other, &cancel, control).await?;
     Ok(())
