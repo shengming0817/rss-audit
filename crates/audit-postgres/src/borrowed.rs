@@ -49,32 +49,29 @@ pub(crate) async fn append_batch<T: ExecutionTimer>(
     control: &Control<'_, T>,
 ) -> Result<Vec<StagedAppend>, Error> {
     control.check(Stage::Operation)?;
-    let requests = batch.records;
-    if requests.is_empty() {
+    let Some(tenant) = batch.tenant else {
         return Ok(Vec::new());
-    }
+    };
     control
         .run(Stage::Operation, async {
-            let mut ledger = Vec::with_capacity(requests.len());
-            for request in requests {
-                let entry = match integrity {
-                    Integrity::Plain => None,
-                    #[cfg(feature = "ledger")]
-                    Integrity::Ledger(auth) => {
-                        let clock = crate::control::LedgerClock(control.timer, control.timer.now());
-                        let budget = clock.budget(control, Stage::Operation);
-                        let mapped = request.append_request()?;
-                        let staged =
-                            rss_ledger_postgres::append_in_transaction(tx, auth, &mapped, &budget)
-                                .await?;
-                        Some((staged.entry().sequence().get(), staged.inserted()))
-                    }
-                };
-                #[cfg(not(feature = "ledger"))]
-                let _ = request;
-                ledger.push(entry);
-            }
-            repository::append_batch(tx, batch, &ledger).await
+            let input = crate::append::Batch::new(batch.records)?;
+            let ledger: Option<Vec<(u64, bool)>> = match integrity {
+                Integrity::Plain => None,
+                #[cfg(feature = "ledger")]
+                Integrity::Ledger(auth) => {
+                    let clock = crate::control::LedgerClock(control.timer, control.timer.now());
+                    let budget = clock.budget(control, Stage::Operation);
+                    let positions = rss_ledger_postgres::append_batch_in_transaction(
+                        tx,
+                        auth,
+                        &input.ledger_requests()?,
+                        &budget,
+                    )
+                    .await?;
+                    Some(crate::append::coordinates(positions))
+                }
+            };
+            repository::append_batch(tx, tenant, &input, ledger.as_deref()).await
         })
         .await
 }

@@ -51,12 +51,26 @@ pub async fn append_in_transaction<T: Timer>(
 
 /// Append one same-chain batch in input order and return its staged sequence and insertion flags.
 pub async fn append_batch_in_transaction<T: Timer>(
-    tx: &mut Transaction<'_, Postgres>, auth: &Authenticator, requests: &[AppendRequest], control: &Control<'_, T>,
-) -> Result<Vec<(Sequence,bool)>, Error> {
-    control.run_stage(LocalTxDeadlineStage::Operation, append_positions(tx, auth, requests)).await
+    tx: &mut Transaction<'_, Postgres>,
+    auth: &Authenticator,
+    requests: &[AppendRequest],
+    control: &Control<'_, T>,
+) -> Result<Vec<(Sequence, bool)>, Error> {
+    control
+        .run_stage(
+            LocalTxDeadlineStage::Operation,
+            append_positions(tx, auth, requests),
+        )
+        .await
 }
-pub(crate) async fn append_positions(c: &mut PgConnection,auth: &Authenticator, requests: &[AppendRequest]) -> Result<Vec<(Sequence,bool)>,Error> {
-    if let Some(first) = requests.first() { validate(c, first.ledger().tenant()).await?; }
+pub(crate) async fn append_positions(
+    c: &mut PgConnection,
+    auth: &Authenticator,
+    requests: &[AppendRequest],
+) -> Result<Vec<(Sequence, bool)>, Error> {
+    if let Some(first) = requests.first() {
+        validate(c, first.ledger().tenant()).await?;
+    }
     crate::append::positions(c, auth, requests).await
 }
 

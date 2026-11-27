@@ -19,6 +19,8 @@ use std::{
 use tokio_util::sync::CancellationToken;
 mod admission;
 mod atomicity;
+mod batch;
+mod batch_cost;
 mod composition;
 mod http;
 mod ledger_index;
@@ -128,7 +130,14 @@ async fn audit_measurement() -> anyhow::Result<()> {
 async fn audit_write_pressure() -> anyhow::Result<()> {
     run(Workload::Pressure).await
 }
+#[tokio::test]
+#[ignore = "release-mode batch cost comparison"]
+async fn audit_batch_cost() -> anyhow::Result<()> {
+    run(Workload::BatchCost).await
+}
+
 enum Workload {
+    BatchCost,
     Acceptance,
     Pages,
     Pressure,
@@ -176,6 +185,7 @@ async fn run(workload: Workload) -> anyhow::Result<()> {
         .await
         .context("ledger startup")?;
     match workload {
+        Workload::BatchCost => batch_cost::measure(&plain, &ledger, &pool, &control).await?,
         Workload::Pages => http::measure(&plain, &ledger, &pool, &control).await?,
         Workload::Pressure => write_capacity::measure(&pool, &control).await?,
         Workload::Acceptance => {
@@ -200,6 +210,7 @@ async fn exercise(
     query_cost::run(pool, admin, control)
         .await
         .context("query_cost::run")?;
+    batch::semantics(plain, ledger, pool, admin, control).await?;
     basic(plain, ledger, control).await.context("basic")?;
     atomicity::run(plain, ledger, admin, control)
         .await

@@ -133,7 +133,11 @@ pub struct AppendRequest {
 }
 impl AppendRequest {
     /// Validate bounded input without changing any payload bytes.
-    pub fn new(ledger: LedgerId, record_id: RecordId, payload: impl Into<bytes::Bytes>) -> Result<Self, Error> {
+    pub fn new(
+        ledger: LedgerId,
+        record_id: RecordId,
+        payload: impl Into<bytes::Bytes>,
+    ) -> Result<Self, Error> {
         let payload = payload.into();
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(Error::InvalidInput);

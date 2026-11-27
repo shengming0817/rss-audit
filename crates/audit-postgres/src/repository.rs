@@ -16,7 +16,7 @@ pub(crate) async fn recording_time(c: &mut PgConnection) -> Result<rss_contract:
 pub(crate) async fn append_batch(
     c: &mut PgConnection,
     tenant: TenantId,
-    batch: crate::append::Batch<'_>,
+    batch: &crate::append::Batch<'_>,
     ledger: Option<&[(u64, bool)]>,
 ) -> Result<Vec<StagedAppend>, Error> {
     let count = batch.unique.len();
@@ -33,29 +33,43 @@ pub(crate) async fn append_batch(
         events.push(request.identity().event_id().as_str());
         recorded.push(request.recorded_at().unix_seconds());
         canonical.push(request.canonical_bytes());
-        sequences.push(ledger.map(|entries| i64::try_from(entries[slot].0))
-            .transpose().map_err(|_| Error::StorageContract)?);
+        sequences.push(
+            ledger
+                .map(|entries| i64::try_from(entries[slot].0))
+                .transpose()
+                .map_err(|_| Error::StorageContract)?,
+        );
     }
-    let inserted: Vec<(String, String,i64)> = sqlx::query_as(
+    let inserted: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT source_id,event_id,position FROM rss_audit.append_batch($1::uuid,$2,$3,$4,$5,$6)",
     )
-    .bind(tenant.to_string()).bind(sources).bind(events).bind(recorded).bind(canonical).bind(sequences)
-    .fetch_all(&mut *c).await?;
+    .bind(tenant.to_string())
+    .bind(sources)
+    .bind(events)
+    .bind(recorded)
+    .bind(canonical)
+    .bind(sequences)
+    .fetch_all(&mut *c)
+    .await?;
     let mut stored = vec![None; count];
     let fresh = inserted.len();
     for (source, event, position) in inserted {
         let slot = batch.slot(&source, &event)?;
-        if position < 0 || stored[slot].is_some() || ledger.is_some_and(|entries| !entries[slot].1) {
+        if position < 0 || stored[slot].is_some() || ledger.is_some_and(|entries| !entries[slot].1)
+        {
             return Err(Error::StorageContract);
         }
-        stored[slot] = Some((Record {
-            position,
-            prepared: batch.unique[slot].clone(),
-            ledger_sequence: ledger.map(|entries| entries[slot].0),
-        }, true));
+        stored[slot] = Some((
+            Record {
+                position,
+                prepared: batch.unique[slot].clone(),
+                ledger_sequence: ledger.map(|entries| entries[slot].0),
+            },
+            true,
+        ));
     }
     if fresh < count {
-        read_replays(c, tenant, &batch, ledger, &mut stored).await?;
+        read_replays(c, tenant, batch, ledger, &mut stored).await?;
     }
     batch.receipts(stored)
 }
@@ -63,9 +77,12 @@ pub(crate) async fn append_batch(
 // A separate READ COMMITTED statement sees the winner after an INSERT waited on its key.
 // Stream and validate every historical row before reporting an ordinary replay conflict.
 async fn read_replays(
-    c: &mut PgConnection, tenant: TenantId, batch: &crate::append::Batch<'_>,
-    ledger: Option<&[(u64, bool)]>, stored: &mut [Option<(Record, bool)>],
-) -> Result<(),Error> {
+    c: &mut PgConnection,
+    tenant: TenantId,
+    batch: &crate::append::Batch<'_>,
+    ledger: Option<&[(u64, bool)]>,
+    stored: &mut [Option<(Record, bool)>],
+) -> Result<(), Error> {
     let mut sources = Vec::new();
     let mut events = Vec::new();
     let mut lengths = Vec::new();
@@ -73,36 +90,61 @@ async fn read_replays(
         if stored[slot].is_none() {
             sources.push(request.identity().source().source_id().as_str());
             events.push(request.identity().event_id().as_str());
-            lengths.push(i32::try_from(request.canonical_bytes().len()).map_err(|_| Error::StorageContract)?);
+            lengths.push(
+                i32::try_from(request.canonical_bytes().len())
+                    .map_err(|_| Error::StorageContract)?,
+            );
         }
     }
     let mut rows = sqlx::query(include_str!("append_readback.sql"))
-        .bind(tenant.to_string()).bind(sources).bind(events).bind(lengths)
+        .bind(tenant.to_string())
+        .bind(sources)
+        .bind(events)
+        .bind(lengths)
         .bind(i32::try_from(rss_audit_core::MAX_HEADER_BYTES).map_err(|_| Error::StorageContract)?)
         .fetch(c);
     let mut conflict = false;
     while let Some(row) = rows.try_next().await? {
-        let slot = batch.slot(row.try_get("source_id")?,row.try_get("event_id")?)?;
-        if stored[slot].is_some() { return Err(Error::StorageContract); }
+        let slot = batch.slot(row.try_get("source_id")?, row.try_get("event_id")?)?;
+        if stored[slot].is_some() {
+            return Err(Error::StorageContract);
+        }
         let request = batch.unique[slot];
         let bytes: &[u8] = row.try_get("canonical")?;
-        let same = !row.try_get::<bool,_>("oversized")? && bytes == request.canonical_bytes();
+        #[cfg(feature = "integration")]
+        tracing::trace!(target: "batch_cost::audit_body", bytes = bytes.len() as u64);
+        let same = !row.try_get::<bool, _>("oversized")? && bytes == request.canonical_bytes();
         let (position, sequence) = if same {
             coordinates(&row, tenant, request.identity(), request.recorded_at())?
         } else {
-            let len = usize::try_from(row.try_get::<i32,_>("stored_bytes")?).map_err(|_| Error::StorageContract)?;
-            let (identity, at) = rss_audit_core::inspect_canonical_header(bytes,len).map_err(|_| Error::StorageContract)?;
+            let len = usize::try_from(row.try_get::<i32, _>("stored_bytes")?)
+                .map_err(|_| Error::StorageContract)?;
+            let (identity, at) = rss_audit_core::inspect_canonical_header(bytes, len)
+                .map_err(|_| Error::StorageContract)?;
             coordinates(&row, tenant, &identity, at)?
         };
         if !same || sequence.is_some() != ledger.is_some() {
             conflict = true;
-        } else if ledger.is_some_and(|entries| entries[slot] != (sequence.unwrap_or_default(), false)) {
+        } else if let (Some(entries), Some(seq)) = (ledger, sequence)
+            && entries[slot] != (seq, false)
+        {
             return Err(Error::StorageContract);
         }
-        stored[slot] = Some((Record { position, prepared: request.clone(), ledger_sequence: sequence }, false));
+        stored[slot] = Some((
+            Record {
+                position,
+                prepared: request.clone(),
+                ledger_sequence: sequence,
+            },
+            false,
+        ));
     }
-    if stored.iter().any(Option::is_none) { return Err(Error::StorageContract); }
-    if conflict { return Err(Error::Conflict); }
+    if stored.iter().any(Option::is_none) {
+        return Err(Error::StorageContract);
+    }
+    if conflict {
+        return Err(Error::Conflict);
+    }
     Ok(())
 }
 
@@ -193,4 +235,3 @@ pub(crate) async fn page(
         .transpose()?;
     Ok(Page { records, next })
 }
-

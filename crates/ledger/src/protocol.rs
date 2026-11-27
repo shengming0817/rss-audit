@@ -56,6 +56,8 @@ impl Authenticator {
     }
     /// Authenticate one entry; this alone says nothing about its position in a complete chain.
     pub fn verify(&self, entry: &Entry) -> Result<(), Error> {
+        #[cfg(feature = "integration")]
+        tracing::trace!(target: "batch_cost::verify", "verify");
         self.mac(entry)?
             .verify_slice(entry.tag().as_bytes())
             .map_err(|_| Error::Authentication)
@@ -69,12 +71,22 @@ impl Authenticator {
         self.appender(request.ledger(), previous)?.append(request)
     }
     /// Start a same-chain signer from genesis or an authenticated predecessor.
-    pub fn appender<'a>(&'a self, ledger: &'a LedgerId, previous: Option<&Entry>) -> Result<ChainAppender<'a>,Error> {
+    pub fn appender<'a>(
+        &'a self,
+        ledger: &'a LedgerId,
+        previous: Option<&Entry>,
+    ) -> Result<ChainAppender<'a>, Error> {
         if let Some(entry) = previous {
-            if entry.ledger() != ledger { return Err(Error::ScopeMismatch); }
+            if entry.ledger() != ledger {
+                return Err(Error::ScopeMismatch);
+            }
             self.verify(entry)?;
         }
-        Ok(ChainAppender { auth: self, ledger, tail: previous.map(|entry| (entry.sequence(), entry.tag())) })
+        Ok(ChainAppender {
+            auth: self,
+            ledger,
+            tail: previous.map(|entry| (entry.sequence(), entry.tag())),
+        })
     }
     /// Verify from genesis through all supplied entries, without proving absence of truncation.
     pub fn verify_chain(
@@ -130,17 +142,30 @@ pub struct ChainAppender<'a> {
 }
 impl ChainAppender<'_> {
     /// Last sequence already authenticated or signed by this appender.
-    pub fn sequence(&self) -> Option<Sequence> { self.tail.map(|(seq,_)|seq) }
+    pub fn sequence(&self) -> Option<Sequence> {
+        self.tail.map(|(seq, _)| seq)
+    }
     /// Produce one authenticated link. Only successful signing advances the local tail.
-    pub fn append(&mut self, request: &AppendRequest) -> Result<Entry,Error> {
-        if request.ledger() != self.ledger { return Err(Error::ScopeMismatch); }
+    pub fn append(&mut self, request: &AppendRequest) -> Result<Entry, Error> {
+        if request.ledger() != self.ledger {
+            return Err(Error::ScopeMismatch);
+        }
         let (sequence, previous) = match self.tail {
-            Some((seq,tag)) => (seq.next()?,tag),
+            Some((seq, tag)) => (seq.next()?, tag),
             None => (Sequence::new(0), AuthenticationTag::genesis()),
         };
-        let mut entry = Entry::from_parts(request.clone(),sequence,previous,AuthenticationTag::genesis(),EncodingVersion::V1,self.auth.key_id.clone());
+        let mut entry = Entry::from_parts(
+            request.clone(),
+            sequence,
+            previous,
+            AuthenticationTag::genesis(),
+            EncodingVersion::V1,
+            self.auth.key_id.clone(),
+        );
+        #[cfg(feature = "integration")]
+        tracing::trace!(target: "batch_cost::sign", "sign");
         entry.tag = AuthenticationTag::new(self.auth.mac(&entry)?.finalize().into_bytes().into());
-        self.tail = Some((sequence,entry.tag()));
+        self.tail = Some((sequence, entry.tag()));
         Ok(entry)
     }
 }

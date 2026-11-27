@@ -13,7 +13,11 @@ pub(crate) struct Batch<'a> {
 
 impl<'a> Batch<'a> {
     pub(crate) fn new(records: &'a [PreparedAuditV1]) -> Result<Self, Error> {
-        let mut batch = Self { unique: Vec::new(), slots: BTreeMap::new(), order: Vec::with_capacity(records.len()) };
+        let mut batch = Self {
+            unique: Vec::new(),
+            slots: BTreeMap::new(),
+            order: Vec::with_capacity(records.len()),
+        };
         for record in records {
             let id = record.identity();
             let key = (id.source().source_id().as_str(), id.event_id().as_str());
@@ -38,18 +42,42 @@ impl<'a> Batch<'a> {
     }
 
     pub(crate) fn slot(&self, source: &str, event: &str) -> Result<usize, Error> {
-        self.slots.get(&(source, event)).copied().ok_or(Error::StorageContract)
+        self.slots
+            .get(&(source, event))
+            .copied()
+            .ok_or(Error::StorageContract)
     }
 
     #[cfg(feature = "ledger")]
     pub(crate) fn ledger_requests(&self) -> Result<Vec<rss_ledger::AppendRequest>, Error> {
-        self.unique.iter().map(|record| Ok(record.append_request()?)).collect()
+        self.unique
+            .iter()
+            .map(|record| Ok(record.append_request()?))
+            .collect()
     }
 
-    pub(crate) fn receipts(self, mut stored: Vec<Option<(Record, bool)>>) -> Result<Vec<StagedAppend>, Error> {
-        self.order.into_iter().map(|slot| {
-            let (record, inserted) = stored[slot].as_mut().ok_or(Error::StorageContract)?;
-            Ok(StagedAppend { record: record.clone(), inserted: std::mem::take(inserted) })
-        }).collect()
+    pub(crate) fn receipts(
+        &self,
+        mut stored: Vec<Option<(Record, bool)>>,
+    ) -> Result<Vec<StagedAppend>, Error> {
+        self.order
+            .iter()
+            .copied()
+            .map(|slot| {
+                let (record, inserted) = stored[slot].as_mut().ok_or(Error::StorageContract)?;
+                Ok(StagedAppend {
+                    record: record.clone(),
+                    inserted: std::mem::take(inserted),
+                })
+            })
+            .collect()
     }
+}
+
+#[cfg(feature = "ledger")]
+pub(crate) fn coordinates(entries: Vec<(rss_ledger::Sequence, bool)>) -> Vec<(u64, bool)> {
+    entries
+        .into_iter()
+        .map(|(seq, added)| (seq.get(), added))
+        .collect()
 }

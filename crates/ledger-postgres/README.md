@@ -44,6 +44,8 @@ async fn business<T: Timer>(store: &PgLedger, request: AppendRequest, c: &Contro
 
 `StagedAppend` 不是提交证明；只有外层 `Committed<T>` 回执确认独立事务提交。回执构造器私有。
 独立重试按稳定身份返回原始记录和认证值，不增加序号；同身份不同 payload 冲突。
+同链批可通过 `append_batch_in_transaction` 或消息事务 `append_batch_in` 追加，按输入顺序返回暂存的序号和新增标志。单条和批量共用追加实现。一次逻辑批认证一次起始链尾，每组最多 32 个请求集合查重和持久化，全部使用同一实际事务。显式授予写函数的宿主使用 `rss_ledger.prepare_append(uuid,text,text,smallint)` 和 `rss_ledger.insert_entries(uuid,text,text,smallint,text[],bigint[],bytea[],bytea[],bytea[])`。
+
 身份/配置检查和记录认证先于幂等返回。同链行锁、checked 分配、写入和链头更新保持在同一个事务。
 PG 序号范围为 `0..=i64::MAX`，耗尽显式拒绝。
 

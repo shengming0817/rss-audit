@@ -212,6 +212,9 @@ pub(crate) fn decode(row: PgRow) -> Result<Entry, Error> {
         )
         .map_err(|_| Error::StorageContract)?,
     );
+    let payload: Vec<u8> = row.try_get("payload").map_err(|_| Error::StorageContract)?;
+    #[cfg(feature = "integration")]
+    tracing::trace!(target: "batch_cost::ledger_body", bytes = payload.len() as u64);
     let request = AppendRequest::new(
         ledger,
         RecordId::parse(
@@ -219,7 +222,7 @@ pub(crate) fn decode(row: PgRow) -> Result<Entry, Error> {
                 .map_err(|_| Error::StorageContract)?,
         )
         .map_err(|_| Error::StorageContract)?,
-        row.try_get::<Vec<u8>,_>("payload").map_err(|_| Error::StorageContract)?,
+        payload,
     )
     .map_err(|_| Error::StorageContract)?;
     let encoding = u16::try_from(

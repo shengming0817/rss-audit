@@ -10,6 +10,7 @@ keywords = ["ledger", "postgres", "checkpoint"]
 publish.workspace = true
 
 [dependencies]
+tracing = { workspace = true, optional = true }
 thiserror.workspace = true
 rss-ledger.workspace = true
 rss-request-context.workspace = true
@@ -23,7 +24,7 @@ futures = { workspace = true, features = ["std"] }
 
 [features]
 default = []
-integration = []
+integration = ["dep:tracing"]
 messaging = ["dep:rss-transactional-messaging-postgres", "rss-transactional-messaging/consumer"]
 
 [dev-dependencies]

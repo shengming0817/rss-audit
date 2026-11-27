@@ -2473,6 +2473,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -2528,6 +2529,7 @@ dependencies = [
  "rss-request-context",
  "sha2 0.10.9",
  "thiserror",
+ "tracing",
  "zeroize",
 ]
 
@@ -2546,6 +2548,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

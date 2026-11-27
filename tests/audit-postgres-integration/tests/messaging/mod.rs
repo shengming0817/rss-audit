@@ -153,10 +153,34 @@ pub(super) async fn run(
             .fold(Ok, Err, Err, Err, Err, Err)?;
         let writer = integrity.clone();
         let capacity = write_budget()?;
+        let z = prepare(
+            event(tenant()?, mode, "z", vec![8])?,
+            prepared.recorded_at(),
+        )?;
+        let b = prepare(
+            event(tenant()?, mode, "b", vec![9])?,
+            prepared.recorded_at(),
+        )?;
         runtime
             .local_tx(execution()?, deadline()?, move |tx| {
                 Box::pin(async move {
-                    assert!(!capacity.append_in(tx, &writer, &prepared).await?.inserted());
+                    let inputs = [z.clone(), prepared.clone(), b, z, prepared.clone()];
+                    let result = capacity
+                        .append_batch_in(tx, &writer, capacity.try_admit(&inputs)?)
+                        .await?;
+                    assert_eq!(
+                        result.iter().map(|r| r.inserted()).collect::<Vec<_>>(),
+                        [true, false, true, false, false]
+                    );
+                    assert_eq!(result[0].record().position(), result[3].record().position());
+                    assert_eq!(result[1].record().position(), result[4].record().position());
+                    if let Some(seq) = result[0].record().ledger_sequence() {
+                        assert_eq!(result[2].record().ledger_sequence(), Some(seq + 1));
+                    }
+                    assert_eq!(
+                        result[1].record().prepared().recorded_at(),
+                        prepared.recorded_at()
+                    );
                     Ok(())
                 })
             })
