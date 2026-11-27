@@ -21,6 +21,7 @@ mod admission;
 mod atomicity;
 mod composition;
 mod http;
+mod ledger_index;
 mod messaging;
 mod paging;
 mod query_cost;
@@ -196,6 +197,9 @@ async fn exercise(
     reader::run(ledger, pool, admin, control)
         .await
         .context("reader::run")?;
+    ledger_index::run(plain, ledger, pool, admin, control)
+        .await
+        .context("ledger_index::run")?;
     admission::run(pool, admin, control)
         .await
         .context("admission::run")?;
