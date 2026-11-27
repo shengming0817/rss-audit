@@ -67,9 +67,9 @@ SELECT current_setting('rss.tenant_id',true) AS tenant,
  AND prosecdef AND proowner=nspowner AND proconfig=ARRAY['search_path=pg_catalog, rss_audit']
  AND prokind='f' AND lanname='plpgsql' AND provolatile='v'
  AND pg_get_function_identity_arguments(oid)='p_tenant uuid, p_sources text[], p_events text[], p_recorded bigint[], p_canonical bytea[], p_ledger bigint[]'
- AND prorettype='record'::regtype AND proallargtypes=ARRAY['uuid'::regtype,'text[]'::regtype,'text[]'::regtype,'bigint[]'::regtype,'bytea[]'::regtype,'bigint[]'::regtype,'text'::regtype,'text'::regtype]::oid[]
- AND proargmodes=ARRAY['i','i','i','i','i','i','t','t']::"char"[]
- AND proargnames=ARRAY['p_tenant','p_sources','p_events','p_recorded','p_canonical','p_ledger','source_id','event_id']
+ AND prorettype='record'::regtype AND proallargtypes=ARRAY['uuid'::regtype,'text[]'::regtype,'text[]'::regtype,'bigint[]'::regtype,'bytea[]'::regtype,'bigint[]'::regtype,'text'::regtype,'text'::regtype,'bigint'::regtype]::oid[]
+ AND proargmodes=ARRAY['i','i','i','i','i','i','t','t','t']::"char"[]
+ AND proargnames=ARRAY['p_tenant','p_sources','p_events','p_recorded','p_canonical','p_ledger','source_id','event_id','position']
  AND NOT proisstrict AND NOT proleakproof AND proparallel='u' AND proretset AND pronargdefaults=0)
  FROM functions) AS functions,
 (SELECT EXISTS(SELECT FROM pg_sequence q JOIN relations c ON c.oid=q.seqrelid

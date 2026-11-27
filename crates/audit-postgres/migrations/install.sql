@@ -25,7 +25,7 @@ REVOKE ALL ON ALL TABLES IN SCHEMA rss_audit FROM PUBLIC;
 
 CREATE FUNCTION rss_audit.append_batch(p_tenant uuid,p_sources text[],p_events text[],
  p_recorded bigint[],p_canonical bytea[],p_ledger bigint[])
-RETURNS TABLE(source_id text,event_id text)
+RETURNS TABLE(source_id text,event_id text,"position" bigint)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,rss_audit AS $append$
 BEGIN
  IF p_tenant IS DISTINCT FROM NULLIF(current_setting('rss.tenant_id',true),'')::uuid THEN
@@ -44,7 +44,7 @@ BEGIN
  AS i(source_id,event_id,recorded,canonical,ledger)
  ORDER BY i.source_id COLLATE "C",i.event_id COLLATE "C"
  ON CONFLICT ON CONSTRAINT records_pkey DO NOTHING
- RETURNING r.source_id,r.event_id;
+ RETURNING r.source_id,r.event_id,r.position;
 END $append$;
 REVOKE ALL ON FUNCTION rss_audit.append_batch(uuid,text[],text[],bigint[],bytea[],bigint[]) FROM PUBLIC;
 REVOKE ALL ON SEQUENCE rss_audit.positions FROM PUBLIC;
