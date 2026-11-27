@@ -94,13 +94,13 @@ async fn admission(
         if let Some(ddl) = drift {
             sqlx::raw_sql(ddl).execute(admin).await?;
         }
-        reject_drift(pool, &reader, control, drift).await;
+        reject_drift(pool, &reader, control, drift).await?;
         sqlx::raw_sql("ALTER TABLE rss_audit.records DROP CONSTRAINT IF EXISTS records_tenant_id_ledger_sequence_key;
             DROP INDEX IF EXISTS rss_audit.records_tenant_ledger_sequence_uidx;
             CREATE UNIQUE INDEX records_tenant_ledger_sequence_uidx ON rss_audit.records (tenant_id, ledger_sequence) WHERE ledger_sequence IS NOT NULL")
             .execute(admin)
             .await?;
-        PgAudit::new(pool.clone(), Integrity::Plain, control).await?;
+        PgAudit::new(pool.clone(), Integrity::Plain, write_budget()?, control).await?;
         PgAuditReader::new(reader.clone(), Integrity::Plain, control).await?;
     }
     Ok(())
@@ -131,8 +131,8 @@ async fn reject_drift(
     reader: &PgPool,
     control: &Control<'_, TestClock>,
     drift: Option<&str>,
-) {
-    let write = PgAudit::new(writer.clone(), Integrity::Plain, control)
+) -> anyhow::Result<()> {
+    let write = PgAudit::new(writer.clone(), Integrity::Plain, write_budget()?, control)
         .await
         .err();
     let read = PgAuditReader::new(reader.clone(), Integrity::Plain, control)
@@ -144,4 +144,5 @@ async fn reject_drift(
             "{role} returned {result:?} for index drift {drift:?}"
         );
     }
+    Ok(())
 }

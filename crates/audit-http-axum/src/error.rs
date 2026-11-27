@@ -48,7 +48,9 @@ fn code(error: &TransactionError<Error>) -> SafeErrorCode {
         }
         TransactionError::Audit(e) | TransactionError::Operation(e) => match e {
             Error::InvalidBound | Error::ReadBudgetExceeded => SafeErrorCode::InvalidInput,
-            Error::Storage { .. } | Error::Admission(_) => SafeErrorCode::Unavailable,
+            Error::WriteBusy | Error::Storage { .. } | Error::Admission(_) => {
+                SafeErrorCode::Unavailable
+            }
             _ => SafeErrorCode::Internal,
         },
         TransactionError::Rollback { .. } => SafeErrorCode::Unavailable,
@@ -67,12 +69,12 @@ fn failed(
     attach(safe(status), classify(error))
 }
 pub(crate) fn settle(
-    attempt: LocalTxAttempt<Committed<crate::dto::PageDto>, TransactionError<Error>>,
+    attempt: LocalTxAttempt<Committed<crate::dto::CheckedPage>, TransactionError<Error>>,
 ) -> Response {
     attempt.fold(
         |page| {
             attach(
-                Json(page.into_value()).into_response(),
+                Json(page.into_value().into_dto()).into_response(),
                 LocalTxAttempt::committed(()),
             )
         },

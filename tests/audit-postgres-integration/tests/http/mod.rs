@@ -1,3 +1,5 @@
+mod interrupt_admission;
+mod measurement;
 use super::*;
 use axum::{
     Router,
@@ -5,6 +7,7 @@ use axum::{
     http::Request,
     response::Response,
 };
+pub(super) use measurement::measure;
 use rss_audit_http_axum::{
     AuditQuery, AuditQueryPolicy, AuditRequestBudget, QueryGrant, QueryOutcome, QueryPolicyError,
     SelfAudit, router,
@@ -130,6 +133,7 @@ pub(super) async fn run(
     corruption(&app, admin, tenant, &cancel).await?;
     interruptions(pg, admin, other, false).await?;
     interruptions(pg, admin, other, true).await?;
+    interrupt_admission::run(pool, tenant, control).await?;
     capacity(pg, ledger, pool, admin, control).await?;
     unavailable(pool, other, &cancel, control).await?;
     Ok(())
@@ -549,7 +553,8 @@ async fn unavailable(
         .max_connections(1)
         .connect_with((*pool.connect_options()).clone())
         .await?;
-    let unavailable = PgAudit::new(detached.clone(), Integrity::Plain, control).await?;
+    let unavailable =
+        PgAudit::new(detached.clone(), Integrity::Plain, write_budget()?, control).await?;
     detached.close().await;
     let (status, _, outcome) = inspect(
         router::<Session, _, _>(unavailable, Policy, TestClock)
@@ -724,7 +729,7 @@ async fn seed_capacity(
     .bind(tenant.to_string())
     .execute(&mut *tx)
     .await?;
-    pg.append_batch_in_transaction(&mut tx, &rows, control)
+    pg.append_batch_in_transaction(&mut tx, pg.try_admit(&rows)?, control)
         .await?;
     tx.commit().await?;
     Ok((tenant, total_bytes))

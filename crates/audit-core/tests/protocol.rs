@@ -308,6 +308,7 @@ fn complete_record_budget_charges_payload_headers_and_identities()
     assert!(payload_size > 65_536);
     let prepared = prepare(maximal_event(vec![7; payload_size])?, recorded)?;
     assert_eq!(prepared.canonical_bytes().len(), MAX_RECORD_BYTES);
+    check_bounded_header(&prepared)?;
     let decoded = decode_untrusted(prepared.canonical_bytes())?;
     assert_eq!(
         decoded.event().context().payload().as_bytes(),
@@ -483,5 +484,40 @@ fn debug_output_redacts_sensitive_values() -> Result<(), Box<dyn std::error::Err
         assert!(!rendered.contains(bait), "sensitive Debug leak: {rendered}");
     }
     assert_eq!(payload.as_bytes(), bait.as_bytes());
+    Ok(())
+}
+
+#[test]
+fn recovery_adopts_the_validated_allocation_and_shares_summary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bytes = golden_v1()?;
+    let address = bytes.as_ptr();
+    assert_eq!(rss_audit_core::canonical_len(&event()?)?, bytes.len());
+    let prepared = rss_audit_core::PreparedAuditV1::from_canonical_bytes(bytes)?;
+    assert_eq!(prepared.clone().canonical_bytes().as_ptr(), address);
+    assert_eq!(prepared.action().as_str(), "session_revoked");
+    assert_eq!(prepared.outcome(), Outcome::Succeeded);
+    assert_eq!(prepared.occurred_at().unix_seconds(), 1_726_000_000);
+    let mut corrupt = prepared.canonical_bytes().to_vec();
+    corrupt.push(0);
+    assert_eq!(
+        rss_audit_core::PreparedAuditV1::from_canonical_bytes(corrupt).err(),
+        Some(Error::UnknownField)
+    );
+    Ok(())
+}
+
+fn check_bounded_header(
+    prepared: &rss_audit_core::PreparedAuditV1,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = prepared.canonical_bytes();
+    let prefix = &bytes[..rss_audit_core::MAX_HEADER_BYTES];
+    let (identity, time) = rss_audit_core::inspect_canonical_header(prefix, bytes.len())?;
+    assert_eq!(
+        identity.event_id().as_str(),
+        prepared.identity().event_id().as_str()
+    );
+    assert_eq!(time, prepared.recorded_at());
+    assert!(rss_audit_core::inspect_canonical_header(prefix, bytes.len() - 1).is_err());
     Ok(())
 }

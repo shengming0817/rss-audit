@@ -74,16 +74,13 @@ fn decode(value: &str) -> Result<Cursor, InvalidQuery> {
     let through = u64::from_be_bytes(bytes[25..33].try_into().map_err(|_| InvalidQuery)?);
     Cursor::resume(tenant, after, through).map_err(|_| InvalidQuery)
 }
-pub(crate) fn encode(cursor: Cursor) -> Result<String, rss_audit_postgres::Error> {
-    let (after, through) = cursor
-        .continuation()
-        .ok_or(rss_audit_postgres::Error::StorageContract)?;
+pub(crate) fn encode(tenant: TenantId, after: u64, through: u64) -> String {
     let mut bytes = Vec::with_capacity(33);
     bytes.push(2);
-    bytes.extend_from_slice(&cursor.tenant().octets());
+    bytes.extend_from_slice(&tenant.octets());
     bytes.extend_from_slice(&after.to_be_bytes());
     bytes.extend_from_slice(&through.to_be_bytes());
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 #[cfg(test)]
@@ -94,7 +91,7 @@ mod tests {
         let tenant = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d479")?;
         let other = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d480")?;
         let cursor = Cursor::resume(tenant, 9_007_199_254_740_992, i64::MAX as u64)?;
-        let token = encode(cursor)?;
+        let token = encode(tenant, 9_007_199_254_740_992, i64::MAX as u64);
         const GOLDEN: &str = "AvR6wQtYzENypWcOArLD1HkAIAAAAAAAAH__________";
         assert_eq!(token, GOLDEN);
         assert_eq!(decode(GOLDEN)?, cursor);
@@ -103,7 +100,6 @@ mod tests {
         assert!(q.is_continuation());
         assert_eq!(q.cursor(tenant)?, cursor);
         assert!(q.cursor(other).is_err());
-        assert!(encode(Cursor::start(tenant)).is_err());
         for bad in [
             "".into(),
             "x".repeat(44),

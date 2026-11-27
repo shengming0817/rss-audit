@@ -52,7 +52,7 @@ assert_eq!(decoded.event().facts().action().as_str(), "read");
 # }
 ```
 
-`PreparedAuditV1` owns the exact audit bytes, identity and recording time without Ledger types.
+`PreparedAuditV1` shares immutable exact bytes and validated identity, action, outcome and occurrence/recording times without Ledger types.
 The default build does not depend on Ledger. Enable `ledger` for `append_request`, authenticated
 windows and Ledger errors. Mapping is fallible and returns an owned request; it never persists data.
 The two Ledger crates live in this workspace and are not independently published. Public RSS

@@ -23,6 +23,7 @@ async fn race(pool: &PgPool, ledger: bool) -> anyhow::Result<()> {
         } else {
             Integrity::Plain
         },
+        write_budget()?,
         &control,
     )
     .await?;

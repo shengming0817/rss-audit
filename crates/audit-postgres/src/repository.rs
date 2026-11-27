@@ -1,45 +1,28 @@
 use crate::{Cursor, Error, Page, ReadLimit, Record, StagedAppend, probe};
-use rss_audit_core::{AuditEventV1, PreparedAuditV1};
+use futures::TryStreamExt;
+use rss_audit_core::PreparedAuditV1;
 use rss_request_context::TenantId;
 use sqlx::{PgConnection, Row, postgres::PgRow};
 
-pub(crate) async fn prepare(
-    c: &mut PgConnection,
-    event: AuditEventV1,
-) -> Result<PreparedAuditV1, Error> {
+pub(crate) async fn recording_time(c: &mut PgConnection) -> Result<rss_contract::Timepoint, Error> {
     let seconds: i64 =
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()))::bigint")
             .fetch_one(c)
             .await?;
-    let recorded =
-        rss_contract::Timepoint::try_from(seconds).map_err(|_| Error::StorageContract)?;
-    Ok(rss_audit_core::prepare(event, recorded)?)
-}
-
-/// One tenant and exact identities per batch, before any persistence is attempted.
-pub(crate) fn batch_tenant(requests: &[PreparedAuditV1]) -> Result<TenantId, Error> {
-    let tenant = requests
-        .first()
-        .ok_or(Error::InvalidBound)?
-        .identity()
-        .tenant();
-    if requests.iter().any(|r| r.identity().tenant() != tenant) {
-        return Err(Error::ScopeMismatch);
-    }
-    Ok(tenant)
+    rss_contract::Timepoint::try_from(seconds).map_err(|_| Error::StorageContract)
 }
 
 /// Shared physical Audit write. The enclosing owner must roll back on any error.
 pub(crate) async fn append_batch(
     c: &mut PgConnection,
-    requests: &[PreparedAuditV1],
+    batch: &crate::AdmittedBatch<'_>,
     ledger: &[Option<(u64, bool)>],
 ) -> Result<Vec<StagedAppend>, Error> {
     use std::collections::{BTreeMap, BTreeSet};
-    if requests.is_empty() {
+    let requests = batch.records;
+    let Some(tenant) = batch.tenant else {
         return Ok(Vec::new());
-    }
-    let tenant = batch_tenant(requests)?;
+    };
     if ledger.len() != requests.len() {
         return Err(Error::StorageContract);
     }
@@ -63,12 +46,17 @@ pub(crate) async fn append_batch(
     let mut events = Vec::with_capacity(unique.len());
     let mut recorded = Vec::with_capacity(unique.len());
     let mut canonical = Vec::with_capacity(unique.len());
+    let mut lengths = Vec::with_capacity(unique.len());
     let mut sequences = Vec::with_capacity(unique.len());
     for ((source, event), &i) in &unique {
         sources.push(source.as_str());
         events.push(event.as_str());
         recorded.push(requests[i].recorded_at().unix_seconds());
         canonical.push(requests[i].canonical_bytes());
+        lengths.push(
+            i32::try_from(requests[i].canonical_bytes().len())
+                .map_err(|_| Error::StorageContract)?,
+        );
         sequences.push(
             ledger[i]
                 .map(|(seq, _)| i64::try_from(seq))
@@ -90,12 +78,34 @@ pub(crate) async fn append_batch(
     let mut inserted: BTreeSet<_> = inserted.into_iter().collect();
     // A new READ COMMITTED snapshot sees competing inserts waited for by ON CONFLICT.
     // Stronger isolation may instead report serialization failure; only the host retries.
-    let rows = sqlx::query("SELECT r.tenant_id::text,r.source_id,r.event_id,r.position,r.recorded_at,r.canonical,r.ledger_sequence FROM rss_audit.records r JOIN unnest($2::text[],$3::text[]) AS i(source_id,event_id) ON r.source_id=i.source_id AND r.event_id=i.event_id WHERE r.tenant_id=$1::uuid")
-        .bind(tenant.to_string()).bind(sources).bind(events).fetch_all(c).await?;
+    let mut rows = sqlx::query(include_str!("append_readback.sql"))
+        .bind(tenant.to_string())
+        .bind(sources)
+        .bind(events)
+        .bind(lengths)
+        .bind(i32::try_from(rss_audit_core::MAX_HEADER_BYTES).map_err(|_| Error::StorageContract)?)
+        .fetch(c);
     let mut records = BTreeMap::new();
-    for row in rows {
-        let record = decode(&row, tenant)?;
-        records.insert(key(record.prepared()), record);
+    let mut oversized = 0usize;
+    while let Some(row) = rows.try_next().await? {
+        if row.try_get("oversized")? {
+            let prefix: &[u8] = row.try_get("canonical")?;
+            let len = usize::try_from(row.try_get::<i32, _>("stored_bytes")?)
+                .map_err(|_| Error::StorageContract)?;
+            let (identity, at) = rss_audit_core::inspect_canonical_header(prefix, len)
+                .map_err(|_| Error::StorageContract)?;
+            coordinates(&row, tenant, &identity, at)?;
+            oversized += 1;
+        } else {
+            let record = decode(&row, tenant)?;
+            records.insert(key(record.prepared()), record);
+        }
+    }
+    if records.len() + oversized != unique.len() {
+        return Err(Error::StorageContract);
+    }
+    if oversized != 0 {
+        return Err(Error::Conflict);
     }
     let mut result = Vec::with_capacity(requests.len());
     for (request, expected) in requests.iter().zip(ledger) {
@@ -119,14 +129,27 @@ pub(crate) async fn append_batch(
 fn decode(row: &PgRow, tenant: TenantId) -> Result<Record, Error> {
     let bytes: Vec<u8> = row.try_get("canonical")?;
     let prepared =
-        PreparedAuditV1::from_canonical_bytes(&bytes).map_err(|_| Error::StorageContract)?;
-    let identity = prepared.identity();
+        PreparedAuditV1::from_canonical_bytes(bytes).map_err(|_| Error::StorageContract)?;
+    let (position, ledger_sequence) =
+        coordinates(row, tenant, prepared.identity(), prepared.recorded_at())?;
+    Ok(Record {
+        position,
+        prepared,
+        ledger_sequence,
+    })
+}
+fn coordinates(
+    row: &PgRow,
+    tenant: TenantId,
+    identity: &rss_audit_core::RecordIdentity,
+    at: rss_contract::Timepoint,
+) -> Result<(i64, Option<u64>), Error> {
     let position: i64 = row.try_get("position")?;
     if identity.tenant() != tenant
         || row.try_get::<String, _>("tenant_id")? != tenant.to_string()
         || row.try_get::<&str, _>("source_id")? != identity.source().source_id().as_str()
         || row.try_get::<&str, _>("event_id")? != identity.event_id().as_str()
-        || row.try_get::<i64, _>("recorded_at")? != prepared.recorded_at().unix_seconds()
+        || row.try_get::<i64, _>("recorded_at")? != at.unix_seconds()
         || position < 0
     {
         return Err(Error::StorageContract);
@@ -136,11 +159,7 @@ fn decode(row: &PgRow, tenant: TenantId) -> Result<Record, Error> {
         .map(u64::try_from)
         .transpose()
         .map_err(|_| Error::StorageContract)?;
-    Ok(Record {
-        position,
-        prepared,
-        ledger_sequence,
-    })
+    Ok((position, ledger_sequence))
 }
 
 pub(crate) async fn page(

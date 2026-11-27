@@ -41,6 +41,7 @@ impl<R> Committed<R> {
 #[derive(Clone)]
 pub struct PgAudit {
     pub(crate) pool: PgPool,
+    budget: Option<crate::WriteBudget>,
     pub(crate) integrity: Integrity,
     #[cfg(feature = "integration")]
     fault: std::sync::Arc<std::sync::atomic::AtomicU8>,
@@ -50,31 +51,44 @@ impl PgAudit {
     pub async fn new<T: ExecutionTimer>(
         pool: PgPool,
         integrity: Integrity,
+        budget: crate::WriteBudget,
         control: &Control<'_, T>,
     ) -> Result<Self, Error> {
-        Self::connect(pool, integrity, control, true).await
+        Self::connect(pool, integrity, control, Some(budget)).await
     }
     pub(crate) async fn connect<T: ExecutionTimer>(
         pool: PgPool,
         integrity: Integrity,
         control: &Control<'_, T>,
-        append: bool,
+        budget: Option<crate::WriteBudget>,
     ) -> Result<Self, Error> {
         control
             .run(Stage::Acquire, async {
                 let connection = pool.acquire().await?;
                 let mut lease = Lease::new(connection);
-                validate_storage(&mut lease.connection, &integrity, control, append).await?;
+                validate_storage(&mut lease.connection, &integrity, control, budget.is_some())
+                    .await?;
                 lease.confirmed = true;
                 Ok(())
             })
             .await?;
         Ok(Self {
+            budget,
             pool,
             integrity,
             #[cfg(feature = "integration")]
             fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         })
+    }
+    pub(crate) fn budget(&self) -> Result<&crate::WriteBudget, Error> {
+        self.budget.as_ref().ok_or(Error::StorageContract)
+    }
+    /// Admit already prepared input on this writer's shared budget without waiting.
+    pub fn try_admit<'a>(
+        &self,
+        records: &'a [PreparedAuditV1],
+    ) -> Result<crate::AdmittedBatch<'a>, Error> {
+        self.budget()?.try_admit(records)
     }
     /// Verify the actual host runtime connection before accepting work.
     /// Does not acquire another connection, change settings or settle a transaction.
@@ -98,14 +112,22 @@ impl PgAudit {
         event: AuditEventV1,
         control: &Control<'_, T>,
     ) -> Result<PreparedAuditV1, Error> {
-        control
+        control.check(Stage::Operation)?;
+        let _reservation = self
+            .budget()?
+            .try_reserve(1, rss_audit_core::canonical_len(&event)?)?;
+        let recorded = control
             .run(Stage::Operation, async {
                 let mut lease = Lease::new(self.pool.acquire().await?);
-                let prepared = crate::repository::prepare(&mut lease.connection, event).await?;
+                let recorded = crate::repository::recording_time(&mut lease.connection).await?;
                 lease.confirmed = true;
-                Ok(prepared)
+                Ok(recorded)
             })
-            .await
+            .await?;
+        control.check(Stage::Operation)?;
+        let prepared = rss_audit_core::prepare(event, recorded)?;
+        control.check(Stage::Operation)?;
+        Ok(prepared)
     }
     /// Append and settle independently. Retry the unchanged request after commit-unknown.
     pub async fn append<T: ExecutionTimer>(
@@ -113,14 +135,27 @@ impl PgAudit {
         request: &PreparedAuditV1,
         control: &Control<'_, T>,
     ) -> LocalTxAttempt<Committed<StagedAppend>, Error> {
-        let request = request.clone();
+        let batch = match control
+            .check(Stage::Operation)
+            .and_then(|()| self.try_admit(std::slice::from_ref(request)))
+        {
+            Ok(batch) => batch,
+            Err(error) => return LocalTxAttempt::not_started(error),
+        };
         audit_only(
             self.transact(
                 request.identity().tenant(),
                 control,
                 Access::Append,
-                (),
-                move |_, tx| Box::pin(async move { tx.append(&request).await }),
+                Some(batch),
+                |batch, tx| {
+                    Box::pin(async move {
+                        tx.append_admitted(batch.take().ok_or(Error::StorageContract)?)
+                            .await?
+                            .pop()
+                            .ok_or(Error::StorageContract)
+                    })
+                },
             )
             .await,
         )
@@ -251,10 +286,13 @@ impl PgAudit {
                 .bind(tenant.to_string()).bind(millis).execute(&mut *tx).await?;
             Ok(())
         }).await;
+        let mut held = None;
         let body = match body {
             Ok(()) => control
                 .run(Stage::Operation, async {
                     let mut transaction = WriteAuditTransaction {
+                        write_budget: self.budget.as_ref(),
+                        held: &mut held,
                         read: ReadAuditTransaction {
                             tx: &mut tx,
                             control,

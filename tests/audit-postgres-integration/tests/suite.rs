@@ -27,7 +27,11 @@ mod paging;
 mod query_cost;
 mod reader;
 mod reads;
+mod write_capacity;
 
+fn write_budget() -> Result<rss_audit_postgres::WriteBudget, Error> {
+    rss_audit_postgres::WriteBudget::new(1024, 8 * 1024 * 1024, 32 * 1024 * 1024)
+}
 struct TestClock;
 impl Clock for TestClock {
     fn now(&self) -> Instant {
@@ -110,10 +114,27 @@ fn rolled_back<R, E>(attempt: LocalTxAttempt<Committed<R>, E>, expected: fn(&E) 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn audit_postgres_suite() -> anyhow::Result<()> {
-    tokio::time::timeout(Duration::from_secs(180), run()).await??;
+    tokio::time::timeout(Duration::from_secs(180), run(Workload::Acceptance)).await??;
     Ok(())
 }
-async fn run() -> anyhow::Result<()> {
+#[tokio::test]
+#[ignore = "isolated release-mode resource measurements"]
+async fn audit_measurement() -> anyhow::Result<()> {
+    run(Workload::Pages).await
+}
+
+#[tokio::test]
+#[ignore = "isolated release-mode concurrent write capacity"]
+async fn audit_write_pressure() -> anyhow::Result<()> {
+    run(Workload::Pressure).await
+}
+enum Workload {
+    Acceptance,
+    Pages,
+    Pressure,
+}
+
+async fn run(workload: Workload) -> anyhow::Result<()> {
     let network = testkit::bridge_network("audit-postgres").await?;
     let fixture = testkit::postgres_tls(
         testkit::NetworkAttachment {
@@ -147,14 +168,21 @@ async fn run() -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
     let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(150))?;
     let control = Control::new(&clock, cutoff, cutoff, &cancel);
-    let plain = PgAudit::new(pool.clone(), Integrity::Plain, &control)
+    let shared = write_budget()?;
+    let plain = PgAudit::new(pool.clone(), Integrity::Plain, shared.clone(), &control)
         .await
         .context("plain startup")?;
-    let ledger = PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), &control)
+    let ledger = PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), shared, &control)
         .await
         .context("ledger startup")?;
-    exercise(&plain, &ledger, &pool, &admin, &fixture, &control).await?;
-    storage_classification(&pool).await?;
+    match workload {
+        Workload::Pages => http::measure(&plain, &ledger, &pool, &control).await?,
+        Workload::Pressure => write_capacity::measure(&pool, &control).await?,
+        Workload::Acceptance => {
+            exercise(&plain, &ledger, &pool, &admin, &fixture, &control).await?;
+            storage_classification(&pool).await?;
+        }
+    }
     pool.close().await;
     admin.close().await;
     drop(fixture);
@@ -197,6 +225,9 @@ async fn exercise(
     reader::run(ledger, pool, admin, control)
         .await
         .context("reader::run")?;
+    write_capacity::run(pool, admin, control)
+        .await
+        .context("write capacity")?;
     ledger_index::run(plain, ledger, pool, admin, control)
         .await
         .context("ledger_index::run")?;

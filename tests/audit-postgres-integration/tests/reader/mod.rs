@@ -30,9 +30,14 @@ pub(super) async fn run(
         .await?;
     PgAuditReader::new(pool.clone(), Integrity::Plain, control).await?;
     assert!(
-        PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), control)
-            .await
-            .is_err()
+        PgAudit::new(
+            pool.clone(),
+            Integrity::Ledger(auth()?),
+            write_budget()?,
+            control
+        )
+        .await
+        .is_err()
     );
     let reader = PgAuditReader::new(pool.clone(), Integrity::Ledger(auth()?), control).await?;
     read_and_reject_write(&reader, control).await?;
@@ -113,7 +118,13 @@ async fn write_authority(
             .is_err()
     );
     sqlx::raw_sql("REVOKE audit_reader_indirect FROM audit_runtime; REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA rss_audit FROM audit_reader_indirect; GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA rss_audit,rss_ledger TO audit_runtime").execute(admin).await?;
-    PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), control).await?;
+    PgAudit::new(
+        pool.clone(),
+        Integrity::Ledger(auth()?),
+        write_budget()?,
+        control,
+    )
+    .await?;
     Ok(())
 }
 

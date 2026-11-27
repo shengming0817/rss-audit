@@ -44,7 +44,8 @@ impl<'a, T: ExecutionTimer> Control<'a, T> {
             _ => self.total_deadline,
         }
     }
-    pub(crate) fn check(&self, stage: LocalTxDeadlineStage) -> Result<(), Error> {
+    /// Check cancellation and the original cutoff before starting synchronous work at a stage.
+    pub fn check(&self, stage: LocalTxDeadlineStage) -> Result<(), Error> {
         if self.cancel.is_cancelled() {
             Err(Error::Cancelled(stage))
         } else if self.deadline(stage).is_expired(self.timer.now()) {

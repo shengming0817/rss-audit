@@ -72,6 +72,7 @@ pub(super) async fn run(
                     } else {
                         Integrity::Plain
                     },
+                    write_budget()?,
                     control,
                 )
                 .await?;

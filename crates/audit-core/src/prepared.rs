@@ -1,34 +1,64 @@
-use crate::{AuditEventV1, Error, RecordIdentity, codec};
+use crate::{Action, AuditEventV1, Error, EventFacts, Outcome, RecordIdentity, codec};
 use rss_contract::Timepoint;
+use std::{borrow::Cow, sync::Arc};
 
-/// Provider-free exact Audit bytes and identity; never durable commit evidence.
+/// Provider-free exact Audit bytes and their structurally validated summary.
 #[derive(Clone)]
-pub struct PreparedAuditV1 {
+pub struct PreparedAuditV1(Arc<RecordData>);
+struct RecordData {
     identity: RecordIdentity,
     recorded_at: Timepoint,
+    occurred_at: Timepoint,
+    action: Action,
+    outcome: Outcome,
     canonical: Vec<u8>,
 }
 impl PreparedAuditV1 {
-    /// Restore structurally valid canonical bytes without authenticating their source or time.
-    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let (event, recorded_at) = codec::decode_untrusted(bytes)?.into_parts();
-        let prepared = prepare(event, recorded_at)?;
-        if prepared.canonical_bytes() != bytes {
-            return Err(Error::MalformedEncoding);
-        }
-        Ok(prepared)
+    /// Restore a canonical record. An owned buffer is adopted after validation.
+    pub fn from_canonical_bytes<'a>(bytes: impl Into<Cow<'a, [u8]>>) -> Result<Self, Error> {
+        let bytes = bytes.into();
+        let parsed = codec::parse(&bytes)?;
+        let (identity, facts, recorded_at) = (parsed.identity, parsed.facts, parsed.recorded_at);
+        Ok(Self::new(identity, &facts, recorded_at, bytes.into_owned()))
+    }
+    fn new(
+        identity: RecordIdentity,
+        facts: &EventFacts,
+        recorded_at: Timepoint,
+        canonical: Vec<u8>,
+    ) -> Self {
+        Self(Arc::new(RecordData {
+            identity,
+            action: facts.action().clone(),
+            outcome: facts.outcome(),
+            occurred_at: facts.occurred_at(),
+            recorded_at,
+            canonical,
+        }))
     }
     /// Stable tenant, source and event identity.
-    pub const fn identity(&self) -> &RecordIdentity {
-        &self.identity
+    pub fn identity(&self) -> &RecordIdentity {
+        &self.0.identity
+    }
+    /// Source action in the exact record.
+    pub fn action(&self) -> &Action {
+        &self.0.action
+    }
+    /// Source outcome in the exact record.
+    pub fn outcome(&self) -> Outcome {
+        self.0.outcome
+    }
+    /// Source occurrence time.
+    pub fn occurred_at(&self) -> Timepoint {
+        self.0.occurred_at
     }
     /// Recording time supplied by the recorder authority.
-    pub const fn recorded_at(&self) -> Timepoint {
-        self.recorded_at
+    pub fn recorded_at(&self) -> Timepoint {
+        self.0.recorded_at
     }
     /// Exact retry bytes, including the original recording time.
     pub fn canonical_bytes(&self) -> &[u8] {
-        &self.canonical
+        &self.0.canonical
     }
 }
 impl std::fmt::Debug for PreparedAuditV1 {
@@ -39,9 +69,10 @@ impl std::fmt::Debug for PreparedAuditV1 {
 /// Encode an audit record. The caller owns the recording-time authority.
 pub fn prepare(event: AuditEventV1, recorded_at: Timepoint) -> Result<PreparedAuditV1, Error> {
     let canonical = codec::encode(&event, recorded_at)?;
-    Ok(PreparedAuditV1 {
-        identity: event.identity().clone(),
+    Ok(PreparedAuditV1::new(
+        event.identity().clone(),
+        event.facts(),
         recorded_at,
         canonical,
-    })
+    ))
 }

@@ -107,18 +107,36 @@ where
                 .read_tx_with_context(grant.tenant, &control, (), move |_, tx| {
                     Box::pin(async move {
                         let page = tx.read_page(cursor, limit).await?;
-                        dto::PageDto::new(grant.tenant, &page)
+                        dto::CheckedPage::new(grant.tenant, page)
                     })
                 })
                 .await
         }
         SelfAudit::Required(prepared) => {
+            let batch = match control
+                .check(rss_transactional_messaging::transaction::LocalTxDeadlineStage::Acquire)
+                .and_then(|()| app.pg.try_admit(std::slice::from_ref(&prepared)))
+            {
+                Ok(batch) => batch,
+                Err(e) => {
+                    return error::settle(
+                        rss_transactional_messaging::transaction::LocalTxAttempt::not_started(
+                            rss_audit_postgres::TransactionError::Audit(e),
+                        ),
+                    );
+                }
+            };
             app.pg
-                .write_tx_with_context(grant.tenant, &control, (), move |_, tx| {
+                .write_tx_with_context(grant.tenant, &control, Some(batch), move |batch, tx| {
                     Box::pin(async move {
                         let page = tx.read_page(cursor, limit).await?;
-                        let response = dto::PageDto::new(grant.tenant, &page)?;
-                        tx.append(&prepared).await?;
+                        let response = dto::CheckedPage::new(grant.tenant, page)?;
+                        tx.append_admitted(
+                            batch
+                                .take()
+                                .ok_or(rss_audit_postgres::Error::StorageContract)?,
+                        )
+                        .await?;
                         Ok::<_, rss_audit_postgres::Error>(response)
                     })
                 })

@@ -57,7 +57,8 @@ pub(super) async fn run(
                             })
                             .await
                             .map_err(Error::from)?;
-                            let prepared = PreparedAuditV1::from_canonical_bytes(expected)?;
+                            let prepared =
+                                PreparedAuditV1::from_canonical_bytes(expected.as_slice())?;
                             let appended = tx.append(&prepared).await?;
                             recovered
                                 .extend_from_slice(appended.record().prepared().canonical_bytes());
@@ -83,7 +84,13 @@ pub(super) async fn single_connection(pool: &PgPool) -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
     let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(5))?;
     let control = Control::new(&clock, cutoff, cutoff, &cancel);
-    let store = PgAudit::new(one.clone(), Integrity::Ledger(auth()?), &control).await?;
+    let store = PgAudit::new(
+        one.clone(),
+        Integrity::Ledger(auth()?),
+        write_budget()?,
+        &control,
+    )
+    .await?;
     let prepared = store
         .prepare(
             event(tenant()?, "single-connection", "id", vec![4])?,

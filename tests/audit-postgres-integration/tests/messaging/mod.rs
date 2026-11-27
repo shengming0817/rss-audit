@@ -23,6 +23,7 @@ fn deadline() -> anyhow::Result<OperationDeadline> {
     ))
 }
 struct Effect {
+    capacity: rss_audit_postgres::WriteBudget,
     integrity: Integrity,
     request: PreparedAuditV1,
     reject: bool,
@@ -37,7 +38,8 @@ impl PgConsumerEffect<Vec<u8>> for Effect {
         rss_audit_postgres::lock_head_in(tx, &self.integrity)
             .await
             .map_err(PgConsumerEffectFailure::infrastructure)?;
-        rss_audit_postgres::append_in(tx, &self.integrity, &self.request)
+        self.capacity
+            .append_in(tx, &self.integrity, &self.request)
             .await
             .map_err(PgConsumerEffectFailure::infrastructure)?;
         let id = decode_untrusted(self.request.canonical_bytes())
@@ -124,18 +126,24 @@ pub(super) async fn run(
             )
             .await?;
         let writer = integrity.clone();
+        let charge = u32::try_from(prepared.canonical_bytes().len() * 8)?;
+        let capacity = rss_audit_postgres::WriteBudget::new(8, charge, charge)?;
+        let occupied = capacity.reserve(8, charge as usize, control).await?;
         let request = prepared.clone();
         runtime
             .local_tx(execution()?, deadline()?, move |tx| {
                 Box::pin(async move {
                     rss_audit_postgres::validate_in(tx, &writer).await?;
                     rss_audit_postgres::lock_head_in(tx, &writer).await?;
-                    let added = rss_audit_postgres::append_batch_in(
-                        tx,
-                        &writer,
-                        &[request.clone(), request],
-                    )
-                    .await?;
+                    assert!(matches!(
+                        capacity.append_in(tx, &writer, &request).await,
+                        Err(rss_audit_postgres::Error::WriteBusy)
+                    ));
+                    drop(occupied);
+                    let records = vec![request; 8];
+                    let added = capacity
+                        .append_batch_in(tx, &writer, capacity.try_admit(&records)?)
+                        .await?;
                     assert!(added[0].inserted());
                     assert!(!added[1].inserted());
                     Ok(())
@@ -144,20 +152,18 @@ pub(super) async fn run(
             .await
             .fold(Ok, Err, Err, Err, Err, Err)?;
         let writer = integrity.clone();
+        let capacity = write_budget()?;
         runtime
             .local_tx(execution()?, deadline()?, move |tx| {
                 Box::pin(async move {
-                    assert!(
-                        !rss_audit_postgres::append_in(tx, &writer, &prepared)
-                            .await?
-                            .inserted()
-                    );
+                    assert!(!capacity.append_in(tx, &writer, &prepared).await?.inserted());
                     Ok(())
                 })
             })
             .await
             .fold(Ok, Err, Err, Err, Err, Err)?;
         let wrong = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d480")?;
+        let capacity = write_budget()?;
         let foreign = plain
             .prepare(event(wrong, "scope", "foreign", vec![])?, control)
             .await?;
@@ -165,7 +171,7 @@ pub(super) async fn run(
             .local_tx(execution()?, deadline()?, move |tx| {
                 Box::pin(async move {
                     assert!(matches!(
-                        rss_audit_postgres::append_in(tx, &integrity, &foreign).await,
+                        capacity.append_in(tx, &integrity, &foreign).await,
                         Err(rss_audit_postgres::Error::ScopeMismatch)
                     ));
                     Ok(())
@@ -253,6 +259,7 @@ async fn scenario(
     let outcome = PgConsumerTx::receipt_only(
         runtime.clone(),
         Effect {
+            capacity: write_budget()?,
             integrity,
             request: request.clone(),
             reject,
@@ -310,12 +317,14 @@ async fn fenced(
     let request = store
         .prepare(event(tenant()?, "message", "fenced", vec![])?, control)
         .await?;
+    let capacity = write_budget()?;
     let staged = request.clone();
     let integrity = Integrity::Ledger(auth()?);
     let outcome = runtime
         .local_tx(execution()?, deadline()?, move |tx| {
             Box::pin(async move {
-                rss_audit_postgres::append_in(tx, &integrity, &staged)
+                capacity
+                    .append_in(tx, &integrity, &staged)
                     .await
                     .map_err(PgError::from)
             })

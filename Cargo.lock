@@ -12,6 +12,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocation-counter"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beb9e990c0a33699f1984d85a6abead615ccc72dd8130bf3e15dcabe2ca149c9"
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -148,6 +154,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "audit-postgres-integration"
 version = "0.1.0"
 dependencies = [
+ "allocation-counter",
  "anyhow",
  "axum",
  "base64 0.22.1",
@@ -2427,6 +2434,7 @@ dependencies = [
 name = "rss-audit-http-axum"
 version = "0.1.0"
 dependencies = [
+ "allocation-counter",
  "anyhow",
  "axum",
  "base64 0.22.1",
