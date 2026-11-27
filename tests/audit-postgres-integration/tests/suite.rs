@@ -165,6 +165,7 @@ async fn run(measure: bool) -> anyhow::Result<()> {
         .context("ledger startup")?;
     if measure {
         http::measure(&plain, &ledger, &pool, &control).await?;
+        write_capacity::measure(&pool, &control).await?;
     } else {
         exercise(&plain, &ledger, &pool, &admin, &fixture, &control).await?;
         storage_classification(&pool).await?;

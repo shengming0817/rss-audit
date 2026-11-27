@@ -31,7 +31,7 @@ pub(crate) async fn measure(
         }
         let bytes: usize = rows.iter().map(|r| r.canonical_bytes().len()).sum();
         for (mode, owner) in [("plain", pg), ("ledger", ledger)] {
-            // Each integrity mode has its own tenant/identities. Roll back the timed batch.
+            // Rollback keeps the identical batch fresh for each integrity mode.
             let start = Instant::now();
             let mut tx = pool.begin().await?;
             let checkout = start.elapsed();

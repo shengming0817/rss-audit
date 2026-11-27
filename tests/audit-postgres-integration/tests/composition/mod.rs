@@ -57,7 +57,8 @@ pub(super) async fn run(
                             })
                             .await
                             .map_err(Error::from)?;
-                            let prepared = PreparedAuditV1::from_canonical_bytes(expected)?;
+                            let prepared =
+                                PreparedAuditV1::from_canonical_bytes(expected.as_slice())?;
                             let appended = tx.append(&prepared).await?;
                             recovered
                                 .extend_from_slice(appended.record().prepared().canonical_bytes());

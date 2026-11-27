@@ -35,7 +35,7 @@ impl PgAuditReader {
         control
             .run(
                 LocalTxDeadlineStage::Setup,
-                crate::runtime::validate_storage(connection, &self.inner.integrity, control, None),
+                crate::runtime::validate_storage(connection, &self.inner.integrity, control, false),
             )
             .await
     }

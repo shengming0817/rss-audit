@@ -136,3 +136,62 @@ pub(super) async fn run(pool: &PgPool, control: &Control<'_, TestClock>) -> anyh
     }
     Ok(())
 }
+
+/// Hold an admitted large batch in a real transaction while a small grant is polled.
+/// The waiting path only has dimensions. It can construct the eight records after grant.
+pub(super) async fn measure(pool: &PgPool, control: &Control<'_, TestClock>) -> anyhow::Result<()> {
+    let t = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d699")?;
+    let at = Timepoint::try_from(456_i64)?;
+    let size = canonical_len(&event(t, "pressure", "large", vec![])?)?;
+    let limit = u32::try_from(MAX_RECORD_BYTES)?;
+    let capacity = WriteBudget::new(8, limit, limit)?;
+    let store = PgAudit::new(pool.clone(), Integrity::Plain, capacity.clone(), control).await?;
+    let granted = capacity.reserve(1, MAX_RECORD_BYTES, control).await?;
+    let rows = [prepare(
+        event(t, "pressure", "large", vec![0; MAX_RECORD_BYTES - size])?,
+        at,
+    )?];
+    let admitted = granted.bind(&rows)?;
+    let small_len = canonical_len(&event(t, "pressure", "small", vec![0; 32])?)? * 8;
+    let mut pending = Box::pin(capacity.reserve(8, small_len, control));
+    let start = Instant::now();
+    assert!(pending.as_mut().now_or_never().is_none());
+    let lease = Instant::now();
+    let mut tx = pool.begin().await?;
+    let begin = lease.elapsed();
+    let hold = Instant::now();
+    sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
+        .bind(t.to_string())
+        .execute(&mut *tx)
+        .await?;
+    store
+        .append_batch_in_transaction(&mut tx, admitted, control)
+        .await?;
+    let next = pending.await?;
+    let waited = start.elapsed();
+    tx.rollback().await?;
+    let large_hold = hold.elapsed();
+    let small = vec![prepare(event(t, "pressure", "small", vec![0; 32])?, at)?; 8];
+    let batch = next.bind(&small)?;
+    let second = Instant::now();
+    let mut tx = pool.begin().await?;
+    let second_begin = second.elapsed();
+    let second_hold = Instant::now();
+    sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
+        .bind(t.to_string())
+        .execute(&mut *tx)
+        .await?;
+    store
+        .append_batch_in_transaction(&mut tx, batch, control)
+        .await?;
+    tx.rollback().await?;
+    eprintln!(
+        "PRESSURE logical_peak={limit} small_bytes={small_len} queued=1 waiter_connections=0 wait_us={} large_begin_us={} large_hold_us={} small_begin_us={} small_hold_us={}",
+        waited.as_micros(),
+        begin.as_micros(),
+        large_hold.as_micros(),
+        second_begin.as_micros(),
+        second_hold.elapsed().as_micros()
+    );
+    Ok(())
+}
