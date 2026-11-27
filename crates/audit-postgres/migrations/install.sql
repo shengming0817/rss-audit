@@ -12,9 +12,10 @@ CREATE TABLE rss_audit.records (
     canonical bytea NOT NULL CHECK (octet_length(canonical) BETWEEN 1 AND 131072),
     ledger_sequence bigint CHECK (ledger_sequence >= 0),
     PRIMARY KEY (tenant_id, source_id, event_id),
-    UNIQUE (tenant_id, position),
-    UNIQUE (tenant_id, ledger_sequence)
+    UNIQUE (tenant_id, position)
 );
+CREATE UNIQUE INDEX records_tenant_ledger_sequence_uidx ON rss_audit.records (tenant_id, ledger_sequence)
+    WHERE ledger_sequence IS NOT NULL;
 ALTER TABLE rss_audit.records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE rss_audit.records FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_scope ON rss_audit.records
