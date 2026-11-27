@@ -26,6 +26,7 @@ mod paging;
 mod query_cost;
 mod reader;
 mod reads;
+mod write_capacity;
 
 fn write_budget() -> Result<rss_audit_postgres::WriteBudget, Error> {
     rss_audit_postgres::WriteBudget::new(1024, 8 * 1024 * 1024, 32 * 1024 * 1024)
@@ -112,10 +113,16 @@ fn rolled_back<R, E>(attempt: LocalTxAttempt<Committed<R>, E>, expected: fn(&E) 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn audit_postgres_suite() -> anyhow::Result<()> {
-    tokio::time::timeout(Duration::from_secs(180), run()).await??;
+    tokio::time::timeout(Duration::from_secs(180), run(false)).await??;
     Ok(())
 }
-async fn run() -> anyhow::Result<()> {
+#[tokio::test]
+#[ignore = "isolated release-mode resource measurements"]
+async fn audit_measurement() -> anyhow::Result<()> {
+    run(true).await
+}
+
+async fn run(measure: bool) -> anyhow::Result<()> {
     let network = testkit::bridge_network("audit-postgres").await?;
     let fixture = testkit::postgres_tls(
         testkit::NetworkAttachment {
@@ -156,8 +163,12 @@ async fn run() -> anyhow::Result<()> {
     let ledger = PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), shared, &control)
         .await
         .context("ledger startup")?;
-    exercise(&plain, &ledger, &pool, &admin, &fixture, &control).await?;
-    storage_classification(&pool).await?;
+    if measure {
+        http::measure(&plain, &ledger, &pool, &control).await?;
+    } else {
+        exercise(&plain, &ledger, &pool, &admin, &fixture, &control).await?;
+        storage_classification(&pool).await?;
+    }
     pool.close().await;
     admin.close().await;
     drop(fixture);
@@ -200,6 +211,9 @@ async fn exercise(
     reader::run(ledger, pool, admin, control)
         .await
         .context("reader::run")?;
+    write_capacity::run(pool, control)
+        .await
+        .context("write capacity")?;
     admission::run(pool, admin, control)
         .await
         .context("admission::run")?;

@@ -21,6 +21,7 @@ tokio-util.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+allocation-counter = "0.8.1"
 rss-audit-postgres = { workspace = true, features = ["ledger"] }
 rss-ledger-postgres.workspace = true
 anyhow.workspace = true

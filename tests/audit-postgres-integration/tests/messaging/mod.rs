@@ -126,14 +126,21 @@ pub(super) async fn run(
             )
             .await?;
         let writer = integrity.clone();
-        let capacity = write_budget()?;
+        let charge = u32::try_from(prepared.canonical_bytes().len() * 8)?;
+        let capacity = rss_audit_postgres::WriteBudget::new(8, charge, charge)?;
+        let occupied = capacity.reserve(8, charge as usize, control).await?;
         let request = prepared.clone();
         runtime
             .local_tx(execution()?, deadline()?, move |tx| {
                 Box::pin(async move {
                     rss_audit_postgres::validate_in(tx, &writer).await?;
                     rss_audit_postgres::lock_head_in(tx, &writer).await?;
-                    let records = [request.clone(), request];
+                    assert!(matches!(
+                        capacity.append_in(tx, &writer, &request).await,
+                        Err(rss_audit_postgres::Error::WriteBusy)
+                    ));
+                    drop(occupied);
+                    let records = vec![request; 8];
                     let added = capacity
                         .append_batch_in(tx, &writer, capacity.try_admit(&records)?)
                         .await?;

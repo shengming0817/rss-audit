@@ -1,3 +1,4 @@
+mod measurement;
 use super::*;
 use axum::{
     Router,
@@ -5,6 +6,7 @@ use axum::{
     http::Request,
     response::Response,
 };
+pub(super) use measurement::measure;
 use rss_audit_http_axum::{
     AuditQuery, AuditQueryPolicy, AuditRequestBudget, QueryGrant, QueryOutcome, QueryPolicyError,
     SelfAudit, router,

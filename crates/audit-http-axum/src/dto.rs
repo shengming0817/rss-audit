@@ -1,5 +1,5 @@
-use rss_audit_core::Outcome;
-use rss_audit_postgres::{Error, Page, Record};
+use rss_audit_core::{Outcome, PreparedAuditV1};
+use rss_audit_postgres::{Error, Page};
 use rss_request_context::TenantId;
 use serde::Serialize;
 
@@ -52,25 +52,35 @@ impl CheckedPage {
         PageDto {
             tenant_id: self.tenant.to_string(),
             integrity: "unverified",
-            entries: self.page.records().iter().map(entry).collect(),
+            entries: self
+                .page
+                .records()
+                .iter()
+                .map(|record| {
+                    entry(
+                        record.prepared(),
+                        record.position(),
+                        record.ledger_sequence(),
+                    )
+                })
+                .collect(),
             next_cursor: self
                 .continuation
                 .map(|(after, through)| crate::query::encode(self.tenant, after, through)),
         }
     }
 }
-fn entry(record: &Record) -> EntryDto {
-    let prepared = record.prepared();
+fn entry(prepared: &PreparedAuditV1, position: u64, sequence: Option<u64>) -> EntryDto {
     let id = prepared.identity();
     EntryDto {
-        position: record.position().to_string(),
+        position: position.to_string(),
         source_id: id.source().source_id().as_str().to_owned(),
         event_id: id.event_id().as_str().to_owned(),
         action: prepared.action().as_str().to_owned(),
         outcome: outcome(prepared.outcome()),
         occurred_at: prepared.occurred_at().unix_seconds().to_string(),
         recorded_at: prepared.recorded_at().unix_seconds().to_string(),
-        ledger: record.ledger_sequence().map(|sequence| LedgerDto {
+        ledger: sequence.map(|sequence| LedgerDto {
             chain_id: "rss.audit.v1".to_owned(),
             record_id: format!(
                 "v1:{}:{}",
@@ -93,6 +103,70 @@ fn outcome(value: Outcome) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn summary_allocations_are_independent_of_payload_size() -> anyhow::Result<()> {
+        use rss_audit_core::*;
+        use rss_contract::{ContractId, ContractVersion, SchemaDigest, Timepoint};
+        use std::hint::black_box;
+        let at = Timepoint::try_from(42_i64)?;
+        let tenant = TenantId::parse("018f47c2-8bd8-7f21-a52b-8d4f6ee2b203")?;
+        let make = |size| -> anyhow::Result<_> {
+            Ok(prepare(
+                AuditEventV1::new(
+                    RecordIdentity::new(
+                        tenant,
+                        SourceIdentity::new(
+                            SourceId::parse("test")?,
+                            SourceContract::new(
+                                ContractId::from_static("test.audit"),
+                                ContractVersion::from_major(1)?,
+                                SchemaDigest::parse(&format!("sha256:{}", "a".repeat(64)))?,
+                            ),
+                        ),
+                        EventId::parse("event")?,
+                    ),
+                    EventFacts::new(
+                        ActorRef::new(ActorKind::parse("user")?, ActorId::parse("actor")?),
+                        Action::parse("read")?,
+                        ResourceRef::new(ResourceKind::parse("doc")?, ResourceId::parse("ref")?),
+                        Outcome::Succeeded,
+                        at,
+                    ),
+                    EventContext::new(
+                        Coordinates::new(None, None, None),
+                        AuditPayload::new(vec![7; size])?,
+                    ),
+                ),
+                at,
+            )?)
+        };
+        let empty = make(0)?;
+        let small = make(32)?;
+        let big = make(MAX_RECORD_BYTES - empty.canonical_bytes().len())?;
+        let project = |rows: [&PreparedAuditV1; 8]| {
+            allocation_counter::measure(|| {
+                black_box(rows.map(|row| entry(row, 1, Some(1))));
+            })
+        };
+        let reference = project([&empty; 8]);
+        for rows in [
+            [&small; 8],
+            [&big; 8],
+            [&small, &big, &small, &big, &small, &big, &small, &big],
+        ] {
+            let measured = project(rows);
+            assert_eq!(
+                (measured.count_total, measured.bytes_total),
+                (reference.count_total, reference.bytes_total)
+            );
+        }
+        // A full owned decode materializes the payload. The same allocator observes the copy.
+        let positive = allocation_counter::measure(|| {
+            black_box(decode_untrusted(big.canonical_bytes()).ok());
+        });
+        assert!(positive.bytes_total >= (MAX_RECORD_BYTES - empty.canonical_bytes().len()) as u64);
+        Ok(())
+    }
     #[test]
     fn outcome_wire_labels_preserve_unknown() {
         for (value, expected) in [
