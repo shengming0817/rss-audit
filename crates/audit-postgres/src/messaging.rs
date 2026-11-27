@@ -32,52 +32,65 @@ pub async fn lock_head_in(tx: &mut PgTransaction<'_>, integrity: &Integrity) -> 
     let _ = integrity;
     Ok(())
 }
-/// Stage one exact prepared record. Propagate errors to the original transaction owner.
-pub async fn append_in(
-    tx: &mut PgTransaction<'_>,
-    integrity: &Integrity,
-    request: &PreparedAuditV1,
-) -> Result<StagedAppend, Error> {
-    append_batch_in(tx, integrity, std::slice::from_ref(request))
+impl crate::WriteBudget {
+    /// Stage one exact prepared record. Propagate errors to the original transaction owner.
+    pub async fn append_in(
+        &self,
+        tx: &mut PgTransaction<'_>,
+        integrity: &Integrity,
+        request: &PreparedAuditV1,
+    ) -> Result<StagedAppend, Error> {
+        self.append_batch_in(
+            tx,
+            integrity,
+            self.try_admit(std::slice::from_ref(request))?,
+        )
         .await?
         .pop()
         .ok_or(Error::StorageContract)
-}
-/// Physically batch Audit writes on the original connection and remaining budget.
-/// Results follow input order. Empty input does no persistence; conflicts require whole-transaction
-/// rollback. The host supplies stable bytes and owns unknown-result recovery. No settings or
-/// settlement authority change; optional Ledger work retains its necessary chain ordering.
-pub async fn append_batch_in(
-    tx: &mut PgTransaction<'_>,
-    integrity: &Integrity,
-    requests: &[PreparedAuditV1],
-) -> Result<Vec<StagedAppend>, Error> {
-    if requests.is_empty() {
-        return Ok(Vec::new());
     }
-    if repository::batch_tenant(requests)? != tx.tenant_id() {
-        return Err(Error::ScopeMismatch);
+    /// Physically batch Audit writes on the original connection and remaining budget.
+    /// Results follow input order. Empty input does no persistence; conflicts require whole-transaction
+    /// rollback. The host supplies stable bytes and owns unknown-result recovery. No settings or
+    /// settlement authority change; optional Ledger work retains its necessary chain ordering.
+    pub async fn append_batch_in(
+        &self,
+        tx: &mut PgTransaction<'_>,
+        integrity: &Integrity,
+        batch: crate::AdmittedBatch<'_>,
+    ) -> Result<Vec<StagedAppend>, Error> {
+        self.check_domain(&batch)?;
+        let requests = batch.records;
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if batch.tenant != Some(tx.tenant_id()) {
+            return Err(Error::ScopeMismatch);
+        }
+        let mut ledger = Vec::with_capacity(requests.len());
+        for request in requests {
+            let entry = match integrity {
+                Integrity::Plain => None,
+                #[cfg(feature = "ledger")]
+                Integrity::Ledger(auth) => {
+                    let staged = rss_ledger_postgres::append_in(
+                        tx,
+                        auth.clone(),
+                        &request.append_request()?,
+                    )
+                    .await?;
+                    Some((staged.entry().sequence().get(), staged.inserted()))
+                }
+            };
+            #[cfg(not(feature = "ledger"))]
+            let _ = request;
+            ledger.push(entry);
+        }
+        tx.with_connection_context(&mut (batch, ledger), |(batch, ledger), c| {
+            Box::pin(async move { Ok(repository::append_batch(c, batch, ledger).await) })
+        })
+        .await?
     }
-    let mut ledger = Vec::with_capacity(requests.len());
-    for request in requests {
-        let entry = match integrity {
-            Integrity::Plain => None,
-            #[cfg(feature = "ledger")]
-            Integrity::Ledger(auth) => {
-                let staged =
-                    rss_ledger_postgres::append_in(tx, auth.clone(), &request.append_request()?)
-                        .await?;
-                Some((staged.entry().sequence().get(), staged.inserted()))
-            }
-        };
-        #[cfg(not(feature = "ledger"))]
-        let _ = request;
-        ledger.push(entry);
-    }
-    tx.with_connection_context(&mut (requests, ledger), |(requests, ledger), c| {
-        Box::pin(async move { Ok(repository::append_batch(c, requests, ledger).await) })
-    })
-    .await?
 }
 
 impl From<Error> for PgError {
@@ -87,6 +100,8 @@ impl From<Error> for PgError {
             Error::Messaging(original) => return original,
             #[cfg(feature = "ledger")]
             Error::Ledger(original) => return original.into(),
+            Error::WriteBusy => MessagingErrorKind::Transient,
+            Error::WriteLimit => MessagingErrorKind::Permanent,
             Error::Conflict => MessagingErrorKind::Conflict,
             Error::Deadline(_) | Error::Cancelled(_) => MessagingErrorKind::DeadlineElapsed,
             Error::Admission(_) | Error::StorageContract => MessagingErrorKind::Invariant,

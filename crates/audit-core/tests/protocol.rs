@@ -487,7 +487,8 @@ fn debug_output_redacts_sensitive_values() -> Result<(), Box<dyn std::error::Err
 }
 
 #[test]
-fn recovery_adopts_the_validated_allocation_and_shares_summary() -> Result<(), Box<dyn std::error::Error>> {
+fn recovery_adopts_the_validated_allocation_and_shares_summary()
+-> Result<(), Box<dyn std::error::Error>> {
     let bytes = golden_v1()?;
     let address = bytes.as_ptr();
     assert_eq!(rss_audit_core::canonical_len(&event()?)?, bytes.len());
@@ -498,6 +499,9 @@ fn recovery_adopts_the_validated_allocation_and_shares_summary() -> Result<(), B
     assert_eq!(prepared.occurred_at().unix_seconds(), 1_726_000_000);
     let mut corrupt = prepared.canonical_bytes().to_vec();
     corrupt.push(0);
-    assert_eq!(rss_audit_core::PreparedAuditV1::from_canonical_bytes(corrupt).err(), Some(Error::UnknownField));
+    assert_eq!(
+        rss_audit_core::PreparedAuditV1::from_canonical_bytes(corrupt).err(),
+        Some(Error::UnknownField)
+    );
     Ok(())
 }

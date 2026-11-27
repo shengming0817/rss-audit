@@ -19,6 +19,7 @@ impl Aead for UnavailableCaptureKey {
     }
 }
 struct ProjectionEffect {
+    capacity: rss_audit_postgres::WriteBudget,
     integrity: Integrity,
     fail: bool,
 }
@@ -31,7 +32,8 @@ impl PgConsumerEffect<Vec<u8>> for ProjectionEffect {
     ) -> Result<TerminalDisposition, PgConsumerEffectFailure> {
         let prepared = PreparedAuditV1::from_canonical_bytes(message.payload())
             .map_err(PgConsumerEffectFailure::infrastructure)?;
-        rss_audit_postgres::append_in(tx, &self.integrity, &prepared)
+        self.capacity
+            .append_in(tx, &self.integrity, &prepared)
             .await
             .map_err(PgConsumerEffectFailure::infrastructure)?;
         if self.fail {
@@ -161,6 +163,7 @@ async fn scenario(
         group.clone(),
         domain.clone(),
         ProjectionEffect {
+            capacity: write_budget()?,
             integrity: Integrity::Ledger(auth()?),
             fail,
         },

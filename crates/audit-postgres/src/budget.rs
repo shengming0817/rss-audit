@@ -17,10 +17,18 @@ pub struct WriteBudget {
 impl WriteBudget {
     /// All limits are positive; a legal batch must fit in the shared capacity.
     pub fn new(rows: usize, bytes: u32, in_flight_bytes: u32) -> Result<Self, Error> {
-        if rows == 0 || bytes == 0 || bytes > in_flight_bytes || in_flight_bytes as usize > Semaphore::MAX_PERMITS {
+        if rows == 0
+            || bytes == 0
+            || bytes > in_flight_bytes
+            || in_flight_bytes as usize > Semaphore::MAX_PERMITS
+        {
             return Err(Error::WriteLimit);
         }
-        Ok(Self { rows, bytes, capacity: Arc::new(Semaphore::new(in_flight_bytes as usize)) })
+        Ok(Self {
+            rows,
+            bytes,
+            capacity: Arc::new(Semaphore::new(in_flight_bytes as usize)),
+        })
     }
     fn charge(&self, rows: usize, bytes: usize) -> Result<u32, Error> {
         if rows > self.rows || bytes > self.bytes as usize || (rows == 0) != (bytes == 0) {
@@ -30,32 +38,75 @@ impl WriteBudget {
     }
     /// Wait before materializing a batch or checking out a connection. The request contains
     /// only dimensions. Cancellation, expiry, and dropping the future relinquish its place.
-    pub async fn reserve<T: ExecutionTimer>(&self, rows: usize, bytes: usize, control: &Control<'_, T>) -> Result<WriteReservation, Error> {
+    pub async fn reserve<T: ExecutionTimer>(
+        &self,
+        rows: usize,
+        bytes: usize,
+        control: &Control<'_, T>,
+    ) -> Result<WriteReservation, Error> {
         control.check(Stage::Operation)?;
         let charge = self.charge(rows, bytes)?;
-        let permit = if charge == 0 { None } else {
-            Some(control.run(Stage::Operation, async {
-                self.capacity.clone().acquire_many_owned(charge).await.map_err(|_| Error::StorageContract)
-            }).await?)
+        let permit = if charge == 0 {
+            None
+        } else {
+            Some(
+                control
+                    .run(Stage::Operation, async {
+                        self.capacity
+                            .clone()
+                            .acquire_many_owned(charge)
+                            .await
+                            .map_err(|_| Error::StorageContract)
+                    })
+                    .await?,
+            )
         };
         control.check(Stage::Operation)?;
-        Ok(WriteReservation { budget: self.clone(), rows, bytes, permit })
+        Ok(WriteReservation {
+            budget: self.clone(),
+            rows,
+            bytes,
+            permit,
+        })
     }
     pub(crate) fn try_reserve(&self, rows: usize, bytes: usize) -> Result<WriteReservation, Error> {
         let charge = self.charge(rows, bytes)?;
-        let permit = if charge == 0 { None } else {
-            Some(self.capacity.clone().try_acquire_many_owned(charge).map_err(|_| Error::WriteBusy)?)
+        let permit = if charge == 0 {
+            None
+        } else {
+            Some(
+                self.capacity
+                    .clone()
+                    .try_acquire_many_owned(charge)
+                    .map_err(|_| Error::WriteBusy)?,
+            )
         };
-        Ok(WriteReservation { budget: self.clone(), rows, bytes, permit })
+        Ok(WriteReservation {
+            budget: self.clone(),
+            rows,
+            bytes,
+            permit,
+        })
     }
     /// Admit already prepared input immediately, including inside a borrowed transaction.
-    pub fn try_admit<'a>(&self, records: &'a [PreparedAuditV1]) -> Result<AdmittedBatch<'a>, Error> {
+    pub fn try_admit<'a>(
+        &self,
+        records: &'a [PreparedAuditV1],
+    ) -> Result<AdmittedBatch<'a>, Error> {
         let (bytes, tenant) = dimensions(records, self.rows, self.bytes as usize)?;
         let reservation = self.try_reserve(records.len(), bytes)?;
-        Ok(AdmittedBatch { records, tenant, reservation })
+        Ok(AdmittedBatch {
+            records,
+            tenant,
+            reservation,
+        })
     }
     pub(crate) fn check_domain(&self, batch: &AdmittedBatch<'_>) -> Result<(), Error> {
-        if Arc::ptr_eq(&self.capacity, &batch.reservation.budget.capacity) { Ok(()) } else { Err(Error::WriteLimit) }
+        if Arc::ptr_eq(&self.capacity, &batch.reservation.budget.capacity) {
+            Ok(())
+        } else {
+            Err(Error::WriteLimit)
+        }
     }
 }
 
@@ -68,9 +119,16 @@ pub struct WriteReservation {
 }
 impl WriteReservation {
     /// Bind to the actual original input, including duplicates; reject an underestimate.
-    pub fn bind(self, records: &[PreparedAuditV1]) -> Result<AdmittedBatch<'_>, Error> {
-        let (_, tenant) = dimensions(records, self.rows, self.bytes)?;
-        Ok(AdmittedBatch { reservation: self, tenant, records })
+    pub fn bind(mut self, records: &[PreparedAuditV1]) -> Result<AdmittedBatch<'_>, Error> {
+        let (actual, tenant) = dimensions(records, self.rows, self.bytes)?;
+        if let Some(permit) = &mut self.permit {
+            drop(permit.split(self.bytes - actual));
+        }
+        Ok(AdmittedBatch {
+            reservation: self,
+            tenant,
+            records,
+        })
     }
 }
 
@@ -81,18 +139,31 @@ pub struct AdmittedBatch<'a> {
     reservation: WriteReservation,
 }
 impl AdmittedBatch<'_> {
-    pub(crate) fn into_permit(self) -> Option<OwnedSemaphorePermit> { self.reservation.permit }
+    pub(crate) fn into_permit(self) -> Option<OwnedSemaphorePermit> {
+        self.reservation.permit
+    }
 }
 
 fn add_length(total: usize, next: usize, max: usize) -> Result<usize, Error> {
-    total.checked_add(next).filter(|value| *value <= max).ok_or(Error::WriteLimit)
+    total
+        .checked_add(next)
+        .filter(|value| *value <= max)
+        .ok_or(Error::WriteLimit)
 }
-fn dimensions(records: &[PreparedAuditV1], max_rows: usize, max_bytes: usize) -> Result<(usize, Option<TenantId>), Error> {
-    if records.len() > max_rows { return Err(Error::WriteLimit); }
+fn dimensions(
+    records: &[PreparedAuditV1],
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<(usize, Option<TenantId>), Error> {
+    if records.len() > max_rows {
+        return Err(Error::WriteLimit);
+    }
     let tenant = records.first().map(|r| r.identity().tenant());
     let mut bytes = 0;
     for record in records {
-        if Some(record.identity().tenant()) != tenant { return Err(Error::ScopeMismatch); }
+        if Some(record.identity().tenant()) != tenant {
+            return Err(Error::ScopeMismatch);
+        }
         bytes = add_length(bytes, record.canonical_bytes().len(), max_bytes)?;
     }
     Ok((bytes, tenant))
@@ -103,7 +174,10 @@ mod tests {
     #[test]
     fn rejects_overflow_and_individually_impossible_requests() -> anyhow::Result<()> {
         let budget = WriteBudget::new(8, 64, 128)?;
-        assert!(matches!(add_length(usize::MAX, 1, usize::MAX), Err(Error::WriteLimit)));
+        assert!(matches!(
+            add_length(usize::MAX, 1, usize::MAX),
+            Err(Error::WriteLimit)
+        ));
         assert!(matches!(budget.try_reserve(9, 1), Err(Error::WriteLimit)));
         assert!(matches!(budget.try_reserve(8, 65), Err(Error::WriteLimit)));
         let first = budget.try_reserve(8, 64)?;

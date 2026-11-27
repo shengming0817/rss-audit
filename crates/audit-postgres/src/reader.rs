@@ -23,7 +23,7 @@ impl PgAuditReader {
         control: &Control<'_, T>,
     ) -> Result<Self, Error> {
         Ok(Self {
-            inner: PgAudit::connect(pool, integrity, control, false).await?,
+            inner: PgAudit::connect(pool, integrity, control, None).await?,
         })
     }
     /// Validate another actual borrowed connection as the same strictly read-only capability.
@@ -35,7 +35,7 @@ impl PgAuditReader {
         control
             .run(
                 LocalTxDeadlineStage::Setup,
-                crate::runtime::validate_storage(connection, &self.inner.integrity, control, false),
+                crate::runtime::validate_storage(connection, &self.inner.integrity, control, None),
             )
             .await
     }

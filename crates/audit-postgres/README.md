@@ -49,7 +49,7 @@ prevents rollback from starting, the result is `RollbackFailed` with both causes
 Preparation errors before COMMIT also use this rollback path. `CommitUnknown` requires
 that this owner has actually started the COMMIT operation.
 
-With `messaging`, `append_in(&mut PgTransaction, &integrity, &prepared)` borrows the actual message connection,
+With `messaging`, `budget.append_in(&mut PgTransaction, &integrity, &prepared)` borrows the actual message connection,
 inherits its tenant and remaining budget, and changes no GUC, isolation level or lifecycle state.
 It does not require a `PgAudit` object or any connection pool. Its result is staged; only the original message owner
 can settle Inbox/business/Audit/ledger together and mint ACK authority. Return failures through
@@ -68,7 +68,7 @@ Replay preserves the original bytes and timestamp. An absent read is not rollbac
 unknown business transaction must not be rerun merely to regenerate its audit input.
 
 The pool-free messaging functions are `validate_in(tx, integrity)`, `lock_head_in(tx, integrity)`,
-`append_in(tx, integrity, prepared)` and `append_batch_in(tx, integrity, records)`.
+`budget.append_in(tx, integrity, prepared)` and `budget.append_batch_in(tx, integrity, batch)`.
 Single-item calls delegate to the physical batch kernel. The batch retains input order and original
 transaction budget; any error must abort the enclosing transaction. No resolver or compatibility
 method remains. Native SQLx and Audit-owned transactions use the same persistence kernel.
@@ -154,7 +154,7 @@ Read-only hosts use `PgAuditReader` with a separately provisioned credential tha
 
 ## Borrow an existing SQLx transaction
 
-`append_in_transaction(tx, prepared, control)` and `append_batch_in_transaction(tx, records, control)`
+`append_in_transaction(tx, prepared, control)` and `append_batch_in_transaction(tx, batch, control)`
 use the same Audit write kernel as owned transactions and the messaging adapter. Batch results
 follow input order; repeated identical identities return the same record and only the first newly
 inserted occurrence has `inserted=true`. Different bytes conflict. Empty input does no DB work.
@@ -166,3 +166,20 @@ and owns isolation, commit/rollback and connection quarantine. The adapter never
 connection or changes GUCs. Propagate any error and roll back the whole transaction. Under stronger
 isolation, competing writes can cause serialization failure; only the host retries the transaction.
 Prepare exact bytes with recorder-authoritative time before append and retain them after uncertainty.
+
+### Write capacity
+
+Create `WriteBudget::new(max_rows, max_batch_bytes, in_flight_bytes)` once per host
+capacity domain. Pass clones to `PgAudit::new(pool, integrity, budget, control)` and the
+pool-free message writers. All sizes are complete Audit V1 bytes, including repeated inputs.
+For sizes known before encoding, call `budget.reserve(rows, bytes, control).await` before
+preparation or pool checkout. Bind the returned reservation to the final slice with `bind`.
+Use Core's `canonical_len` for the exact size. Binding refunds excess bytes.
+For existing input or a borrowed connection use `budget.try_admit(records)` immediately.
+Both routes produce a single-use batch. Supply it to the SQLx or message batch append.
+The owned transaction callback accepts it via `tx.append_admitted(batch)`.
+Underestimates and impossible dimensions return `WriteLimit`; temporary exhaustion
+returns `WriteBusy`. Propagate either error to the original transaction owner.
+Dropping a waiter or grant returns capacity. Borrowed writes release it on return;
+owned transactions retain staged grants until settlement. Retained host retry bytes,
+receipts, SQLx buffers and allocator overhead are outside the canonical-byte charge.

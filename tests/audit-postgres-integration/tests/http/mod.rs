@@ -549,7 +549,8 @@ async fn unavailable(
         .max_connections(1)
         .connect_with((*pool.connect_options()).clone())
         .await?;
-    let unavailable = PgAudit::new(detached.clone(), Integrity::Plain, control).await?;
+    let unavailable =
+        PgAudit::new(detached.clone(), Integrity::Plain, write_budget()?, control).await?;
     detached.close().await;
     let (status, _, outcome) = inspect(
         router::<Session, _, _>(unavailable, Policy, TestClock)
@@ -724,7 +725,7 @@ async fn seed_capacity(
     .bind(tenant.to_string())
     .execute(&mut *tx)
     .await?;
-    pg.append_batch_in_transaction(&mut tx, &rows, control)
+    pg.append_batch_in_transaction(&mut tx, pg.try_admit(&rows)?, control)
         .await?;
     tx.commit().await?;
     Ok((tenant, total_bytes))

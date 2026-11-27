@@ -33,7 +33,7 @@ never a successful shorter page. These bounds charge canonical records, not exac
 
 The grant explicitly selects `SelfAudit::NotRequired` or `SelfAudit::Required(prepared)`. For Required, the host durably preserves the exact prepared bytes
 and stable event ID before dispatch. This type does not prove durable preservation. In one tenant
-transaction the adapter selects the page, then appends the query attempt. Only a confirmed COMMIT
+transaction the adapter selects the page, then appends the query attempt. Write capacity for Required is acquired before pool checkout; temporary exhaustion returns 503. Summary and cursor rendering follow settlement. Only a confirmed COMMIT
 permits returning the page. An audit record must not claim the HTTP client received the response.
 
 Never wrap the transaction handler in a timeout that drops its future. Propagate the host token

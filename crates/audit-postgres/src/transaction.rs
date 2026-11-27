@@ -123,6 +123,8 @@ impl<T: ExecutionTimer> ReadAuditTransaction<'_, '_, '_, T> {
 /// Tenant-bound write access, handed to the callback after optional Ledger locks.
 /// Operations share the connection, admitted storage and absolute operation cutoff.
 pub struct WriteAuditTransaction<'a, 'db, 'control, T> {
+    pub(crate) write_budget: Option<&'control crate::WriteBudget>,
+    pub(crate) held: &'a mut Option<tokio::sync::OwnedSemaphorePermit>,
     pub(crate) read: ReadAuditTransaction<'a, 'db, 'control, T>,
 }
 impl<'a, 'db, 'control, T> std::ops::Deref for WriteAuditTransaction<'a, 'db, 'control, T> {
@@ -160,17 +162,43 @@ impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
     /// In Ledger mode acquire the chain before business/outbox locks.
     pub async fn append(&mut self, request: &PreparedAuditV1) -> Result<StagedAppend, Error> {
         self.read.control.check(Stage::Operation)?;
-        if request.identity().tenant() != self.read.tenant {
+        let batch = self
+            .write_budget
+            .ok_or(Error::StorageContract)?
+            .try_admit(std::slice::from_ref(request))?;
+        self.append_admitted(batch)
+            .await?
+            .pop()
+            .ok_or(Error::StorageContract)
+    }
+    /// Stage an admitted batch; its grant remains held through the owner's settlement.
+    pub async fn append_admitted(
+        &mut self,
+        batch: crate::AdmittedBatch<'_>,
+    ) -> Result<Vec<StagedAppend>, Error> {
+        self.write_budget
+            .ok_or(Error::StorageContract)?
+            .check_domain(&batch)?;
+        if batch
+            .tenant
+            .is_some_and(|tenant| tenant != self.read.tenant)
+        {
             return Err(Error::ScopeMismatch);
         }
-        crate::borrowed::append_batch(
+        let result = crate::borrowed::append_batch(
             self.read.tx,
             self.read.integrity,
-            std::slice::from_ref(request),
+            &batch,
             self.read.control,
         )
-        .await?
-        .pop()
-        .ok_or(Error::StorageContract)
+        .await;
+        if let Some(permit) = batch.into_permit() {
+            if let Some(held) = self.held {
+                held.merge(permit);
+            } else {
+                *self.held = Some(permit);
+            }
+        }
+        result
     }
 }

@@ -83,7 +83,13 @@ pub(super) async fn single_connection(pool: &PgPool) -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
     let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(5))?;
     let control = Control::new(&clock, cutoff, cutoff, &cancel);
-    let store = PgAudit::new(one.clone(), Integrity::Ledger(auth()?), &control).await?;
+    let store = PgAudit::new(
+        one.clone(),
+        Integrity::Ledger(auth()?),
+        write_budget()?,
+        &control,
+    )
+    .await?;
     let prepared = store
         .prepare(
             event(tenant()?, "single-connection", "id", vec![4])?,

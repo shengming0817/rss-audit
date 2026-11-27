@@ -18,7 +18,9 @@ pub const MAX_RECORD_BYTES: usize = 131_072;
 pub fn canonical_len(event: &AuditEventV1) -> Result<usize, Error> {
     let mut size = 0usize;
     visit_encoding(event, 0, |field| {
-        size = size.checked_add(field.len()).filter(|n| *n <= MAX_RECORD_BYTES)
+        size = size
+            .checked_add(field.len())
+            .filter(|n| *n <= MAX_RECORD_BYTES)
             .ok_or(Error::RecordTooLarge)?;
         Ok(())
     })?;
@@ -34,7 +36,11 @@ pub(crate) fn encode(event: &AuditEventV1, recorded_at: Timepoint) -> Result<Vec
     Ok(bytes)
 }
 
-fn visit_encoding(event: &AuditEventV1, recorded_at: i64, mut emit: impl FnMut(&[u8]) -> Result<(), Error>) -> Result<(), Error> {
+fn visit_encoding(
+    event: &AuditEventV1,
+    recorded_at: i64,
+    mut emit: impl FnMut(&[u8]) -> Result<(), Error>,
+) -> Result<(), Error> {
     let id = event.identity();
     let source = id.source();
     let contract = source.contract();
@@ -43,19 +49,36 @@ fn visit_encoding(event: &AuditEventV1, recorded_at: i64, mut emit: impl FnMut(&
     emit(DOMAIN)?;
     emit(&RecordVersion::V1.tag().to_be_bytes())?;
     emit(&id.tenant().octets())?;
-    for text in [source.source_id().as_str(), id.event_id().as_str(), contract.id().as_str()] {
+    for text in [
+        source.source_id().as_str(),
+        id.event_id().as_str(),
+        contract.id().as_str(),
+    ] {
         field(&mut emit, text.as_bytes())?;
     }
     emit(&contract.version().major().to_be_bytes())?;
-    for text in [contract.schema_digest().as_str(), facts.actor().kind().as_str(), facts.actor().id().as_str(), facts.action().as_str(), facts.resource().kind().as_str(), facts.resource().id().as_str()] {
+    for text in [
+        contract.schema_digest().as_str(),
+        facts.actor().kind().as_str(),
+        facts.actor().id().as_str(),
+        facts.action().as_str(),
+        facts.resource().kind().as_str(),
+        facts.resource().id().as_str(),
+    ] {
         field(&mut emit, text.as_bytes())?;
     }
     emit(&[facts.outcome().tag()])?;
     emit(&facts.occurred_at().unix_seconds().to_be_bytes())?;
     emit(&recorded_at.to_be_bytes())?;
-    for coordinate in [coordinates.correlation_id().map(CorrelationId::as_str), coordinates.request_id().map(RequestId::as_str), coordinates.operation_id().map(OperationId::as_str)] {
+    for coordinate in [
+        coordinates.correlation_id().map(CorrelationId::as_str),
+        coordinates.request_id().map(RequestId::as_str),
+        coordinates.operation_id().map(OperationId::as_str),
+    ] {
         emit(&[u8::from(coordinate.is_some())])?;
-        if let Some(text) = coordinate { field(&mut emit, text.as_bytes())?; }
+        if let Some(text) = coordinate {
+            field(&mut emit, text.as_bytes())?;
+        }
     }
     field(&mut emit, event.context().payload().as_bytes())
 }
@@ -71,8 +94,14 @@ fn field(emit: &mut impl FnMut(&[u8]) -> Result<(), Error>, bytes: &[u8]) -> Res
 /// evidence. Use [`crate::verify_window`] to authenticate a supplied ledger range.
 pub fn decode_untrusted(bytes: &[u8]) -> Result<DecodedAuditV1, Error> {
     let parsed = parse(bytes)?;
-    let context = EventContext::new(parsed.coordinates, AuditPayload::new(parsed.payload.to_vec())?);
-    Ok(DecodedAuditV1::new(AuditEventV1::new(parsed.identity, parsed.facts, context), parsed.recorded_at))
+    let context = EventContext::new(
+        parsed.coordinates,
+        AuditPayload::new(parsed.payload.to_vec())?,
+    );
+    Ok(DecodedAuditV1::new(
+        AuditEventV1::new(parsed.identity, parsed.facts, context),
+        parsed.recorded_at,
+    ))
 }
 
 pub(crate) struct Parsed<'a> {
@@ -150,7 +179,13 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Parsed<'_>, Error> {
         outcome,
         occurred_at,
     );
-    Ok(Parsed { identity, facts, recorded_at, coordinates: Coordinates::new(correlation_id, request_id, operation_id), payload })
+    Ok(Parsed {
+        identity,
+        facts,
+        recorded_at,
+        coordinates: Coordinates::new(correlation_id, request_id, operation_id),
+        payload,
+    })
 }
 
 fn decode_tenant(bytes: &[u8]) -> Result<TenantId, Error> {

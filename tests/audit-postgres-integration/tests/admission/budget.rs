@@ -14,7 +14,7 @@ pub(super) async fn run(pool: &PgPool) -> anyhow::Result<()> {
             Integrity::Plain
         };
         // Both startup entrypoints use the owner cutoff even after Operation expired.
-        let store = PgAudit::new(pool.clone(), integrity, &control).await?;
+        let store = PgAudit::new(pool.clone(), integrity, write_budget()?, &control).await?;
         let mut actual = pool.acquire().await?;
         store.validate_connection(&mut actual, &control).await?;
         expired_owner(pool, &store, &mut actual, ledger).await?;
@@ -46,7 +46,7 @@ async fn expired_owner(
         Integrity::Plain
     };
     assert!(matches!(
-        PgAudit::new(pool.clone(), integrity, &control).await,
+        PgAudit::new(pool.clone(), integrity, write_budget()?, &control).await,
         Err(Error::Deadline(Stage::Acquire))
     ));
     assert!(matches!(

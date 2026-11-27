@@ -15,10 +15,14 @@ impl PgAudit {
         request: &PreparedAuditV1,
         control: &Control<'_, T>,
     ) -> Result<StagedAppend, Error> {
-        append_batch(tx, &self.integrity, std::slice::from_ref(request), control)
-            .await?
-            .pop()
-            .ok_or(Error::StorageContract)
+        self.append_batch_in_transaction(
+            tx,
+            self.try_admit(std::slice::from_ref(request))?,
+            control,
+        )
+        .await?
+        .pop()
+        .ok_or(Error::StorageContract)
     }
     /// Physically batch Audit writes on the original transaction and absolute budget.
     /// Results follow input order; repeated identical input returns the same record, with
@@ -28,24 +32,25 @@ impl PgAudit {
     pub async fn append_batch_in_transaction<T: ExecutionTimer>(
         &self,
         tx: &mut Transaction<'_, Postgres>,
-        requests: &[PreparedAuditV1],
+        batch: crate::AdmittedBatch<'_>,
         control: &Control<'_, T>,
     ) -> Result<Vec<StagedAppend>, Error> {
-        append_batch(tx, &self.integrity, requests, control).await
+        self.budget()?.check_domain(&batch)?;
+        append_batch(tx, &self.integrity, &batch, control).await
     }
 }
 
 pub(crate) async fn append_batch<T: ExecutionTimer>(
     tx: &mut Transaction<'_, Postgres>,
     integrity: &Integrity,
-    requests: &[PreparedAuditV1],
+    batch: &crate::AdmittedBatch<'_>,
     control: &Control<'_, T>,
 ) -> Result<Vec<StagedAppend>, Error> {
     control.check(Stage::Operation)?;
+    let requests = batch.records;
     if requests.is_empty() {
         return Ok(Vec::new());
     }
-    repository::batch_tenant(requests)?;
     control
         .run(Stage::Operation, async {
             let mut ledger = Vec::with_capacity(requests.len());
@@ -67,7 +72,7 @@ pub(crate) async fn append_batch<T: ExecutionTimer>(
                 let _ = request;
                 ledger.push(entry);
             }
-            repository::append_batch(tx, requests, &ledger).await
+            repository::append_batch(tx, batch, &ledger).await
         })
         .await
 }

@@ -1,4 +1,4 @@
-use rss_audit_core::{Outcome, decode_untrusted};
+use rss_audit_core::Outcome;
 use rss_audit_postgres::{Error, Page, Record};
 use rss_request_context::TenantId;
 use serde::Serialize;
@@ -30,39 +30,56 @@ struct LedgerDto {
     record_id: String,
     sequence: String,
 }
-impl PageDto {
-    pub(crate) fn new(tenant: TenantId, page: &Page) -> Result<Self, Error> {
+/// All fallible page checks are complete when this value leaves the transaction.
+pub(crate) struct CheckedPage {
+    tenant: TenantId,
+    page: Page,
+    continuation: Option<(u64, u64)>,
+}
+impl CheckedPage {
+    pub(crate) fn new(tenant: TenantId, page: Page) -> Result<Self, Error> {
+        let continuation = page
+            .next()
+            .map(|cursor| cursor.continuation().ok_or(Error::StorageContract))
+            .transpose()?;
         Ok(Self {
-            tenant_id: tenant.to_string(),
-            integrity: "unverified",
-            entries: page.records().iter().map(entry).collect::<Result<_, _>>()?,
-            next_cursor: page.next().map(crate::query::encode).transpose()?,
+            tenant,
+            page,
+            continuation,
         })
     }
+    pub(crate) fn into_dto(self) -> PageDto {
+        PageDto {
+            tenant_id: self.tenant.to_string(),
+            integrity: "unverified",
+            entries: self.page.records().iter().map(entry).collect(),
+            next_cursor: self
+                .continuation
+                .map(|(after, through)| crate::query::encode(self.tenant, after, through)),
+        }
+    }
 }
-fn entry(record: &Record) -> Result<EntryDto, Error> {
-    let decoded = decode_untrusted(record.prepared().canonical_bytes())
-        .map_err(|_| Error::StorageContract)?;
-    let event = decoded.event();
-    let facts = event.facts();
-    Ok(EntryDto {
+fn entry(record: &Record) -> EntryDto {
+    let prepared = record.prepared();
+    let id = prepared.identity();
+    EntryDto {
         position: record.position().to_string(),
-        source_id: event.identity().source().source_id().as_str().to_owned(),
-        event_id: event.identity().event_id().as_str().to_owned(),
-        action: facts.action().as_str().to_owned(),
-        outcome: outcome(facts.outcome()),
-        occurred_at: facts.occurred_at().unix_seconds().to_string(),
-        recorded_at: decoded.recorded_at().unix_seconds().to_string(),
+        source_id: id.source().source_id().as_str().to_owned(),
+        event_id: id.event_id().as_str().to_owned(),
+        action: prepared.action().as_str().to_owned(),
+        outcome: outcome(prepared.outcome()),
+        occurred_at: prepared.occurred_at().unix_seconds().to_string(),
+        recorded_at: prepared.recorded_at().unix_seconds().to_string(),
         ledger: record.ledger_sequence().map(|sequence| LedgerDto {
             chain_id: "rss.audit.v1".to_owned(),
             record_id: format!(
                 "v1:{}:{}",
-                event.identity().source().source_id().as_str(),
-                event.identity().event_id().as_str()
+                id.source().source_id().as_str(),
+                id.event_id().as_str()
             ),
             sequence: sequence.to_string(),
         }),
-    })
+    }
 }
 
 fn outcome(value: Outcome) -> &'static str {

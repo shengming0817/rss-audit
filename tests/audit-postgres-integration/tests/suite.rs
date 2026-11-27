@@ -27,6 +27,9 @@ mod query_cost;
 mod reader;
 mod reads;
 
+fn write_budget() -> Result<rss_audit_postgres::WriteBudget, Error> {
+    rss_audit_postgres::WriteBudget::new(1024, 8 * 1024 * 1024, 32 * 1024 * 1024)
+}
 struct TestClock;
 impl Clock for TestClock {
     fn now(&self) -> Instant {
@@ -146,10 +149,11 @@ async fn run() -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
     let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(150))?;
     let control = Control::new(&clock, cutoff, cutoff, &cancel);
-    let plain = PgAudit::new(pool.clone(), Integrity::Plain, &control)
+    let shared = write_budget()?;
+    let plain = PgAudit::new(pool.clone(), Integrity::Plain, shared.clone(), &control)
         .await
         .context("plain startup")?;
-    let ledger = PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), &control)
+    let ledger = PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), shared, &control)
         .await
         .context("ledger startup")?;
     exercise(&plain, &ledger, &pool, &admin, &fixture, &control).await?;
