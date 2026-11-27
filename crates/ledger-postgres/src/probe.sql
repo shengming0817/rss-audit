@@ -25,7 +25,11 @@ WITH reachable AS (
 (11,'permissions',NOT EXISTS(SELECT FROM funcs p CROSS JOIN LATERAL aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a WHERE a.grantee=0)),
 (12,'rls',(SELECT count(*)=2 AND bool_and(polname='tenant_scope' AND polcmd='*' AND polpermissive AND polroles=ARRAY[0::oid] AND pg_get_expr(polqual,polrelid)=pg_get_expr(polwithcheck,polrelid) AND pg_get_expr(polqual,polrelid)='(tenant_id = (NULLIF(current_setting(''rss.tenant_id''::text, true), ''''::text))::uuid)') FROM pg_policy WHERE polrelid IN (SELECT oid FROM relations))),
 (13,'columns',(SELECT count(*)=15 AND bool_and(attgenerated='' AND attidentity='') FROM pg_attribute WHERE attrelid IN(SELECT oid FROM relations) AND attnum>0 AND NOT attisdropped)),
-(14,'constraints',(SELECT count(*)=18 AND count(DISTINCT (conrelid,pg_get_constraintdef(oid)))=18 AND bool_and(convalidated) FROM pg_constraint WHERE conrelid IN(SELECT oid FROM relations))),
+-- PG18 catalogs NOT NULL here too. Check validity for every row and nullability with the columns below.
+(14,'constraints',(SELECT bool_and(convalidated)
+ AND count(*) FILTER (WHERE contype<>'n')=18
+ AND count(DISTINCT (conrelid,pg_get_constraintdef(oid))) FILTER (WHERE contype<>'n')=18
+ FROM pg_constraint WHERE conrelid IN(SELECT oid FROM relations))),
 (15,'columns',NOT EXISTS (
  SELECT FROM (
     SELECT c.relname::text,a.attname::text,format_type(a.atttypid,a.atttypmod),a.attnotnull
@@ -41,6 +45,7 @@ WITH reachable AS (
 (19,'constraints',NOT EXISTS (
  SELECT FROM (
     SELECT c.relname::text,pg_get_constraintdef(k.oid) FROM pg_constraint k JOIN relations c ON c.oid=k.conrelid
+    WHERE k.contype<>'n'
     EXCEPT VALUES
     ('entries',$d$CHECK (((seq <> 0) OR (previous_tag = decode(repeat('00'::text, 32), 'hex'::text))))$d$),
     ('entries','CHECK ((encoding_version = 1))'),
