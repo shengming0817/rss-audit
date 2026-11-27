@@ -14,6 +14,7 @@ use tracing_subscriber::{
 #[derive(Default)]
 struct Cost {
     ledger_sql: AtomicUsize,
+    scope_sql: AtomicUsize,
     ledger_writes: AtomicUsize,
     sign: AtomicUsize,
     verify: AtomicUsize,
@@ -24,6 +25,7 @@ struct Observer(Arc<Cost>);
 #[derive(Default)]
 struct Fields {
     ledger: bool,
+    scope: bool,
     write: bool,
     bytes: usize,
 }
@@ -31,6 +33,7 @@ impl Visit for Fields {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if matches!(field.name(), "summary" | "db.statement") {
             let sql = format!("{value:?}");
+            self.scope |= sql.contains("current_setting(");
             self.ledger |= sql.contains("rss_ledger.");
             self.write |= sql.contains("rss_ledger.insert_entr");
         }
@@ -47,6 +50,7 @@ impl<S: Subscriber> Layer<S> for Observer {
         match event.metadata().target() {
             "sqlx::query" => {
                 event.record(&mut f);
+                self.0.scope_sql.fetch_add(usize::from(f.scope), Relaxed);
                 self.0.ledger_sql.fetch_add(usize::from(f.ledger), Relaxed);
                 self.0
                     .ledger_writes
@@ -97,58 +101,131 @@ pub(super) async fn measure(
                     };
                     rows.push(prepare(event(tenant, mode, &id, vec![3; bytes])?, at)?);
                 }
-                let mut tx = pool.begin().await?;
-                sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
-                    .bind(tenant.to_string())
-                    .execute(&mut *tx)
-                    .await?;
-                let cost = Arc::new(Cost::default());
-                let subscriber = tracing_subscriber::registry().with(Observer(cost.clone()));
-                let receipts = owner
-                    .append_batch_in_transaction(&mut tx, owner.try_admit(&rows)?, control)
-                    .with_subscriber(subscriber)
-                    .await?;
-                let recovered = receipts
-                    .iter()
-                    .zip(&rows)
-                    .filter(|(r, input)| {
-                        !std::ptr::eq(
-                            r.record().prepared().canonical_bytes(),
-                            input.canonical_bytes(),
-                        )
-                    })
-                    .count();
-                let receipt_copies = receipts
-                    .iter()
-                    .filter(|r| {
-                        !std::ptr::eq(
-                            r.record().clone().prepared().canonical_bytes(),
-                            r.record().prepared().canonical_bytes(),
-                        )
-                    })
-                    .count();
-                assert!(receipts.iter().all(|r| r.inserted()));
-                let sql = cost.ledger_sql.load(Relaxed);
-                let writes = cost.ledger_writes.load(Relaxed);
-                let verify = cost.verify.load(Relaxed);
-                let sign = cost.sign.load(Relaxed);
-                let audit_bytes = cost.audit_body.load(Relaxed);
-                let ledger_bytes = cost.ledger_body.load(Relaxed);
-                println!(
-                    "BATCH {mode} {profile} n={n} audit_bytes={audit_bytes} recovered={recovered} receipt_copies={receipt_copies} ledger_sql={sql} writes={writes} verify={verify} sign={sign} ledger_bytes={ledger_bytes}"
+                let sample = observe(owner, pool, control, &rows).await?;
+                sample.print(mode, profile, "fresh", n);
+                assert_eq!(
+                    (sample.audit_bytes, sample.recovered, sample.extra_copies),
+                    (0, 0, 0)
                 );
-                assert_eq!((audit_bytes, recovered, receipt_copies), (0, 0, 0));
+                assert_eq!(sample.inserted, n);
                 if mode == "ledger" {
-                    assert_eq!((verify, sign), (1, n));
-                    assert_eq!(writes, n.div_ceil(32));
-                    assert_eq!(sql, 2 + 2 * writes);
-                    assert_eq!(ledger_bytes, seed.canonical_bytes().len());
+                    let chunks = n.div_ceil(32);
+                    assert_eq!((sample.verify, sample.sign, sample.scope), (1, n, 1));
+                    assert_eq!((sample.writes, sample.sql), (chunks, 2 + 2 * chunks));
+                    assert_eq!(sample.ledger_bytes, seed.canonical_bytes().len());
                 } else {
-                    assert_eq!((sql, writes, verify, sign, ledger_bytes), (0, 0, 0, 0, 0));
+                    assert_eq!(
+                        (sample.sql, sample.scope, sample.verify, sample.sign),
+                        (0, 0, 0, 0)
+                    );
                 }
-                tx.rollback().await?;
+            }
+        }
+        let new = prepare(event(tenant, mode, "fresh", vec![8])?, at)?;
+        for (case, inputs, inserted) in [
+            (
+                "mixed-replay",
+                vec![new.clone(), seed.clone(), new, seed.clone()],
+                1,
+            ),
+            ("all-replay", vec![seed.clone(), seed.clone()], 0),
+        ] {
+            let sample = observe(owner, pool, control, &inputs).await?;
+            sample.print(mode, "small", case, inputs.len());
+            assert_eq!(
+                (
+                    sample.audit_bytes,
+                    sample.recovered,
+                    sample.extra_copies,
+                    sample.inserted
+                ),
+                (seed.canonical_bytes().len(), 0, 0, inserted)
+            );
+            if mode == "ledger" {
+                assert_eq!(
+                    (sample.writes, sample.sign, sample.scope),
+                    (inserted, inserted, 1)
+                );
             }
         }
     }
     Ok(())
+}
+
+struct Sample {
+    sql: usize,
+    scope: usize,
+    writes: usize,
+    verify: usize,
+    sign: usize,
+    audit_bytes: usize,
+    ledger_bytes: usize,
+    inserted: usize,
+    recovered: usize,
+    extra_copies: usize,
+}
+impl Sample {
+    fn print(&self, mode: &str, profile: &str, case: &str, n: usize) {
+        let Self {
+            sql,
+            scope,
+            writes,
+            verify,
+            sign,
+            audit_bytes,
+            ledger_bytes,
+            inserted,
+            recovered,
+            extra_copies,
+        } = self;
+        println!(
+            "BATCH {mode} {profile} {case} n={n} inserted={inserted} audit_bytes={audit_bytes} recovered={recovered} duplicate_copies={extra_copies} ledger_data_sql={sql} tenant_sql={scope} writes={writes} verify={verify} sign={sign} ledger_bytes={ledger_bytes}"
+        );
+    }
+}
+async fn observe(
+    owner: &PgAudit,
+    pool: &PgPool,
+    control: &Control<'_, TestClock>,
+    rows: &[PreparedAuditV1],
+) -> anyhow::Result<Sample> {
+    let tenant = rows[0].identity().tenant();
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
+        .bind(tenant.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let cost = Arc::new(Cost::default());
+    let subscriber = tracing_subscriber::registry().with(Observer(cost.clone()));
+    let receipts = owner
+        .append_batch_in_transaction(&mut tx, owner.try_admit(rows)?, control)
+        .with_subscriber(subscriber)
+        .await?;
+    let mut addresses = std::collections::HashMap::new();
+    let (mut recovered, mut extra_copies) = (0, 0);
+    for (receipt, input) in receipts.iter().zip(rows) {
+        let address = receipt.record().prepared().canonical_bytes().as_ptr();
+        match addresses.entry(receipt.record().position()) {
+            std::collections::hash_map::Entry::Vacant(first) => {
+                recovered += usize::from(address != input.canonical_bytes().as_ptr());
+                first.insert(address);
+            }
+            std::collections::hash_map::Entry::Occupied(first) => {
+                extra_copies += usize::from(*first.get() != address)
+            }
+        }
+    }
+    tx.rollback().await?;
+    Ok(Sample {
+        sql: cost.ledger_sql.load(Relaxed),
+        scope: cost.scope_sql.load(Relaxed),
+        writes: cost.ledger_writes.load(Relaxed),
+        verify: cost.verify.load(Relaxed),
+        sign: cost.sign.load(Relaxed),
+        audit_bytes: cost.audit_body.load(Relaxed),
+        ledger_bytes: cost.ledger_body.load(Relaxed),
+        inserted: receipts.iter().filter(|r| r.inserted()).count(),
+        recovered,
+        extra_copies,
+    })
 }

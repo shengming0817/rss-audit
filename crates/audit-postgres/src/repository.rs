@@ -55,8 +55,7 @@ pub(crate) async fn append_batch(
     let fresh = inserted.len();
     for (source, event, position) in inserted {
         let slot = batch.slot(&source, &event)?;
-        if position < 0 || stored[slot].is_some() || ledger.is_some_and(|entries| !entries[slot].1)
-        {
+        if position < 0 || stored[slot].is_some() {
             return Err(Error::StorageContract);
         }
         stored[slot] = Some((
@@ -68,8 +67,22 @@ pub(crate) async fn append_batch(
             true,
         ));
     }
-    if fresh < count {
-        read_replays(c, tenant, batch, ledger, &mut stored).await?;
+    let first_different = if fresh < count {
+        read_replays(c, tenant, batch, &mut stored).await?
+    } else {
+        None
+    };
+    // Stable first-occurrence order also determines the public semantic error classification.
+    for (slot, row) in stored.iter().enumerate() {
+        let (record, added) = row.as_ref().ok_or(Error::StorageContract)?;
+        if Some(slot) == first_different || record.ledger_sequence.is_some() != ledger.is_some() {
+            return Err(Error::Conflict);
+        }
+        if let (Some(seq), Some(entries)) = (record.ledger_sequence, ledger)
+            && entries[slot] != (seq, *added)
+        {
+            return Err(Error::StorageContract);
+        }
     }
     batch.receipts(stored)
 }
@@ -80,9 +93,8 @@ async fn read_replays(
     c: &mut PgConnection,
     tenant: TenantId,
     batch: &crate::append::Batch<'_>,
-    ledger: Option<&[(u64, bool)]>,
     stored: &mut [Option<(Record, bool)>],
-) -> Result<(), Error> {
+) -> Result<Option<usize>, Error> {
     let mut sources = Vec::new();
     let mut events = Vec::new();
     let mut lengths = Vec::new();
@@ -103,7 +115,8 @@ async fn read_replays(
         .bind(lengths)
         .bind(i32::try_from(rss_audit_core::MAX_HEADER_BYTES).map_err(|_| Error::StorageContract)?)
         .fetch(c);
-    let mut conflict = false;
+    let mut oversized = false;
+    let mut first_different: Option<usize> = None;
     while let Some(row) = rows.try_next().await? {
         let slot = batch.slot(row.try_get("source_id")?, row.try_get("event_id")?)?;
         if stored[slot].is_some() {
@@ -113,7 +126,9 @@ async fn read_replays(
         let bytes: &[u8] = row.try_get("canonical")?;
         #[cfg(feature = "integration")]
         tracing::trace!(target: "batch_cost::audit_body", bytes = bytes.len() as u64);
-        let same = !row.try_get::<bool, _>("oversized")? && bytes == request.canonical_bytes();
+        let longer: bool = row.try_get("oversized")?;
+        oversized |= longer;
+        let same = !longer && bytes == request.canonical_bytes();
         let (position, sequence) = if same {
             coordinates(&row, tenant, request.identity(), request.recorded_at())?
         } else {
@@ -123,12 +138,8 @@ async fn read_replays(
                 .map_err(|_| Error::StorageContract)?;
             coordinates(&row, tenant, &identity, at)?
         };
-        if !same || sequence.is_some() != ledger.is_some() {
-            conflict = true;
-        } else if let (Some(entries), Some(seq)) = (ledger, sequence)
-            && entries[slot] != (seq, false)
-        {
-            return Err(Error::StorageContract);
+        if !same {
+            first_different = Some(first_different.map_or(slot, |first| first.min(slot)));
         }
         stored[slot] = Some((
             Record {
@@ -142,10 +153,10 @@ async fn read_replays(
     if stored.iter().any(Option::is_none) {
         return Err(Error::StorageContract);
     }
-    if conflict {
+    if oversized {
         return Err(Error::Conflict);
     }
-    Ok(())
+    Ok(first_different)
 }
 
 fn decode(row: &PgRow, tenant: TenantId) -> Result<Record, Error> {

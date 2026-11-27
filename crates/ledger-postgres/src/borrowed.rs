@@ -50,6 +50,8 @@ pub async fn append_in_transaction<T: Timer>(
 }
 
 /// Append one same-chain batch in input order and return its staged sequence and insertion flags.
+/// A later chunk can fail after earlier entries were staged. Propagate every batch error,
+/// including a stable-ID conflict, and roll back the entire owner transaction.
 pub async fn append_batch_in_transaction<T: Timer>(
     tx: &mut Transaction<'_, Postgres>,
     auth: &Authenticator,

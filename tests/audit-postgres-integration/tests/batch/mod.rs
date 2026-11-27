@@ -9,6 +9,8 @@ pub(super) async fn semantics(
     admin: &PgPool,
     control: &Control<'_, TestClock>,
 ) -> anyhow::Result<()> {
+    competing_plain(plain, pool, admin, control).await?;
+    replay_errors(ledger, pool, admin, control).await?;
     for (mode, owner) in [("plain", plain), ("ledger", ledger)] {
         let tenant = TenantId::parse(if mode == "plain" {
             "10555663-d15a-46a0-bff3-9f73991fe730"
@@ -172,6 +174,102 @@ pub(super) async fn semantics(
             );
         }
         tx.commit().await?;
+    }
+    Ok(())
+}
+
+async fn competing_plain(
+    owner: &PgAudit,
+    pool: &PgPool,
+    admin: &PgPool,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let tenant = TenantId::parse("9749781a-3274-43cf-9560-99feeb0c2753")?;
+    for (id, loser_payload) in [("retry", 1u8), ("conflict", 2u8)] {
+        let at = Timepoint::try_from(11_i64)?;
+        let first = prepare(event(tenant, "wait", id, vec![1])?, at)?;
+        let second = prepare(event(tenant, "wait", id, vec![loser_payload])?, at)?;
+        let mut winner = pool.begin().await?;
+        let pid: i32 =
+            sqlx::query_scalar("SELECT pg_backend_pid() FROM set_config('rss.tenant_id',$1,true)")
+                .bind(tenant.to_string())
+                .fetch_one(&mut *winner)
+                .await?;
+        let original = owner
+            .append_in_transaction(&mut winner, &first, control)
+            .await?;
+        let wait_and_release = async {
+            tokio::time::timeout(Duration::from_secs(5),async {
+                loop {
+                    let blocked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))").bind(pid).fetch_one(admin).await?;
+                    if blocked { return Ok::<(),sqlx::Error>(()); }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await??;
+            winner.commit().await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        let (outcome, released) = tokio::join!(owner.append(&second, control), wait_and_release);
+        released?;
+        if loser_payload == 1 {
+            let replay = committed(outcome)?;
+            assert!(!replay.inserted());
+            assert_eq!(replay.record().position(), original.record().position());
+        } else {
+            rolled_back(outcome, |e| matches!(e, Error::Conflict));
+        }
+    }
+    Ok(())
+}
+
+async fn replay_errors(
+    owner: &PgAudit,
+    pool: &PgPool,
+    admin: &PgPool,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let tenant = TenantId::parse("286618bf-2800-49a7-9730-b20d27930f10")?;
+    let at = Timepoint::try_from(11_i64)?;
+    let make = |id, payload| -> anyhow::Result<_> {
+        Ok(prepare(event(tenant, "classify", id, payload)?, at)?)
+    };
+    let a = make("a", vec![1])?;
+    let b = make("b", vec![1])?;
+    committed(owner.append(&a, control).await)?;
+    committed(owner.append(&b, control).await)?;
+    sqlx::query("UPDATE rss_audit.records SET ledger_sequence=100 WHERE tenant_id=$1::uuid AND event_id='b'").bind(tenant.to_string()).execute(admin).await?;
+    for (payload, reversed, ordinary_conflict) in [
+        (vec![2, 3], true, true),
+        (vec![2], false, true),
+        (vec![2], true, false),
+    ] {
+        let different = make("a", payload)?;
+        sqlx::query(
+            "UPDATE rss_audit.records SET canonical=$2 WHERE tenant_id=$1::uuid AND event_id='a'",
+        )
+        .bind(tenant.to_string())
+        .bind(different.canonical_bytes())
+        .execute(admin)
+        .await?;
+        let rows = if reversed {
+            [b.clone(), a.clone()]
+        } else {
+            [a.clone(), b.clone()]
+        };
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
+            .bind(tenant.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let result = owner
+            .append_batch_in_transaction(&mut tx, owner.try_admit(&rows)?, control)
+            .await;
+        if ordinary_conflict {
+            assert!(matches!(result, Err(Error::Conflict)));
+        } else {
+            assert!(matches!(result, Err(Error::StorageContract)));
+        }
+        tx.rollback().await?;
     }
     Ok(())
 }

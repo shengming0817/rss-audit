@@ -54,6 +54,8 @@ pub async fn append_in(
     .map_err(Error::Messaging)?
 }
 /// Stage a same-chain batch under the original message fence and remaining budget.
+/// A later chunk can fail after earlier entries were staged. Propagate every batch error,
+/// including a stable-ID conflict, and roll back the entire owner transaction.
 pub async fn append_batch_in(
     tx: &mut PgTransaction<'_>,
     auth: &Authenticator,
