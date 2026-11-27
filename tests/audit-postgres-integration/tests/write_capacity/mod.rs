@@ -361,7 +361,18 @@ async fn corrupted_replay(
     let other = prepare(event(t, "corrupt", "other", vec![7; 100_000])?, at)?;
     committed(store.append(&other, control).await)?;
     let input = [short, prepare(event(t, "corrupt", "other", vec![])?, at)?];
-    for (good, bad) in [(&long, &other), (&other, &long)] {
+    mixed_corruption(pool, admin, &store, &input, [&long, &other], control).await
+}
+async fn mixed_corruption(
+    pool: &PgPool,
+    admin: &PgPool,
+    store: &PgAudit,
+    input: &[PreparedAuditV1],
+    originals: [&PreparedAuditV1; 2],
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let t = originals[0].identity().tenant();
+    for [good, bad] in [originals, [originals[1], originals[0]]] {
         for (record, bytes) in [(good, good.canonical_bytes()), (bad, &[1u8][..])] {
             sqlx::query("UPDATE rss_audit.records SET canonical=$1 WHERE tenant_id=$2::uuid AND event_id=$3")
                 .bind(bytes).bind(t.to_string()).bind(record.identity().event_id().as_str()).execute(admin).await?;
@@ -370,7 +381,7 @@ async fn corrupted_replay(
         set_tenant(&mut tx, t).await?;
         assert!(matches!(
             store
-                .append_batch_in_transaction(&mut tx, store.try_admit(&input)?, control)
+                .append_batch_in_transaction(&mut tx, store.try_admit(input)?, control)
                 .await,
             Err(Error::StorageContract)
         ));
