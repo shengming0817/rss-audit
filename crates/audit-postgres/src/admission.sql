@@ -34,9 +34,19 @@ SELECT current_setting('rss.tenant_id',true) AS tenant,
  FROM relations c WHERE relkind NOT IN ('i','I')) AS schema,
 (SELECT bool_and(relrowsecurity AND relforcerowsecurity)
  FROM relations WHERE relkind='r') AS forced_rls,
-(SELECT count(*)=3 AND bool_and(i.indisvalid AND i.indisready AND i.indislive
- AND i.indpred IS NULL AND i.indexprs IS NULL)
- FROM pg_index i JOIN relations c ON c.oid=i.indrelid) AS indexes,
+(SELECT count(*)=3 AND bool_and(i.indisvalid AND i.indisready AND i.indislive AND i.indexprs IS NULL)
+ AND count(*) FILTER (WHERE i.indpred IS NULL)=2
+ AND count(*) FILTER (WHERE i.indisunique AND i.indimmediate AND am.amname='btree'
+   AND i.indnkeyatts=2 AND i.indnatts=2
+   AND pg_get_indexdef(i.indexrelid,1,false)='tenant_id'
+   AND pg_get_indexdef(i.indexrelid,2,false)='ledger_sequence'
+   AND (SELECT array_agg(op.opcname ORDER BY k.ord)
+        FROM unnest(i.indclass) WITH ORDINALITY k(oid,ord) JOIN pg_opclass op ON op.oid=k.oid
+        WHERE op.opcnamespace='pg_catalog'::regnamespace)=ARRAY['uuid_ops','int8_ops']::name[]
+   AND pg_get_expr(i.indpred,i.indrelid)='(ledger_sequence IS NOT NULL)')=1
+ FROM pg_index i JOIN relations c ON c.oid=i.indrelid
+ JOIN pg_class idx ON idx.oid=i.indexrelid JOIN pg_am am ON am.oid=idx.relam
+ WHERE c.relname='records') AS indexes,
 (SELECT count(*)=7 AND bool_and(NOT attisdropped AND NOT atthasdef AND attidentity='' AND attgenerated=''
  AND attcollation=CASE WHEN attname IN ('source_id','event_id') THEN 'pg_catalog."C"'::regcollation::oid ELSE 0::oid END)
  AND array_agg(relname||':'||attname||':'||format_type(atttypid,atttypmod)||':'||attnotnull::text ORDER BY relname,attnum)
@@ -44,8 +54,10 @@ SELECT current_setting('rss.tenant_id',true) AS tenant,
  'records:source_id:text:true','records:event_id:text:true','records:position:bigint:true',
  'records:recorded_at:bigint:true','records:canonical:bytea:true','records:ledger_sequence:bigint:false']
  FROM columns) AS columns,
-(SELECT count(*)=9 AND bool_and(convalidated AND NOT condeferrable AND NOT condeferred)
- AND array_agg(relname||':'||pg_get_constraintdef(oid) ORDER BY (relname||':'||pg_get_constraintdef(oid)) COLLATE "C")=$2::text[]
+(SELECT bool_and(convalidated AND NOT condeferrable AND NOT condeferred)
+ -- PostgreSQL 18 also catalogs column NOT NULL constraints; the column check covers their shape.
+ AND array_agg(relname||':'||pg_get_constraintdef(oid) ORDER BY (relname||':'||pg_get_constraintdef(oid)) COLLATE "C")
+   FILTER (WHERE contype<>'n')=$2::text[]
  FROM constraints) AS constraints,
 (SELECT count(*)=1 AND array_agg(c.relname::text ORDER BY c.relname)=ARRAY['records']
  AND bool_and(p.polname='tenant_scope' AND p.polcmd='*' AND p.polpermissive AND p.polroles=ARRAY[0::oid]

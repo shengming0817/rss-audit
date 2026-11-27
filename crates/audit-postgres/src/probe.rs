@@ -32,7 +32,6 @@ async fn inspect(connection: &mut PgConnection, require_append: bool) -> Result<
         "records:CHECK ((ledger_sequence >= 0))",
         "records:PRIMARY KEY (tenant_id, source_id, event_id)",
         "records:UNIQUE (tenant_id, \"position\")",
-        "records:UNIQUE (tenant_id, ledger_sequence)",
     ];
     expected.sort();
     let row = sqlx::query(include_str!("admission.sql"))
