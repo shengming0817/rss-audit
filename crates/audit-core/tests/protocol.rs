@@ -485,3 +485,19 @@ fn debug_output_redacts_sensitive_values() -> Result<(), Box<dyn std::error::Err
     assert_eq!(payload.as_bytes(), bait.as_bytes());
     Ok(())
 }
+
+#[test]
+fn recovery_adopts_the_validated_allocation_and_shares_summary() -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = golden_v1()?;
+    let address = bytes.as_ptr();
+    assert_eq!(rss_audit_core::canonical_len(&event()?)?, bytes.len());
+    let prepared = rss_audit_core::PreparedAuditV1::from_canonical_bytes(bytes)?;
+    assert_eq!(prepared.clone().canonical_bytes().as_ptr(), address);
+    assert_eq!(prepared.action().as_str(), "session_revoked");
+    assert_eq!(prepared.outcome(), Outcome::Succeeded);
+    assert_eq!(prepared.occurred_at().unix_seconds(), 1_726_000_000);
+    let mut corrupt = prepared.canonical_bytes().to_vec();
+    corrupt.push(0);
+    assert_eq!(rss_audit_core::PreparedAuditV1::from_canonical_bytes(corrupt).err(), Some(Error::UnknownField));
+    Ok(())
+}

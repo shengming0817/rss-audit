@@ -14,75 +14,55 @@ const REQUEST_ID_MAX_BYTES: usize = 128;
 /// Maximum complete canonical Audit V1 bytes.
 pub const MAX_RECORD_BYTES: usize = 131_072;
 
+/// Exact complete V1 size, including the fixed-width recorder timestamp.
+pub fn canonical_len(event: &AuditEventV1) -> Result<usize, Error> {
+    let mut size = 0usize;
+    visit_encoding(event, 0, |field| {
+        size = size.checked_add(field.len()).filter(|n| *n <= MAX_RECORD_BYTES)
+            .ok_or(Error::RecordTooLarge)?;
+        Ok(())
+    })?;
+    Ok(size)
+}
+
 pub(crate) fn encode(event: &AuditEventV1, recorded_at: Timepoint) -> Result<Vec<u8>, Error> {
-    let identity = event.identity();
-    let source = identity.source();
-    let contract = source.contract();
-    let facts = event.facts();
-    let coordinates = event.context().coordinates();
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(DOMAIN);
-    bytes.extend_from_slice(&RecordVersion::V1.tag().to_be_bytes());
-    bytes.extend_from_slice(&identity.tenant().octets());
-    push_text(&mut bytes, source.source_id().as_str())?;
-    push_text(&mut bytes, identity.event_id().as_str())?;
-    push_text(&mut bytes, contract.id().as_str())?;
-    bytes.extend_from_slice(&contract.version().major().to_be_bytes());
-    push_text(&mut bytes, contract.schema_digest().as_str())?;
-    push_text(&mut bytes, facts.actor().kind().as_str())?;
-    push_text(&mut bytes, facts.actor().id().as_str())?;
-    push_text(&mut bytes, facts.action().as_str())?;
-    push_text(&mut bytes, facts.resource().kind().as_str())?;
-    push_text(&mut bytes, facts.resource().id().as_str())?;
-    bytes.push(facts.outcome().tag());
-    bytes.extend_from_slice(&facts.occurred_at().unix_seconds().to_be_bytes());
-    bytes.extend_from_slice(&recorded_at.unix_seconds().to_be_bytes());
-    push_optional(
-        &mut bytes,
-        coordinates.correlation_id().map(CorrelationId::as_str),
-    )?;
-    push_optional(&mut bytes, coordinates.request_id().map(RequestId::as_str))?;
-    push_optional(
-        &mut bytes,
-        coordinates.operation_id().map(OperationId::as_str),
-    )?;
-    push_bytes(&mut bytes, event.context().payload().as_bytes())?;
-    if bytes.len() > MAX_RECORD_BYTES {
-        return Err(Error::RecordTooLarge);
-    }
+    let mut bytes = Vec::with_capacity(canonical_len(event)?);
+    visit_encoding(event, recorded_at.unix_seconds(), |field| {
+        bytes.extend_from_slice(field);
+        Ok(())
+    })?;
     Ok(bytes)
 }
 
-fn push_text(output: &mut Vec<u8>, value: &str) -> Result<(), Error> {
-    push_bytes(output, value.as_bytes())
-}
-
-fn push_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), Error> {
-    let len = u32::try_from(value.len()).map_err(|_| Error::RecordTooLarge)?;
-    let end = output
-        .len()
-        .checked_add(4)
-        .and_then(|size| size.checked_add(value.len()))
-        .ok_or(Error::RecordTooLarge)?;
-    if end > MAX_RECORD_BYTES {
-        return Err(Error::RecordTooLarge);
+fn visit_encoding(event: &AuditEventV1, recorded_at: i64, mut emit: impl FnMut(&[u8]) -> Result<(), Error>) -> Result<(), Error> {
+    let id = event.identity();
+    let source = id.source();
+    let contract = source.contract();
+    let facts = event.facts();
+    let coordinates = event.context().coordinates();
+    emit(DOMAIN)?;
+    emit(&RecordVersion::V1.tag().to_be_bytes())?;
+    emit(&id.tenant().octets())?;
+    for text in [source.source_id().as_str(), id.event_id().as_str(), contract.id().as_str()] {
+        field(&mut emit, text.as_bytes())?;
     }
-    output.extend_from_slice(&len.to_be_bytes());
-    output.extend_from_slice(value);
-    Ok(())
-}
-
-fn push_optional(output: &mut Vec<u8>, value: Option<&str>) -> Result<(), Error> {
-    match value {
-        Some(value) => {
-            output.push(1);
-            push_text(output, value)
-        }
-        None => {
-            output.push(0);
-            Ok(())
-        }
+    emit(&contract.version().major().to_be_bytes())?;
+    for text in [contract.schema_digest().as_str(), facts.actor().kind().as_str(), facts.actor().id().as_str(), facts.action().as_str(), facts.resource().kind().as_str(), facts.resource().id().as_str()] {
+        field(&mut emit, text.as_bytes())?;
     }
+    emit(&[facts.outcome().tag()])?;
+    emit(&facts.occurred_at().unix_seconds().to_be_bytes())?;
+    emit(&recorded_at.to_be_bytes())?;
+    for coordinate in [coordinates.correlation_id().map(CorrelationId::as_str), coordinates.request_id().map(RequestId::as_str), coordinates.operation_id().map(OperationId::as_str)] {
+        emit(&[u8::from(coordinate.is_some())])?;
+        if let Some(text) = coordinate { field(&mut emit, text.as_bytes())?; }
+    }
+    field(&mut emit, event.context().payload().as_bytes())
+}
+fn field(emit: &mut impl FnMut(&[u8]) -> Result<(), Error>, bytes: &[u8]) -> Result<(), Error> {
+    let len = u32::try_from(bytes.len()).map_err(|_| Error::RecordTooLarge)?;
+    emit(&len.to_be_bytes())?;
+    emit(bytes)
 }
 
 /// Decode canonical V1 bytes after applying all structural and size checks.
@@ -90,6 +70,20 @@ fn push_optional(output: &mut Vec<u8>, value: Option<&str>) -> Result<(), Error>
 /// The returned value is not source authentication, ledger authentication, or durable-commit
 /// evidence. Use [`crate::verify_window`] to authenticate a supplied ledger range.
 pub fn decode_untrusted(bytes: &[u8]) -> Result<DecodedAuditV1, Error> {
+    let parsed = parse(bytes)?;
+    let context = EventContext::new(parsed.coordinates, AuditPayload::new(parsed.payload.to_vec())?);
+    Ok(DecodedAuditV1::new(AuditEventV1::new(parsed.identity, parsed.facts, context), parsed.recorded_at))
+}
+
+pub(crate) struct Parsed<'a> {
+    pub identity: RecordIdentity,
+    pub facts: EventFacts,
+    pub recorded_at: Timepoint,
+    coordinates: Coordinates,
+    payload: &'a [u8],
+}
+
+pub(crate) fn parse(bytes: &[u8]) -> Result<Parsed<'_>, Error> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(Error::RecordTooLarge);
     }
@@ -140,7 +134,7 @@ pub fn decode_untrusted(bytes: &[u8]) -> Result<DecodedAuditV1, Error> {
         .optional_text(Field::OperationId, OperationId::MAX_BYTES)?
         .map(OperationId::parse)
         .transpose()?;
-    let payload = AuditPayload::new(reader.bytes(Field::Payload, MAX_RECORD_BYTES)?.to_vec())?;
+    let payload = reader.bytes(Field::Payload, MAX_RECORD_BYTES)?;
     if !reader.is_finished() {
         return Err(Error::UnknownField);
     }
@@ -156,14 +150,7 @@ pub fn decode_untrusted(bytes: &[u8]) -> Result<DecodedAuditV1, Error> {
         outcome,
         occurred_at,
     );
-    let context = EventContext::new(
-        Coordinates::new(correlation_id, request_id, operation_id),
-        payload,
-    );
-    Ok(DecodedAuditV1::new(
-        AuditEventV1::new(identity, facts, context),
-        recorded_at,
-    ))
+    Ok(Parsed { identity, facts, recorded_at, coordinates: Coordinates::new(correlation_id, request_id, operation_id), payload })
 }
 
 fn decode_tenant(bytes: &[u8]) -> Result<TenantId, Error> {
