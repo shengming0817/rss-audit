@@ -55,11 +55,18 @@ async fn batch<R>(
     // Even a locally conflicting input must check the real anchor and earlier persisted
     // identities. Validate that prefix without staging any entries from a known invalid batch.
     let conflict = conflicting_prefix(requests);
+    let mut stored_tail = signer.sequence();
+    // In validation-only mode the database will not run its unique sequence constraint.
+    // Check the first occupied successor so a simulated write cannot hide that storage error.
+    let occupied = if conflict.is_some() {
+        first_occupied_after(c, ledger, stored_tail).await?
+    } else {
+        None
+    };
     let input = conflict.as_deref().unwrap_or(requests);
     let mut result = Vec::with_capacity(input.len());
     for chunk in input.chunks(ROWS_PER_STATEMENT) {
         let mut historical = history(c, ledger, chunk).await?;
-        let old_tail = signer.sequence();
         let mut known = BTreeMap::<RecordId, Entry>::new();
         let mut fresh = Vec::with_capacity(chunk.len());
         for request in chunk {
@@ -75,14 +82,16 @@ async fn batch<R>(
                 if !entry.matches(request) {
                     return Err(Error::Conflict);
                 }
-                if old_tail.is_none_or(|seq| entry.sequence() > seq) {
+                if stored_tail.is_none_or(|seq| entry.sequence() > seq) {
                     return Err(Error::StorageContract);
                 }
                 known.insert(id.clone(), entry.clone());
                 (entry, false)
             } else {
                 let entry = signer.append(request)?;
-                encode_sequence(entry.sequence())?;
+                if Some(encode_sequence(entry.sequence())?) == occupied {
+                    return Err(Error::StorageContract);
+                }
                 known.insert(id.clone(), entry.clone());
                 fresh.push(entry.clone());
                 (entry, true)
@@ -91,6 +100,7 @@ async fn batch<R>(
         }
         if conflict.is_none() && !fresh.is_empty() {
             persist(c, auth, ledger, &fresh).await?;
+            stored_tail = signer.sequence();
         }
     }
     if conflict.is_some() {
@@ -150,6 +160,17 @@ async fn locked_signer<'a>(
         return Err(Error::StorageContract);
     }
     Ok(signer)
+}
+
+async fn first_occupied_after(
+    c: &mut PgConnection,
+    ledger: &LedgerId,
+    tail: Option<Sequence>,
+) -> Result<Option<i64>, Error> {
+    sqlx::query_scalar("SELECT seq FROM rss_ledger.entries WHERE tenant_id=$1::uuid AND chain_id=$2 AND seq>$3 ORDER BY seq LIMIT 1")
+        .bind(ledger.tenant().to_string()).bind(ledger.chain().as_str())
+        .bind(tail.map(encode_sequence).transpose()?.unwrap_or(-1))
+        .fetch_optional(c).await.map_err(sql_error)
 }
 
 async fn history(

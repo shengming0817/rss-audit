@@ -8,6 +8,7 @@ pub(super) async fn run<T: Timer>(
     control: &Control<'_, T>,
 ) -> anyhow::Result<()> {
     ordered_errors(pool, owner, control).await?;
+    unpersisted_prefix(pool, owner, control).await?;
     exhaustion(pool, owner, control).await?;
     competing(pool, owner, control).await
 }
@@ -173,5 +174,43 @@ async fn competing<T: Timer>(
     .await?;
     assert_eq!(window.entries().len(), 34);
     second.commit().await?;
+    Ok(())
+}
+
+async fn unpersisted_prefix<T: Timer>(
+    pool: &PgPool,
+    owner: &PgPool,
+    control: &Control<'_, T>,
+) -> anyhow::Result<()> {
+    let auth = auth()?;
+    let chain = "unpersisted-prefix";
+    let orphan = request(chain, "orphan", b"real")?;
+    let mut tx = scoped(pool).await?;
+    append_batch_in_transaction(
+        &mut tx,
+        &auth,
+        &[request(chain, "anchor", b"anchor")?, orphan.clone()],
+        control,
+    )
+    .await?;
+    tx.commit().await?;
+    sqlx::query("UPDATE rss_ledger.heads h SET seq=e.seq,tag=e.tag FROM rss_ledger.entries e WHERE h.tenant_id=e.tenant_id AND h.chain_id=e.chain_id AND h.chain_id=$1 AND e.seq=0")
+        .bind(chain).execute(owner).await?;
+    for include_orphan in [true, false] {
+        let mut rows = (0..32)
+            .map(|i| request(chain, &format!("new{i}"), &[i]))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if include_orphan {
+            rows.push(orphan.clone());
+        }
+        rows.push(request(chain, "new0", b"changed")?);
+        let mut tx = scoped(pool).await?;
+        let failure = append_batch_in_transaction(&mut tx, &auth, &rows, control).await;
+        assert!(matches!(failure, Err(Error::StorageContract)));
+        let coords:(i64,i64)=sqlx::query_as("SELECT h.seq,(SELECT count(*) FROM rss_ledger.entries e WHERE e.tenant_id=h.tenant_id AND e.chain_id=h.chain_id) FROM rss_ledger.heads h WHERE h.chain_id=$1")
+            .bind(chain).fetch_one(&mut *tx).await?;
+        assert_eq!(coords, (0, 2));
+        tx.rollback().await?;
+    }
     Ok(())
 }
