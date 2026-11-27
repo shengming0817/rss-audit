@@ -90,35 +90,10 @@ pub(super) async fn measure(
         committed(owner.append(&seed, control).await)?;
         for profile in ["small", "large", "mixed"] {
             for n in [1_usize, 8, 32, 33, 64] {
-                let mut rows = Vec::with_capacity(n);
-                for i in 0..n {
-                    let id = format!("r{i}");
-                    let header = canonical_len(&event(tenant, mode, &id, vec![])?)?;
-                    let bytes = if profile == "large" || (profile == "mixed" && i % 2 == 1) {
-                        MAX_RECORD_BYTES - header
-                    } else {
-                        32
-                    };
-                    rows.push(prepare(event(tenant, mode, &id, vec![3; bytes])?, at)?);
-                }
+                let rows = sample_rows(tenant, mode, profile, at, n)?;
                 let sample = observe(owner, pool, control, &rows).await?;
                 sample.print(mode, profile, "fresh", n);
-                assert_eq!(
-                    (sample.audit_bytes, sample.recovered, sample.extra_copies),
-                    (0, 0, 0)
-                );
-                assert_eq!(sample.inserted, n);
-                if mode == "ledger" {
-                    let chunks = n.div_ceil(32);
-                    assert_eq!((sample.verify, sample.sign, sample.scope), (1, n, 1));
-                    assert_eq!((sample.writes, sample.sql), (chunks, 2 + 2 * chunks));
-                    assert_eq!(sample.ledger_bytes, seed.canonical_bytes().len());
-                } else {
-                    assert_eq!(
-                        (sample.sql, sample.scope, sample.verify, sample.sign),
-                        (0, 0, 0, 0)
-                    );
-                }
+                sample.check_fresh(mode, n, seed.canonical_bytes().len());
             }
         }
         let new = prepare(event(tenant, mode, "fresh", vec![8])?, at)?;
@@ -152,6 +127,27 @@ pub(super) async fn measure(
     Ok(())
 }
 
+fn sample_rows(
+    tenant: TenantId,
+    mode: &str,
+    profile: &str,
+    at: Timepoint,
+    n: usize,
+) -> anyhow::Result<Vec<PreparedAuditV1>> {
+    let mut rows = Vec::with_capacity(n);
+    for i in 0..n {
+        let id = format!("r{i}");
+        let header = canonical_len(&event(tenant, mode, &id, vec![])?)?;
+        let bytes = if profile == "large" || (profile == "mixed" && i % 2 == 1) {
+            MAX_RECORD_BYTES - header
+        } else {
+            32
+        };
+        rows.push(prepare(event(tenant, mode, &id, vec![3; bytes])?, at)?);
+    }
+    Ok(rows)
+}
+
 struct Sample {
     sql: usize,
     scope: usize,
@@ -165,6 +161,21 @@ struct Sample {
     extra_copies: usize,
 }
 impl Sample {
+    fn check_fresh(&self, mode: &str, n: usize, seed_bytes: usize) {
+        assert_eq!(
+            (self.audit_bytes, self.recovered, self.extra_copies),
+            (0, 0, 0)
+        );
+        assert_eq!(self.inserted, n);
+        if mode == "ledger" {
+            let chunks = n.div_ceil(32);
+            assert_eq!((self.verify, self.sign, self.scope), (1, n, 1));
+            assert_eq!((self.writes, self.sql), (chunks, 2 + 2 * chunks));
+            assert_eq!(self.ledger_bytes, seed_bytes);
+        } else {
+            assert_eq!((self.sql, self.scope, self.verify, self.sign), (0, 0, 0, 0));
+        }
+    }
     fn print(&self, mode: &str, profile: &str, case: &str, n: usize) {
         let Self {
             sql,

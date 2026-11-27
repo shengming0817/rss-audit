@@ -153,26 +153,7 @@ async fn run(workload: Workload) -> anyhow::Result<()> {
         testkit::PgTlsServerIdentity::MatchingHost,
     )
     .await?;
-    let p = fixture.params();
-    let options = PgConnectOptions::new()
-        .host(&p.host)
-        .port(p.port)
-        .database(&p.database)
-        .ssl_mode(PgSslMode::VerifyFull)
-        .ssl_root_cert_from_pem(fixture.ca_pem().as_bytes().to_vec());
-    let admin = PgPoolOptions::new()
-        .max_connections(3)
-        .connect_with(options.clone().username(&p.username).password(&p.password))
-        .await?;
-    install(&admin).await?;
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect_with(
-            options
-                .username("audit_runtime")
-                .password("fixture-password"),
-        )
-        .await?;
+    let (admin, pool) = install_pools(&fixture).await?;
     let clock = TestClock;
     let cancel = CancellationToken::new();
     let cutoff = Deadline::from_timeout(&clock, Duration::from_secs(150))?;
@@ -396,4 +377,28 @@ async fn storage_classification(pool: &PgPool) -> anyhow::Result<()> {
     );
     tx.rollback().await?;
     Ok(())
+}
+
+async fn install_pools(fixture: &testkit::PgTlsFixture) -> anyhow::Result<(PgPool, PgPool)> {
+    let p = fixture.params();
+    let options = PgConnectOptions::new()
+        .host(&p.host)
+        .port(p.port)
+        .database(&p.database)
+        .ssl_mode(PgSslMode::VerifyFull)
+        .ssl_root_cert_from_pem(fixture.ca_pem().as_bytes().to_vec());
+    let admin = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(options.clone().username(&p.username).password(&p.password))
+        .await?;
+    install(&admin).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect_with(
+            options
+                .username("audit_runtime")
+                .password("fixture-password"),
+        )
+        .await?;
+    Ok((admin, pool))
 }

@@ -267,11 +267,7 @@ async fn same_chain_batch<T: Timer>(pool: &PgPool, control: &Control<'_, T>) -> 
         Err(Error::Protocol(rss_ledger::Error::ScopeMismatch))
     ));
     let first = append_batch_in_transaction(&mut tx, &auth, &rows, control).await?;
-    assert_eq!(first.len(), 35);
-    assert_eq!(first[0], (Sequence::new(0), true));
-    assert_eq!(first[1], (Sequence::new(0), false));
-    assert_eq!(first[33], (Sequence::new(32), true));
-    assert_eq!(first[34], (Sequence::new(0), false));
+    assert_batch_positions(&first);
     let window = read_window_in_transaction(
         &mut tx,
         &auth,
@@ -291,4 +287,12 @@ async fn same_chain_batch<T: Timer>(pool: &PgPool, control: &Control<'_, T>) -> 
     );
     tx.rollback().await?;
     Ok(())
+}
+
+fn assert_batch_positions(first: &[(Sequence, bool)]) {
+    assert_eq!(first.len(), 35);
+    assert_eq!(first[0], (Sequence::new(0), true));
+    assert_eq!(first[1], (Sequence::new(0), false));
+    assert_eq!(first[33], (Sequence::new(32), true));
+    assert_eq!(first[34], (Sequence::new(0), false));
 }
