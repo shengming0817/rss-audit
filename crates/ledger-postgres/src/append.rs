@@ -8,7 +8,7 @@ use futures::TryStreamExt;
 use rss_ledger::{
     AppendRequest, Authenticator, ChainAppender, Entry, LedgerId, RecordId, Sequence,
 };
-use sqlx::{PgConnection, Row};
+use sqlx::{PgConnection, Row, postgres::PgRow};
 use std::collections::BTreeMap;
 
 // A history hit can contain a full 1 MiB payload even when the proposed retry is tiny.
@@ -52,31 +52,78 @@ async fn batch<R>(
         return Err(rss_ledger::Error::ScopeMismatch.into());
     }
     let mut signer = locked_signer(c, auth, ledger).await?;
-    let mut result = Vec::with_capacity(requests.len());
-    for chunk in requests.chunks(ROWS_PER_STATEMENT) {
-        let mut known = history(c, auth, ledger, chunk, signer.sequence()).await?;
+    // Even a locally conflicting input must check the real anchor and earlier persisted
+    // identities. Validate that prefix without staging any entries from a known invalid batch.
+    let conflict = conflicting_prefix(requests);
+    let input = conflict.as_deref().unwrap_or(requests);
+    let mut result = Vec::with_capacity(input.len());
+    for chunk in input.chunks(ROWS_PER_STATEMENT) {
+        let mut historical = history(c, ledger, chunk).await?;
+        let old_tail = signer.sequence();
+        let mut known = BTreeMap::<RecordId, Entry>::new();
         let mut fresh = Vec::with_capacity(chunk.len());
         for request in chunk {
-            if let Some(entry) = known.get(request.record_id()) {
+            let id = request.record_id();
+            let (entry, inserted) = if let Some(entry) = known.get(id) {
                 if !entry.matches(request) {
                     return Err(Error::Conflict);
                 }
-                result.push(project(entry.clone(), false));
+                (entry.clone(), false)
+            } else if let Some(row) = historical.remove(id.as_str()) {
+                let entry = decode(row)?;
+                auth.verify(&entry)?;
+                if !entry.matches(request) {
+                    return Err(Error::Conflict);
+                }
+                if old_tail.is_none_or(|seq| entry.sequence() > seq) {
+                    return Err(Error::StorageContract);
+                }
+                known.insert(id.clone(), entry.clone());
+                (entry, false)
             } else {
                 let entry = signer.append(request)?;
                 encode_sequence(entry.sequence())?;
-                known.insert(entry.record_id().clone(), entry.clone());
+                known.insert(id.clone(), entry.clone());
                 fresh.push(entry.clone());
-                result.push(project(entry, true));
-            }
+                (entry, true)
+            };
+            result.push(project(entry, inserted));
         }
-        if !fresh.is_empty() {
+        if conflict.is_none() && !fresh.is_empty() {
             persist(c, auth, ledger, &fresh).await?;
         }
+    }
+    if conflict.is_some() {
+        return Err(Error::Conflict);
     }
     Ok(result)
 }
 
+// Return only the ordered first occurrences preceding the first divergent duplicate.
+// Cloning requests here shares payloads and is confined to the invalid-input path.
+fn conflicting_prefix(requests: &[AppendRequest]) -> Option<Vec<AppendRequest>> {
+    use std::collections::hash_map::Entry;
+    let mut seen = std::collections::HashMap::new();
+    for (i, request) in requests.iter().enumerate() {
+        match seen.entry(request.record_id()) {
+            Entry::Occupied(first) if &requests[*first.get()] != request => {
+                let mut slots: Vec<usize> = seen.into_values().collect();
+                slots.sort_unstable();
+                return Some(
+                    slots
+                        .into_iter()
+                        .map(|slot| requests[slot].clone())
+                        .collect(),
+                );
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(i);
+            }
+            _ => {}
+        }
+    }
+    None
+}
 async fn locked_signer<'a>(
     c: &mut PgConnection,
     auth: &'a Authenticator,
@@ -107,22 +154,16 @@ async fn locked_signer<'a>(
 
 async fn history(
     c: &mut PgConnection,
-    auth: &Authenticator,
     ledger: &LedgerId,
     chunk: &[AppendRequest],
-    tail: Option<Sequence>,
-) -> Result<BTreeMap<RecordId, Entry>, Error> {
+) -> Result<BTreeMap<String, PgRow>, Error> {
     let ids: Vec<_> = chunk.iter().map(|r| r.record_id().as_str()).collect();
     let mut rows = sqlx::query("SELECT *,tenant_id::text AS tenant_text FROM rss_ledger.entries WHERE tenant_id=$1::uuid AND chain_id=$2 AND record_id=ANY($3)")
         .bind(ledger.tenant().to_string()).bind(ledger.chain().as_str()).bind(ids).fetch(c);
     let mut known = BTreeMap::new();
     while let Some(row) = rows.try_next().await.map_err(sql_error)? {
-        let entry = decode(row)?;
-        auth.verify(&entry)?;
-        if tail.is_none_or(|seq| entry.sequence() > seq) {
-            return Err(Error::StorageContract);
-        }
-        known.insert(entry.record_id().clone(), entry);
+        let id: String = row.try_get("record_id").map_err(sql_error)?;
+        known.insert(id, row);
     }
     Ok(known)
 }

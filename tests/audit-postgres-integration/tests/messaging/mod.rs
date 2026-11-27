@@ -115,6 +115,7 @@ pub(super) async fn run(
     install(admin).await?;
     let runtime = connect(fixture, "audit_runtime").await?;
     startup(plain, ledger, admin, fixture).await?;
+    expired_conflict(fixture).await?;
     for (mode, integrity) in [
         ("borrowed-plain", Integrity::Plain),
         ("borrowed-ledger", Integrity::Ledger(auth()?)),
@@ -393,6 +394,13 @@ async fn install(admin: &PgPool) -> anyhow::Result<()> {
 }
 
 async fn connect(fixture: &testkit::PgTlsFixture, role: &str) -> anyhow::Result<Arc<PgRuntime>> {
+    connect_with(fixture, role, TestClock).await
+}
+async fn connect_with(
+    fixture: &testkit::PgTlsFixture,
+    role: &str,
+    timer: impl ExecutionTimer + 'static,
+) -> anyhow::Result<Arc<PgRuntime>> {
     let p = fixture.params();
     Ok(Arc::new(
         PgRuntime::connect(
@@ -404,7 +412,7 @@ async fn connect(fixture: &testkit::PgTlsFixture, role: &str) -> anyhow::Result<
                 PgPassword::new("fixture-password"),
                 PgPrivateCa::from_pem(fixture.ca_pem().as_bytes().to_vec())?,
             ),
-            TestClock,
+            timer,
             StorageIdentity::new([1; 16], [2; 16])?,
         )
         .await?,
@@ -480,5 +488,47 @@ async fn startup(
             .fold(Ok, Err, Err, Err, Err, Err)?;
     }
     runtime.close().await;
+    Ok(())
+}
+
+async fn expired_conflict(fixture: &testkit::PgTlsFixture) -> anyhow::Result<()> {
+    let cutoff = Deadline::from_timeout(&TestClock, Duration::from_secs(10))?;
+    let advance = CancellationToken::new();
+    let runtime = connect_with(
+        fixture,
+        "audit_runtime",
+        super::write_capacity::StepClock {
+            cutoff: Deadline::at(cutoff.instant() + Duration::from_secs(60)),
+            advance: advance.clone(),
+        },
+    )
+    .await?;
+    let owner_deadline = OperationDeadline::from_cutoff(cutoff, &TestClock);
+    let at = Timepoint::try_from(77_i64)?;
+    let t = tenant()?;
+    let rows = [
+        prepare(event(t, "deadline", "dup", vec![1])?, at)?,
+        prepare(event(t, "deadline", "dup", vec![2])?, at)?,
+    ];
+    let writer = write_budget()?;
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let record = observed.clone();
+    let attempt=runtime.local_tx(execution()?,owner_deadline,move |tx| Box::pin(async move {
+        let batch=writer.try_admit(&rows)?;
+        advance.cancel();
+        let result=writer.append_batch_in(tx,&Integrity::Plain,batch).await;
+        assert!(matches!(result,Err(rss_audit_postgres::Error::Messaging(ref err)) if err.kind()==rss_transactional_messaging::error::MessagingErrorKind::DeadlineElapsed));
+        record.store(true,std::sync::atomic::Ordering::Relaxed);
+        result.map(|_|()).map_err(PgError::from)
+    })).await;
+    assert!(observed.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!attempt.fold(
+        |_| true,
+        |_| false,
+        |_| false,
+        |_| false,
+        |_| false,
+        |_| false
+    ));
     Ok(())
 }

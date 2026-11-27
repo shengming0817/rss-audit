@@ -11,6 +11,7 @@ pub(super) async fn semantics(
 ) -> anyhow::Result<()> {
     competing_plain(plain, pool, admin, control).await?;
     replay_errors(ledger, pool, admin, control).await?;
+    divergent_input(ledger, pool, admin, control).await?;
     for (mode, owner) in [("plain", plain), ("ledger", ledger)] {
         let tenant = TenantId::parse(if mode == "plain" {
             "10555663-d15a-46a0-bff3-9f73991fe730"
@@ -319,4 +320,51 @@ async fn scoped_tx(
         .execute(&mut *tx)
         .await?;
     Ok(tx)
+}
+
+async fn divergent_input(
+    owner: &PgAudit,
+    pool: &PgPool,
+    admin: &PgPool,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let tenant = TenantId::parse("286618bf-2800-49a7-9730-b20d27930f11")?;
+    let make = |id: &str, v| -> anyhow::Result<_> {
+        Ok(prepare(
+            event(tenant, "bad-tail", id, vec![v])?,
+            Timepoint::try_from(1_i64)?,
+        )?)
+    };
+    let seed = make("seed", 1)?;
+    committed(owner.append(&seed, control).await)?;
+    let mut rows = (0..33)
+        .map(|i| make(&format!("r{i}"), i))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    rows.push(make("r0", 255)?);
+    let mut tx = scoped_tx(pool, tenant).await?;
+    let added = owner
+        .append_batch_in_transaction(&mut tx, owner.try_admit(&rows)?, control)
+        .await;
+    assert!(matches!(added, Err(Error::Conflict)));
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM rss_ledger.entries")
+        .fetch_one(&mut *tx)
+        .await?;
+    assert_eq!(count, 1);
+    tx.rollback().await?;
+    sqlx::query("UPDATE rss_ledger.entries SET payload='bad'::bytea WHERE tenant_id=$1::uuid")
+        .bind(tenant.to_string())
+        .execute(admin)
+        .await?;
+    let mut tx = scoped_tx(pool, tenant).await?;
+    let result = owner
+        .append_batch_in_transaction(&mut tx, owner.try_admit(&rows)?, control)
+        .await;
+    assert!(matches!(
+        result,
+        Err(Error::Ledger(rss_ledger_postgres::Error::Protocol(
+            rss_ledger::Error::Authentication
+        )))
+    ));
+    tx.rollback().await?;
+    Ok(())
 }

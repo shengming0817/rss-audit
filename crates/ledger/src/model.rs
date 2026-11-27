@@ -133,12 +133,15 @@ pub struct AppendRequest {
 }
 impl AppendRequest {
     /// Validate bounded input without changing any payload bytes.
-    pub fn new(
+    pub fn new(ledger: LedgerId, record_id: RecordId, payload: Vec<u8>) -> Result<Self, Error> {
+        Self::from_bytes(ledger, record_id, payload.into())
+    }
+    /// Adopt shared immutable bytes using the same protocol size bound.
+    pub fn from_bytes(
         ledger: LedgerId,
         record_id: RecordId,
-        payload: impl Into<bytes::Bytes>,
+        payload: bytes::Bytes,
     ) -> Result<Self, Error> {
-        let payload = payload.into();
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(Error::InvalidInput);
         }

@@ -54,8 +54,12 @@ pub(crate) async fn append_batch<T: ExecutionTimer>(
     };
     control
         .run(Stage::Operation, async {
-            let input = crate::append::Batch::new(batch.records)?;
+            let input = crate::append::Batch::new(batch.records);
             let ledger: Option<Vec<(u64, bool)>> = match integrity {
+                Integrity::Plain if input.conflict.is_some() => {
+                    crate::probe::tenant(tx, tenant).await?;
+                    return Err(Error::Conflict);
+                }
                 Integrity::Plain => None,
                 #[cfg(feature = "ledger")]
                 Integrity::Ledger(auth) => {

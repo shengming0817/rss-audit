@@ -66,7 +66,23 @@ impl crate::WriteBudget {
         if tenant != tx.tenant_id() {
             return Err(Error::ScopeMismatch);
         }
-        let input = crate::append::Batch::new(batch.records)?;
+        // Fencing and expiry belong to the message owner, including on invalid input.
+        let mut records = batch.records;
+        let plain = matches!(integrity, Integrity::Plain);
+        let input = tx
+            .with_connection_context(&mut records, move |records, c| {
+                let records = *records;
+                Box::pin(async move {
+                    let input = crate::append::Batch::new(records);
+                    if plain && input.conflict.is_some() {
+                        return Ok(crate::probe::tenant(c, tenant)
+                            .await
+                            .and(Err(Error::Conflict)));
+                    }
+                    Ok(Ok(input))
+                })
+            })
+            .await??;
         let ledger: Option<Vec<(u64, bool)>> = match integrity {
             Integrity::Plain => None,
             #[cfg(feature = "ledger")]

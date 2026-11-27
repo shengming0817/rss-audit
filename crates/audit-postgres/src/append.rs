@@ -7,14 +7,16 @@ type Key<'a> = (&'a str, &'a str);
 
 pub(crate) struct Batch<'a> {
     pub(crate) unique: Vec<&'a PreparedAuditV1>,
+    pub(crate) conflict: Option<&'a PreparedAuditV1>,
     slots: BTreeMap<Key<'a>, usize>,
     order: Vec<usize>,
 }
 
 impl<'a> Batch<'a> {
-    pub(crate) fn new(records: &'a [PreparedAuditV1]) -> Result<Self, Error> {
+    pub(crate) fn new(records: &'a [PreparedAuditV1]) -> Self {
         let mut batch = Self {
             unique: Vec::new(),
+            conflict: None,
             slots: BTreeMap::new(),
             order: Vec::with_capacity(records.len()),
         };
@@ -31,14 +33,15 @@ impl<'a> Batch<'a> {
                 std::collections::btree_map::Entry::Occupied(entry) => {
                     let slot = *entry.get();
                     if batch.unique[slot].canonical_bytes() != record.canonical_bytes() {
-                        return Err(Error::Conflict);
+                        batch.conflict = Some(record);
+                        break;
                     }
                     slot
                 }
             };
             batch.order.push(slot);
         }
-        Ok(batch)
+        batch
     }
 
     pub(crate) fn slot(&self, source: &str, event: &str) -> Result<usize, Error> {
@@ -52,6 +55,8 @@ impl<'a> Batch<'a> {
     pub(crate) fn ledger_requests(&self) -> Result<Vec<rss_ledger::AppendRequest>, Error> {
         self.unique
             .iter()
+            .copied()
+            .chain(self.conflict)
             .map(|record| Ok(record.append_request()?))
             .collect()
     }

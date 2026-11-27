@@ -158,7 +158,6 @@ Read-only hosts use `PgAuditReader` with a separately provisioned credential tha
 use the same Audit write kernel as owned transactions and the messaging adapter. Batch results
 follow input order; repeated identical identities return the same record and only the first newly
 inserted occurrence has `inserted=true`. Different bytes conflict. Empty input does no DB work.
-Audit inserts and reads back sets, not a loop of complete single-record transactions. Optional
 New rows return their database-assigned position and reuse the admitted body. Exact replays are checked in a subsequent statement snapshot. Ledger signs new identities in first-occurrence order under one same-chain lock.
 
 The host admits the actual borrowed credential at startup, configures tenant and server timeouts,

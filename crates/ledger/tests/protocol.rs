@@ -245,3 +245,10 @@ fn encoded_read_charge_matches_canonical_bytes() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn request_constructor_infers_collected_payload() -> anyhow::Result<()> {
+    let request = AppendRequest::new(scope()?, RecordId::parse("collected")?, (0..3u8).collect())?;
+    assert_eq!(request.payload(), &[0, 1, 2]);
+    Ok(())
+}

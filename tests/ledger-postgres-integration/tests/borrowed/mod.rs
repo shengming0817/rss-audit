@@ -1,4 +1,5 @@
 use super::*;
+mod batches;
 mod interruption;
 mod locking;
 
@@ -11,6 +12,7 @@ pub(super) async fn run<T: Timer>(
     locking::run(pool, control).await?;
     scope(pool, control).await?;
     same_chain_batch(pool, control).await?;
+    batches::run(pool, owner, control).await?;
     visibility(store, pool, control).await?;
     commit(store, pool, control).await?;
     replay(pool, control).await?;
