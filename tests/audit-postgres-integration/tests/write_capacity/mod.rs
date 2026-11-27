@@ -12,14 +12,7 @@ pub(super) async fn run(
         ("budget-plain", Integrity::Plain),
         ("budget-ledger", Integrity::Ledger(auth()?)),
     ] {
-        let rows = (0..8)
-            .map(|index| -> anyhow::Result<_> {
-                Ok(prepare(
-                    event(t, source, &format!("event-{index}"), vec![12; 128])?,
-                    Timepoint::try_from(456_i64)?,
-                )?)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let rows = eight_rows(t, source)?;
         let bytes = rows
             .iter()
             .map(|r| r.canonical_bytes().len())
@@ -27,129 +20,200 @@ pub(super) async fn run(
         let limit = u32::try_from(bytes)?;
         let capacity = WriteBudget::new(8, limit, limit)?;
         let pg = PgAudit::new(pool.clone(), integrity, capacity.clone(), control).await?;
-        let all = capacity.reserve(8, bytes, control).await?;
-        let attempt = pg
-            .append(&rows[0], control)
-            .now_or_never()
-            .context("saturated writer waited")?;
-        assert!(attempt.fold(
-            |_| false,
-            |e| matches!(e, Error::WriteBusy),
-            |_| false,
-            |_| false,
-            |_| false,
-            |_| false
-        ));
-        let cancel = CancellationToken::new();
-        let deadline = Deadline::from_timeout(&TestClock, Duration::from_secs(3))?;
-        let cancelled = Control::new(&TestClock, deadline, deadline, &cancel);
-        let mut waiter = Box::pin(capacity.reserve(1, 1, &cancelled));
-        assert!(waiter.as_mut().now_or_never().is_none());
-        cancel.cancel();
-        assert!(matches!(waiter.await, Err(Error::Cancelled(_))));
-        let stop = Deadline::at(TestClock.now());
-        assert!(matches!(
-            capacity
-                .reserve(1, 1, &Control::new(&TestClock, deadline, stop, &cancel))
-                .await,
-            Err(Error::Cancelled(_))
-        ));
-        let live = CancellationToken::new();
-        assert!(matches!(
-            capacity
-                .reserve(1, 1, &Control::new(&TestClock, deadline, stop, &live))
-                .await,
-            Err(Error::Deadline(_))
-        ));
-        let mut next = Box::pin(capacity.reserve(8, bytes, control));
-        assert!(next.as_mut().now_or_never().is_none());
-        let mut tx = pool.begin().await?;
-        sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
-            .bind(t.to_string())
-            .execute(&mut *tx)
-            .await?;
-        assert!(matches!(
-            pg.append_in_transaction(&mut tx, &rows[0], control)
-                .now_or_never(),
-            Some(Err(Error::WriteBusy))
-        ));
-        assert!(
-            pg.append_batch_in_transaction(&mut tx, pg.try_admit(&[])?, control)
-                .await?
-                .is_empty()
-        );
-        let expired = Control::new(&TestClock, deadline, stop, &live);
-        assert!(matches!(
-            pg.append_in_transaction(&mut tx, &rows[0], &expired).await,
-            Err(Error::Deadline(_))
-        ));
-        let foreign = WriteBudget::new(8, limit, limit)?;
-        assert!(matches!(
-            pg.append_batch_in_transaction(&mut tx, foreign.try_admit(&rows)?, control)
-                .await,
-            Err(Error::WriteLimit)
-        ));
-        assert!(matches!(
-            pg.append_batch_in_transaction(&mut tx, foreign.try_admit(&rows)?, &expired)
-                .await,
-            Err(Error::Deadline(_))
-        ));
-        let admitted = all.bind(&rows)?;
-        let receipts = pg
-            .append_batch_in_transaction(&mut tx, admitted, control)
-            .await?;
-        assert_eq!(receipts.len(), 8);
-        assert!(receipts.iter().all(|receipt| receipt.inserted()));
-        let granted = next.await?;
-        drop(granted);
-        tx.commit().await?;
-        let mut too_many = rows.clone();
-        too_many.push(rows[0].clone());
-        assert!(matches!(pg.try_admit(&too_many), Err(Error::WriteLimit)));
-        let mut bigger = rows.clone();
-        bigger[0] = prepare(
-            event(t, source, "event-0", vec![12; 129])?,
-            Timepoint::try_from(456_i64)?,
-        )?;
-        assert!(matches!(pg.try_admit(&bigger), Err(Error::WriteLimit)));
-        assert!(matches!(
-            capacity.reserve(8, bytes - 1, control).await?.bind(&rows),
-            Err(Error::WriteLimit)
-        ));
-        let mut tx = pool.begin().await?;
-        sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
-            .bind(t.to_string())
-            .execute(&mut *tx)
-            .await?;
-        let changes = [
-            prepare(
-                event(t, source, "new-row", vec![])?,
-                Timepoint::try_from(456_i64)?,
-            )?,
-            prepare(
-                event(t, source, "event-7", vec![5])?,
-                Timepoint::try_from(456_i64)?,
-            )?,
-        ];
-        assert!(matches!(
-            pg.append_batch_in_transaction(&mut tx, pg.try_admit(&changes)?, control)
-                .await,
-            Err(Error::Conflict)
-        ));
-        tx.rollback().await?;
-        let page = committed(
-            pg.read_page(Cursor::start(t), ReadLimit::new(100, 65536)?, control)
-                .await,
-        )?;
-        assert!(
-            !page
-                .records()
-                .iter()
-                .any(|r| r.prepared().identity().event_id().as_str() == "new-row")
-        );
+        handoff(pool, &pg, &capacity, &rows, bytes, control).await?;
+        batch_limits(&pg, &capacity, &rows, bytes, control).await?;
+        late_conflict(pool, &pg, t, source, control).await?;
     }
     interrupted_stage(pool, admin, control).await?;
     corrupted_replay(pool, admin, control).await?;
+    Ok(())
+}
+
+async fn handoff(
+    pool: &PgPool,
+    pg: &PgAudit,
+    capacity: &WriteBudget,
+    rows: &[PreparedAuditV1],
+    bytes: usize,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let all = capacity.reserve(8, bytes, control).await?;
+    busy_owner(pg, &rows[0], control)?;
+    cancelled_waiter(capacity).await?;
+    let mut next = Box::pin(capacity.reserve(8, bytes, control));
+    assert!(next.as_mut().now_or_never().is_none());
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
+        .bind(rows[0].identity().tenant().to_string())
+        .execute(&mut *tx)
+        .await?;
+    busy_borrowed(pg, &mut tx, rows, u32::try_from(bytes)?, control).await?;
+    let admitted = all.bind(rows)?;
+    let receipts = pg
+        .append_batch_in_transaction(&mut tx, admitted, control)
+        .await?;
+    assert_eq!(receipts.len(), 8);
+    assert!(receipts.iter().all(|receipt| receipt.inserted()));
+    let granted = next.await?;
+    drop(granted);
+    tx.commit().await?;
+    Ok(())
+}
+
+fn busy_owner(
+    pg: &PgAudit,
+    record: &PreparedAuditV1,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let attempt = pg
+        .append(record, control)
+        .now_or_never()
+        .context("saturated writer waited")?;
+    assert!(attempt.fold(
+        |_| false,
+        |e| matches!(e, Error::WriteBusy),
+        |_| false,
+        |_| false,
+        |_| false,
+        |_| false
+    ));
+    Ok(())
+}
+
+fn eight_rows(t: TenantId, source: &str) -> anyhow::Result<Vec<PreparedAuditV1>> {
+    (0..8)
+        .map(|index| -> anyhow::Result<_> {
+            Ok(prepare(
+                event(t, source, &format!("event-{index}"), vec![12; 128])?,
+                Timepoint::try_from(456_i64)?,
+            )?)
+        })
+        .collect()
+}
+async fn cancelled_waiter(capacity: &WriteBudget) -> anyhow::Result<()> {
+    let cancel = CancellationToken::new();
+    let deadline = Deadline::from_timeout(&TestClock, Duration::from_secs(3))?;
+    let cancelled = Control::new(&TestClock, deadline, deadline, &cancel);
+    let mut waiter = Box::pin(capacity.reserve(1, 1, &cancelled));
+    assert!(waiter.as_mut().now_or_never().is_none());
+    cancel.cancel();
+    assert!(matches!(waiter.await, Err(Error::Cancelled(_))));
+    let stop = Deadline::at(TestClock.now());
+    assert!(matches!(
+        capacity
+            .reserve(1, 1, &Control::new(&TestClock, deadline, stop, &cancel))
+            .await,
+        Err(Error::Cancelled(_))
+    ));
+    let live = CancellationToken::new();
+    assert!(matches!(
+        capacity
+            .reserve(1, 1, &Control::new(&TestClock, deadline, stop, &live))
+            .await,
+        Err(Error::Deadline(_))
+    ));
+    Ok(())
+}
+async fn busy_borrowed(
+    pg: &PgAudit,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    rows: &[PreparedAuditV1],
+    limit: u32,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    assert!(matches!(
+        pg.append_in_transaction(tx, &rows[0], control)
+            .now_or_never(),
+        Some(Err(Error::WriteBusy))
+    ));
+    assert!(
+        pg.append_batch_in_transaction(tx, pg.try_admit(&[])?, control)
+            .await?
+            .is_empty()
+    );
+    let live = CancellationToken::new();
+    let cutoff = Deadline::at(TestClock.now());
+    let expired = Control::new(&TestClock, cutoff, cutoff, &live);
+    assert!(matches!(
+        pg.append_in_transaction(tx, &rows[0], &expired).await,
+        Err(Error::Deadline(_))
+    ));
+    let foreign = WriteBudget::new(8, limit, limit)?;
+    assert!(matches!(
+        pg.append_batch_in_transaction(tx, foreign.try_admit(rows)?, control)
+            .await,
+        Err(Error::WriteLimit)
+    ));
+    assert!(matches!(
+        pg.append_batch_in_transaction(tx, foreign.try_admit(rows)?, &expired)
+            .await,
+        Err(Error::Deadline(_))
+    ));
+    Ok(())
+}
+async fn batch_limits(
+    pg: &PgAudit,
+    capacity: &WriteBudget,
+    rows: &[PreparedAuditV1],
+    bytes: usize,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let id = rows[0].identity();
+    let t = id.tenant();
+    let source = id.source().source_id().as_str();
+    let mut too_many = rows.to_vec();
+    too_many.push(rows[0].clone());
+    assert!(matches!(pg.try_admit(&too_many), Err(Error::WriteLimit)));
+    let mut bigger = rows.to_vec();
+    bigger[0] = prepare(
+        event(t, source, "event-0", vec![12; 129])?,
+        Timepoint::try_from(456_i64)?,
+    )?;
+    assert!(matches!(pg.try_admit(&bigger), Err(Error::WriteLimit)));
+    assert!(matches!(
+        capacity.reserve(8, bytes - 1, control).await?.bind(rows),
+        Err(Error::WriteLimit)
+    ));
+    Ok(())
+}
+async fn late_conflict(
+    pool: &PgPool,
+    pg: &PgAudit,
+    t: TenantId,
+    source: &str,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
+        .bind(t.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let changes = [
+        prepare(
+            event(t, source, "new-row", vec![])?,
+            Timepoint::try_from(456_i64)?,
+        )?,
+        prepare(
+            event(t, source, "event-7", vec![5])?,
+            Timepoint::try_from(456_i64)?,
+        )?,
+    ];
+    assert!(matches!(
+        pg.append_batch_in_transaction(&mut tx, pg.try_admit(&changes)?, control)
+            .await,
+        Err(Error::Conflict)
+    ));
+    tx.rollback().await?;
+    let page = committed(
+        pg.read_page(Cursor::start(t), ReadLimit::new(100, 65536)?, control)
+            .await,
+    )?;
+    assert!(
+        !page
+            .records()
+            .iter()
+            .any(|r| r.prepared().identity().event_id().as_str() == "new-row")
+    );
     Ok(())
 }
 
@@ -169,13 +233,19 @@ pub(super) async fn measure(pool: &PgPool, control: &Control<'_, TestClock>) -> 
     )?];
     let admitted = granted.bind(&rows)?;
     let small_len = canonical_len(&event(t, "pressure", "small", vec![0; 32])?)? * 8;
+    use sqlx::Acquire;
+    let lease = Instant::now();
+    let mut conn = pool.acquire().await?;
+    let begin = lease.elapsed();
+    let hold = Instant::now();
+    let mut tx = conn.begin().await?;
+    let checked_out = || pool.size() as usize - pool.num_idle();
+    let before = checked_out();
     let mut pending = Box::pin(capacity.reserve(8, small_len, control));
     let start = Instant::now();
     assert!(pending.as_mut().now_or_never().is_none());
-    let lease = Instant::now();
-    let mut tx = pool.begin().await?;
-    let begin = lease.elapsed();
-    let hold = Instant::now();
+    let with_waiter = checked_out();
+    assert_eq!(before, with_waiter);
     sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
         .bind(t.to_string())
         .execute(&mut *tx)
@@ -186,13 +256,36 @@ pub(super) async fn measure(pool: &PgPool, control: &Control<'_, TestClock>) -> 
     let next = pending.await?;
     let waited = start.elapsed();
     tx.rollback().await?;
+    drop(conn);
     let large_hold = hold.elapsed();
+    let (second_begin, second_held) = stage_small(pool, &store, next, t, at, control).await?;
+    eprintln!(
+        "PRESSURE logical_peak={limit} small_bytes={small_len} queued=1 occupied_before={before} occupied_waiting={with_waiter} wait_us={} large_checkout_us={} large_hold_us={} small_checkout_us={} small_hold_us={}",
+        waited.as_micros(),
+        begin.as_micros(),
+        large_hold.as_micros(),
+        second_begin.as_micros(),
+        second_held.as_micros()
+    );
+    Ok(())
+}
+
+async fn stage_small(
+    pool: &PgPool,
+    store: &PgAudit,
+    next: rss_audit_postgres::WriteReservation,
+    t: TenantId,
+    at: Timepoint,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<(Duration, Duration)> {
+    use sqlx::Acquire;
     let small = vec![prepare(event(t, "pressure", "small", vec![0; 32])?, at)?; 8];
     let batch = next.bind(&small)?;
     let second = Instant::now();
-    let mut tx = pool.begin().await?;
+    let mut conn = pool.acquire().await?;
     let second_begin = second.elapsed();
     let second_hold = Instant::now();
+    let mut tx = conn.begin().await?;
     sqlx::query("SELECT set_config('rss.tenant_id',$1,true)")
         .bind(t.to_string())
         .execute(&mut *tx)
@@ -201,15 +294,8 @@ pub(super) async fn measure(pool: &PgPool, control: &Control<'_, TestClock>) -> 
         .append_batch_in_transaction(&mut tx, batch, control)
         .await?;
     tx.rollback().await?;
-    eprintln!(
-        "PRESSURE logical_peak={limit} small_bytes={small_len} queued=1 waiter_connections=0 wait_us={} large_begin_us={} large_hold_us={} small_begin_us={} small_hold_us={}",
-        waited.as_micros(),
-        begin.as_micros(),
-        large_hold.as_micros(),
-        second_begin.as_micros(),
-        second_hold.elapsed().as_micros()
-    );
-    Ok(())
+    drop(conn);
+    Ok((second_begin, second_hold.elapsed()))
 }
 
 async fn corrupted_replay(

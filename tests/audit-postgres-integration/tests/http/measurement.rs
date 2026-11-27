@@ -16,19 +16,7 @@ pub(crate) async fn measure(
     for (index, profile) in ["small", "large", "mixed"].into_iter().enumerate() {
         let t = TenantId::parse(&format!("f47ac10b-58cc-4372-a567-0e02b2c3d6{index:02}"))?;
         let at = Timepoint::try_from(456_i64)?;
-        let mut rows = Vec::new();
-        for i in 0..8 {
-            let id = format!("row-{i}");
-            let overhead = prepare(event(t, "measure", &id, vec![])?, at)?
-                .canonical_bytes()
-                .len();
-            let size = if profile == "large" || (profile == "mixed" && i % 2 == 1) {
-                MAX_RECORD_BYTES - overhead
-            } else {
-                32
-            };
-            rows.push(prepare(event(t, "measure", &id, vec![7; size])?, at)?);
-        }
+        let rows = sample_rows(t, profile, at)?;
         let bytes: usize = rows.iter().map(|r| r.canonical_bytes().len()).sum();
         for (mode, owner) in [("plain", pg), ("ledger", ledger)] {
             // Rollback keeps the identical batch fresh for each integrity mode.
@@ -57,25 +45,7 @@ pub(crate) async fn measure(
                 alloc.peak
             );
         }
-        let anchor = prepare(event(t, "measure", "anchor", vec![])?, at)?;
-        let after = committed(pg.append(&anchor, control).await)?
-            .record()
-            .position();
-        let mut through = after;
-        for row in &rows {
-            through = committed(pg.append(row, control).await)?
-                .record()
-                .position();
-        }
-        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-        let mut coordinates = vec![2];
-        coordinates.extend_from_slice(&t.octets());
-        coordinates.extend_from_slice(&after.to_be_bytes());
-        coordinates.extend_from_slice(&through.to_be_bytes());
-        let path = format!(
-            "/api/v2/audit/entries?limit=8&cursor={}",
-            URL_SAFE_NO_PAD.encode(coordinates)
-        );
+        let path = fixed_page(pg, &rows, t, at, control).await?;
         let app = router::<Session, _, _>(pg.clone(), Policy, TestClock);
         for required in [false, true] {
             for round in 0..6 {
@@ -106,6 +76,50 @@ pub(crate) async fn measure(
         }
     }
     Ok(())
+}
+fn sample_rows(t: TenantId, profile: &str, at: Timepoint) -> anyhow::Result<Vec<PreparedAuditV1>> {
+    let mut rows = Vec::new();
+    for i in 0..8 {
+        let id = format!("row-{i}");
+        let overhead = prepare(event(t, "measure", &id, vec![])?, at)?
+            .canonical_bytes()
+            .len();
+        let size = if profile == "large" || (profile == "mixed" && i % 2 == 1) {
+            MAX_RECORD_BYTES - overhead
+        } else {
+            32
+        };
+        rows.push(prepare(event(t, "measure", &id, vec![7; size])?, at)?);
+    }
+    Ok(rows)
+}
+async fn fixed_page(
+    pg: &PgAudit,
+    rows: &[PreparedAuditV1],
+    t: TenantId,
+    at: Timepoint,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<String> {
+    let anchor = prepare(event(t, "measure", "anchor", vec![])?, at)?;
+    let after = committed(pg.append(&anchor, control).await)?
+        .record()
+        .position();
+    let mut through = after;
+    for row in rows {
+        through = committed(pg.append(row, control).await)?
+            .record()
+            .position();
+    }
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let mut coordinates = vec![2];
+    coordinates.extend_from_slice(&t.octets());
+    coordinates.extend_from_slice(&after.to_be_bytes());
+    coordinates.extend_from_slice(&through.to_be_bytes());
+    let path = format!(
+        "/api/v2/audit/entries?limit=8&cursor={}",
+        URL_SAFE_NO_PAD.encode(coordinates)
+    );
+    Ok(path)
 }
 #[derive(Default)]
 struct Alloc {

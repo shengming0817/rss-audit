@@ -113,16 +113,27 @@ fn rolled_back<R, E>(attempt: LocalTxAttempt<Committed<R>, E>, expected: fn(&E) 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn audit_postgres_suite() -> anyhow::Result<()> {
-    tokio::time::timeout(Duration::from_secs(180), run(false)).await??;
+    tokio::time::timeout(Duration::from_secs(180), run(Workload::Acceptance)).await??;
     Ok(())
 }
 #[tokio::test]
 #[ignore = "isolated release-mode resource measurements"]
 async fn audit_measurement() -> anyhow::Result<()> {
-    run(true).await
+    run(Workload::Pages).await
 }
 
-async fn run(measure: bool) -> anyhow::Result<()> {
+#[tokio::test]
+#[ignore = "isolated release-mode concurrent write capacity"]
+async fn audit_write_pressure() -> anyhow::Result<()> {
+    run(Workload::Pressure).await
+}
+enum Workload {
+    Acceptance,
+    Pages,
+    Pressure,
+}
+
+async fn run(workload: Workload) -> anyhow::Result<()> {
     let network = testkit::bridge_network("audit-postgres").await?;
     let fixture = testkit::postgres_tls(
         testkit::NetworkAttachment {
@@ -163,12 +174,13 @@ async fn run(measure: bool) -> anyhow::Result<()> {
     let ledger = PgAudit::new(pool.clone(), Integrity::Ledger(auth()?), shared, &control)
         .await
         .context("ledger startup")?;
-    if measure {
-        http::measure(&plain, &ledger, &pool, &control).await?;
-        write_capacity::measure(&pool, &control).await?;
-    } else {
-        exercise(&plain, &ledger, &pool, &admin, &fixture, &control).await?;
-        storage_classification(&pool).await?;
+    match workload {
+        Workload::Pages => http::measure(&plain, &ledger, &pool, &control).await?,
+        Workload::Pressure => write_capacity::measure(&pool, &control).await?,
+        Workload::Acceptance => {
+            exercise(&plain, &ledger, &pool, &admin, &fixture, &control).await?;
+            storage_classification(&pool).await?;
+        }
     }
     pool.close().await;
     admin.close().await;

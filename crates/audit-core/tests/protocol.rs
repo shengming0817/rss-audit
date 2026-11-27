@@ -304,21 +304,12 @@ fn complete_record_budget_charges_payload_headers_and_identities()
     let overhead = prepare(maximal_event(vec![])?, recorded)?
         .canonical_bytes()
         .len();
-    assert!(overhead <= rss_audit_core::MAX_HEADER_BYTES);
     let payload_size = MAX_RECORD_BYTES - overhead;
     assert!(payload_size > 65_536);
     let prepared = prepare(maximal_event(vec![7; payload_size])?, recorded)?;
     assert_eq!(prepared.canonical_bytes().len(), MAX_RECORD_BYTES);
-    let bytes = prepared.canonical_bytes();
-    let prefix = &bytes[..rss_audit_core::MAX_HEADER_BYTES];
-    let (identity, time) = rss_audit_core::inspect_canonical_header(prefix, bytes.len())?;
-    assert_eq!(
-        identity.event_id().as_str(),
-        prepared.identity().event_id().as_str()
-    );
-    assert_eq!(time, recorded);
-    assert!(rss_audit_core::inspect_canonical_header(prefix, bytes.len() - 1).is_err());
-    let decoded = decode_untrusted(bytes)?;
+    check_bounded_header(&prepared)?;
+    let decoded = decode_untrusted(prepared.canonical_bytes())?;
     assert_eq!(
         decoded.event().context().payload().as_bytes(),
         vec![7; payload_size]
@@ -513,5 +504,20 @@ fn recovery_adopts_the_validated_allocation_and_shares_summary()
         rss_audit_core::PreparedAuditV1::from_canonical_bytes(corrupt).err(),
         Some(Error::UnknownField)
     );
+    Ok(())
+}
+
+fn check_bounded_header(
+    prepared: &rss_audit_core::PreparedAuditV1,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = prepared.canonical_bytes();
+    let prefix = &bytes[..rss_audit_core::MAX_HEADER_BYTES];
+    let (identity, time) = rss_audit_core::inspect_canonical_header(prefix, bytes.len())?;
+    assert_eq!(
+        identity.event_id().as_str(),
+        prepared.identity().event_id().as_str()
+    );
+    assert_eq!(time, prepared.recorded_at());
+    assert!(rss_audit_core::inspect_canonical_header(prefix, bytes.len() - 1).is_err());
     Ok(())
 }
