@@ -40,6 +40,9 @@ SELECT current_setting('rss.tenant_id',true) AS tenant,
    AND i.indnkeyatts=2 AND i.indnatts=2
    AND pg_get_indexdef(i.indexrelid,1,false)='tenant_id'
    AND pg_get_indexdef(i.indexrelid,2,false)='ledger_sequence'
+   AND (SELECT array_agg(op.opcname ORDER BY k.ord)
+        FROM unnest(i.indclass) WITH ORDINALITY k(oid,ord) JOIN pg_opclass op ON op.oid=k.oid
+        WHERE op.opcnamespace='pg_catalog'::regnamespace)=ARRAY['uuid_ops','int8_ops']::name[]
    AND pg_get_expr(i.indpred,i.indrelid)='(ledger_sequence IS NOT NULL)')=1
  FROM pg_index i JOIN relations c ON c.oid=i.indrelid
  JOIN pg_class idx ON idx.oid=i.indexrelid JOIN pg_am am ON am.oid=idx.relam

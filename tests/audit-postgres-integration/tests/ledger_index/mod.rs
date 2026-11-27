@@ -66,7 +66,9 @@ async fn admission(
     sqlx::raw_sql(
         "CREATE ROLE audit_index_reader LOGIN PASSWORD 'fixture-password';
         GRANT USAGE ON SCHEMA rss_audit TO audit_index_reader;
-        GRANT SELECT ON rss_audit.records TO audit_index_reader",
+        GRANT SELECT ON rss_audit.records TO audit_index_reader;
+        CREATE OPERATOR CLASS public.fixture_int8_ops FOR TYPE bigint USING btree
+            FAMILY pg_catalog.integer_ops AS STORAGE bigint",
     )
     .execute(admin)
     .await?;
@@ -91,6 +93,9 @@ async fn admission(
         ),
         Some(
             "CREATE UNIQUE INDEX records_tenant_ledger_sequence_uidx ON rss_audit.records (ledger_sequence, tenant_id) WHERE ledger_sequence IS NOT NULL",
+        ),
+        Some(
+            "CREATE UNIQUE INDEX records_tenant_ledger_sequence_uidx ON rss_audit.records (tenant_id, ledger_sequence public.fixture_int8_ops) WHERE ledger_sequence IS NOT NULL",
         ),
         Some("ALTER TABLE rss_audit.records ADD UNIQUE (tenant_id, ledger_sequence)"),
     ] {
