@@ -77,11 +77,24 @@ pub(crate) async fn append_batch(
     let mut inserted: BTreeSet<_> = inserted.into_iter().collect();
     // A new READ COMMITTED snapshot sees competing inserts waited for by ON CONFLICT.
     // Stronger isolation may instead report serialization failure; only the host retries.
-    let rows = sqlx::query("SELECT r.tenant_id::text,r.source_id,r.event_id,r.position,r.recorded_at,CASE WHEN octet_length(r.canonical)=i.bytes THEN r.canonical END AS canonical,r.ledger_sequence FROM rss_audit.records r JOIN unnest($2::text[],$3::text[],$4::integer[]) AS i(source_id,event_id,bytes) ON r.source_id=i.source_id AND r.event_id=i.event_id WHERE r.tenant_id=$1::uuid")
-        .bind(tenant.to_string()).bind(sources).bind(events).bind(lengths).fetch_all(c).await?;
+    let rows = sqlx::query("SELECT r.tenant_id::text,r.source_id,r.event_id,r.position,r.recorded_at,CASE WHEN octet_length(r.canonical)<=i.bytes THEN r.canonical END AS canonical,r.ledger_sequence FROM rss_audit.records r JOIN unnest($2::text[],$3::text[],$4::integer[]) AS i(source_id,event_id,bytes) ON r.source_id=i.source_id AND r.event_id=i.event_id WHERE r.tenant_id=$1::uuid")
+        .bind(tenant.to_string()).bind(sources).bind(events).bind(lengths).fetch_all(&mut *c).await?;
     let mut records = BTreeMap::new();
     for row in rows {
         if row.try_get::<Option<&[u8]>, _>("canonical")?.is_none() {
+            // Diagnose only the first oversized conflict. Its opaque payload never
+            // has to cross the wire to validate V1 framing and stored coordinates.
+            let (prefix, len): (Vec<u8>, i32) = sqlx::query_as(
+                "SELECT substring(canonical FROM 1 FOR $3),octet_length(canonical) FROM rss_audit.records WHERE tenant_id=$1::uuid AND position=$2"
+            ).bind(tenant.to_string()).bind(row.try_get::<i64,_>("position")?)
+             .bind(i32::try_from(rss_audit_core::MAX_HEADER_BYTES).map_err(|_|Error::StorageContract)?)
+             .fetch_optional(&mut *c).await?.ok_or(Error::StorageContract)?;
+            let (identity, at) = rss_audit_core::inspect_canonical_header(
+                &prefix,
+                usize::try_from(len).map_err(|_| Error::StorageContract)?,
+            )
+            .map_err(|_| Error::StorageContract)?;
+            coordinates(&row, tenant, &identity, at)?;
             return Err(Error::Conflict);
         }
         let record = decode(&row, tenant)?;
@@ -110,13 +123,26 @@ fn decode(row: &PgRow, tenant: TenantId) -> Result<Record, Error> {
     let bytes: Vec<u8> = row.try_get("canonical")?;
     let prepared =
         PreparedAuditV1::from_canonical_bytes(bytes).map_err(|_| Error::StorageContract)?;
-    let identity = prepared.identity();
+    let (position, ledger_sequence) =
+        coordinates(row, tenant, prepared.identity(), prepared.recorded_at())?;
+    Ok(Record {
+        position,
+        prepared,
+        ledger_sequence,
+    })
+}
+fn coordinates(
+    row: &PgRow,
+    tenant: TenantId,
+    identity: &rss_audit_core::RecordIdentity,
+    at: rss_contract::Timepoint,
+) -> Result<(i64, Option<u64>), Error> {
     let position: i64 = row.try_get("position")?;
     if identity.tenant() != tenant
         || row.try_get::<String, _>("tenant_id")? != tenant.to_string()
         || row.try_get::<&str, _>("source_id")? != identity.source().source_id().as_str()
         || row.try_get::<&str, _>("event_id")? != identity.event_id().as_str()
-        || row.try_get::<i64, _>("recorded_at")? != prepared.recorded_at().unix_seconds()
+        || row.try_get::<i64, _>("recorded_at")? != at.unix_seconds()
         || position < 0
     {
         return Err(Error::StorageContract);
@@ -126,11 +152,7 @@ fn decode(row: &PgRow, tenant: TenantId) -> Result<Record, Error> {
         .map(u64::try_from)
         .transpose()
         .map_err(|_| Error::StorageContract)?;
-    Ok(Record {
-        position,
-        prepared,
-        ledger_sequence,
-    })
+    Ok((position, ledger_sequence))
 }
 
 pub(crate) async fn page(

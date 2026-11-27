@@ -174,8 +174,9 @@ impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
     /// Stage an admitted batch; its grant remains held through the owner's settlement.
     pub async fn append_admitted(
         &mut self,
-        batch: crate::AdmittedBatch<'_>,
+        mut batch: crate::AdmittedBatch<'_>,
     ) -> Result<Vec<StagedAppend>, Error> {
+        self.read.control.check(Stage::Operation)?;
         self.write_budget
             .ok_or(Error::StorageContract)?
             .check_domain(&batch)?;
@@ -185,20 +186,15 @@ impl<T: ExecutionTimer> WriteAuditTransaction<'_, '_, '_, T> {
         {
             return Err(Error::ScopeMismatch);
         }
-        let result = crate::borrowed::append_batch(
-            self.read.tx,
-            self.read.integrity,
-            &batch,
-            self.read.control,
-        )
-        .await;
-        if let Some(permit) = batch.into_permit() {
+        if let Some(permit) = batch.take_permit() {
             if let Some(held) = self.held {
                 held.merge(permit);
             } else {
                 *self.held = Some(permit);
             }
         }
-        result
+        // The outer deadline may drop the callback while SQL is in flight.
+        crate::borrowed::append_batch(self.read.tx, self.read.integrity, &batch, self.read.control)
+            .await
     }
 }

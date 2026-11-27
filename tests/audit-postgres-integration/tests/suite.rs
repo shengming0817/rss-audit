@@ -212,7 +212,7 @@ async fn exercise(
     reader::run(ledger, pool, admin, control)
         .await
         .context("reader::run")?;
-    write_capacity::run(pool, control)
+    write_capacity::run(pool, admin, control)
         .await
         .context("write capacity")?;
     admission::run(pool, admin, control)

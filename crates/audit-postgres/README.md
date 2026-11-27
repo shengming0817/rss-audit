@@ -183,3 +183,17 @@ returns `WriteBusy`. Propagate either error to the original transaction owner.
 Dropping a waiter or grant returns capacity. Borrowed writes release it on return;
 owned transactions retain staged grants until settlement. Retained host retry bytes,
 receipts, SQLx buffers and allocator overhead are outside the canonical-byte charge.
+
+For an up-front reservation, use the source recorder's authoritative time and keep the
+same reservation through Core preparation and binding:
+
+```rust,ignore
+let slot = budget.reserve(1, rss_audit_core::canonical_len(&event)?, control).await?;
+let rows = [rss_audit_core::prepare(event, recorded_at)?];
+let batch = slot.bind(&rows)?;
+budget.append_batch_in(message_tx, integrity, batch).await?;
+```
+
+When PostgreSQL supplies the recording time via `PgAudit::prepare`, that method obtains
+its own preparation capacity, releases the connection after the clock query, and returns
+the retry record. Use it without an outstanding reservation for the same input.

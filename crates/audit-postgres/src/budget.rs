@@ -139,8 +139,8 @@ pub struct AdmittedBatch<'a> {
     reservation: WriteReservation,
 }
 impl AdmittedBatch<'_> {
-    pub(crate) fn into_permit(self) -> Option<OwnedSemaphorePermit> {
-        self.reservation.permit
+    pub(crate) fn take_permit(&mut self) -> Option<OwnedSemaphorePermit> {
+        self.reservation.permit.take()
     }
 }
 

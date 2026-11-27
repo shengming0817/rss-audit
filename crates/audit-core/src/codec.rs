@@ -14,6 +14,29 @@ const REQUEST_ID_MAX_BYTES: usize = 128;
 /// Maximum complete canonical Audit V1 bytes.
 pub const MAX_RECORD_BYTES: usize = 131_072;
 
+/// Maximum V1 bytes through the opaque payload's length prefix. Includes thirteen
+/// length prefixes, the three optional tags and all fixed-width fields.
+pub const MAX_HEADER_BYTES: usize = DOMAIN.len()
+    + 2
+    + 16
+    + 4
+    + 1
+    + 16
+    + 3
+    + 13 * 4
+    + SourceId::MAX_BYTES
+    + EventId::MAX_BYTES
+    + CONTRACT_ID_MAX_BYTES
+    + SCHEMA_DIGEST_BYTES
+    + ActorKind::MAX_BYTES
+    + ActorId::MAX_BYTES
+    + Action::MAX_BYTES
+    + ResourceKind::MAX_BYTES
+    + ResourceId::MAX_BYTES
+    + CorrelationId::MAX_LEN
+    + REQUEST_ID_MAX_BYTES
+    + OperationId::MAX_BYTES;
+
 /// Exact complete V1 size, including the fixed-width recorder timestamp.
 pub fn canonical_len(event: &AuditEventV1) -> Result<usize, Error> {
     let mut size = 0usize;
@@ -113,8 +136,25 @@ pub(crate) struct Parsed<'a> {
 }
 
 pub(crate) fn parse(bytes: &[u8]) -> Result<Parsed<'_>, Error> {
-    if bytes.len() > MAX_RECORD_BYTES {
+    parse_prefix(bytes, bytes.len())
+}
+
+/// Inspect structural identity and time from a bounded prefix and the actual stored length.
+/// The suffix is an opaque payload. This cannot mint a prepared record or authenticate it.
+pub fn inspect_canonical_header(
+    prefix: &[u8],
+    record_len: usize,
+) -> Result<(RecordIdentity, Timepoint), Error> {
+    let parsed = parse_prefix(prefix, record_len)?;
+    Ok((parsed.identity, parsed.recorded_at))
+}
+
+fn parse_prefix(bytes: &[u8], record_len: usize) -> Result<Parsed<'_>, Error> {
+    if record_len > MAX_RECORD_BYTES {
         return Err(Error::RecordTooLarge);
+    }
+    if bytes.len() > record_len {
+        return Err(Error::MalformedEncoding);
     }
     let mut reader = Reader::new(bytes);
     if reader.take(DOMAIN.len())? != DOMAIN {
@@ -163,10 +203,16 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Parsed<'_>, Error> {
         .optional_text(Field::OperationId, OperationId::MAX_BYTES)?
         .map(OperationId::parse)
         .transpose()?;
-    let payload = reader.bytes(Field::Payload, MAX_RECORD_BYTES)?;
-    if !reader.is_finished() {
-        return Err(Error::UnknownField);
+    let payload_len = reader.u32()? as usize;
+    if payload_len > MAX_RECORD_BYTES {
+        return Err(Error::RecordTooLarge);
     }
+    match (reader.offset + payload_len).cmp(&record_len) {
+        std::cmp::Ordering::Greater => return Err(Error::MalformedEncoding),
+        std::cmp::Ordering::Less => return Err(Error::UnknownField),
+        std::cmp::Ordering::Equal => {}
+    }
+    let payload = &bytes[reader.offset..];
     let source = SourceIdentity::new(
         source_id,
         SourceContract::new(contract_id, contract_version, schema_digest),
@@ -248,11 +294,7 @@ impl<'a> Reader<'a> {
     fn bytes(&mut self, field: Field, max: usize) -> Result<&'a [u8], Error> {
         let len = usize::try_from(self.u32()?).map_err(|_| Error::MalformedEncoding)?;
         if len > max {
-            return Err(if field == Field::Payload {
-                Error::RecordTooLarge
-            } else {
-                Error::TooLong(field)
-            });
+            return Err(Error::TooLong(field));
         }
         self.take(len)
     }
@@ -267,9 +309,5 @@ impl<'a> Reader<'a> {
             1 => self.text(field, max).map(Some),
             _ => Err(Error::UnsupportedTag),
         }
-    }
-
-    const fn is_finished(&self) -> bool {
-        self.offset == self.bytes.len()
     }
 }

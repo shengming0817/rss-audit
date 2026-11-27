@@ -2,7 +2,11 @@ use super::*;
 use futures::FutureExt;
 use rss_audit_postgres::WriteBudget;
 
-pub(super) async fn run(pool: &PgPool, control: &Control<'_, TestClock>) -> anyhow::Result<()> {
+pub(super) async fn run(
+    pool: &PgPool,
+    admin: &PgPool,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
     let t = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d510")?;
     for (source, integrity) in [
         ("budget-plain", Integrity::Plain),
@@ -74,11 +78,21 @@ pub(super) async fn run(pool: &PgPool, control: &Control<'_, TestClock>) -> anyh
                 .await?
                 .is_empty()
         );
+        let expired = Control::new(&TestClock, deadline, stop, &live);
+        assert!(matches!(
+            pg.append_in_transaction(&mut tx, &rows[0], &expired).await,
+            Err(Error::Deadline(_))
+        ));
         let foreign = WriteBudget::new(8, limit, limit)?;
         assert!(matches!(
             pg.append_batch_in_transaction(&mut tx, foreign.try_admit(&rows)?, control)
                 .await,
             Err(Error::WriteLimit)
+        ));
+        assert!(matches!(
+            pg.append_batch_in_transaction(&mut tx, foreign.try_admit(&rows)?, &expired)
+                .await,
+            Err(Error::Deadline(_))
         ));
         let admitted = all.bind(&rows)?;
         let receipts = pg
@@ -134,6 +148,8 @@ pub(super) async fn run(pool: &PgPool, control: &Control<'_, TestClock>) -> anyh
                 .any(|r| r.prepared().identity().event_id().as_str() == "new-row")
         );
     }
+    interrupted_stage(pool, admin, control).await?;
+    corrupted_replay(pool, admin, control).await?;
     Ok(())
 }
 
@@ -193,5 +209,123 @@ pub(super) async fn measure(pool: &PgPool, control: &Control<'_, TestClock>) -> 
         second_begin.as_micros(),
         second_hold.elapsed().as_micros()
     );
+    Ok(())
+}
+
+async fn corrupted_replay(
+    pool: &PgPool,
+    admin: &PgPool,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let t = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d515")?;
+    let store = PgAudit::new(pool.clone(), Integrity::Plain, write_budget()?, control).await?;
+    let at = Timepoint::try_from(456_i64)?;
+    let short = prepare(event(t, "corrupt", "replay", vec![])?, at)?;
+    let long = prepare(event(t, "corrupt", "replay", vec![7; 100_000])?, at)?;
+    committed(store.append(&long, control).await)?;
+    rolled_back(store.append(&short, control).await, |e| {
+        matches!(e, Error::Conflict)
+    });
+    for bytes in [vec![1], [long.canonical_bytes(), &[1]].concat()] {
+        sqlx::query("UPDATE rss_audit.records SET canonical=$1 WHERE tenant_id=$2::uuid")
+            .bind(bytes)
+            .bind(t.to_string())
+            .execute(admin)
+            .await?;
+        rolled_back(store.append(&short, control).await, |e| {
+            matches!(e, Error::StorageContract)
+        });
+    }
+    Ok(())
+}
+
+// The fixture advances only the operation cutoff after observing an actual blocked
+// PostgreSQL writer. The server timeout and owner settlement deadline remain ample.
+struct StepClock {
+    cutoff: Deadline,
+    advance: CancellationToken,
+}
+impl Clock for StepClock {
+    fn now(&self) -> Instant {
+        if self.advance.is_cancelled() {
+            self.cutoff.instant().max(Instant::now())
+        } else {
+            Instant::now()
+        }
+    }
+}
+impl ExecutionTimer for StepClock {
+    async fn sleep_until(&self, deadline: Deadline) {
+        if deadline.instant() == self.cutoff.instant() {
+            tokio::select! { () = self.advance.cancelled() => {}, () = TestClock.sleep_until(deadline) => {} }
+        } else {
+            TestClock.sleep_until(deadline).await;
+        }
+    }
+}
+async fn interrupted_stage(
+    pool: &PgPool,
+    admin: &PgPool,
+    control: &Control<'_, TestClock>,
+) -> anyhow::Result<()> {
+    let t = TenantId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d516")?;
+    let record = prepare(
+        event(t, "settle", "blocked", vec![])?,
+        Timepoint::try_from(456_i64)?,
+    )?;
+    let bytes = u32::try_from(record.canonical_bytes().len())?;
+    let budget = WriteBudget::new(1, bytes, bytes)?;
+    let store = PgAudit::new(pool.clone(), Integrity::Plain, budget.clone(), control).await?;
+    let mut blocker = admin.begin().await?;
+    sqlx::query("LOCK TABLE rss_audit.records IN SHARE MODE")
+        .execute(&mut *blocker)
+        .await?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    let cutoff = Deadline::from_timeout(&TestClock, Duration::from_secs(20))?;
+    let total = Deadline::from_timeout(&TestClock, Duration::from_secs(60))?;
+    let clock = StepClock {
+        cutoff,
+        advance: CancellationToken::new(),
+    };
+    let cancel = CancellationToken::new();
+    let timed = Control::new(&clock, total, cutoff, &cancel);
+    let dropped = CancellationToken::new();
+    let marker = dropped.clone();
+    let operation = store.write_tx_with_context(t, &timed, &record, move |row, tx| {
+        Box::pin(async move {
+            let _dropped = marker.drop_guard();
+            tx.append(row).await?;
+            Ok::<_, Error>(())
+        })
+    });
+    let observe = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting:bool=sqlx::query_scalar("SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))").bind(blocker_pid).fetch_one(admin).await?;
+                if waiting {return Ok::<_,anyhow::Error>(());}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await??;
+        clock.advance.cancel();
+        dropped.cancelled().await;
+        assert!(matches!(
+            budget.try_admit(std::slice::from_ref(&record)),
+            Err(Error::WriteBusy)
+        ));
+        blocker.rollback().await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (result, observed) = tokio::join!(operation, observe);
+    observed?;
+    rolled_back(result, |e| {
+        matches!(
+            e,
+            TransactionError::Audit(Error::Deadline(_))
+                | TransactionError::Operation(Error::Deadline(_))
+        )
+    });
+    budget.try_admit(std::slice::from_ref(&record))?;
     Ok(())
 }

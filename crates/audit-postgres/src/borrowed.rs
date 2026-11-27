@@ -15,6 +15,7 @@ impl PgAudit {
         request: &PreparedAuditV1,
         control: &Control<'_, T>,
     ) -> Result<StagedAppend, Error> {
+        control.check(Stage::Operation)?;
         self.append_batch_in_transaction(
             tx,
             self.try_admit(std::slice::from_ref(request))?,
@@ -35,6 +36,7 @@ impl PgAudit {
         batch: crate::AdmittedBatch<'_>,
         control: &Control<'_, T>,
     ) -> Result<Vec<StagedAppend>, Error> {
+        control.check(Stage::Operation)?;
         self.budget()?.check_domain(&batch)?;
         append_batch(tx, &self.integrity, &batch, control).await
     }

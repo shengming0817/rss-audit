@@ -49,7 +49,7 @@ pub(crate) async fn measure(
             added?;
             tx.rollback().await?;
             eprintln!(
-                "WRITE {profile} {mode} rows=8 bytes={bytes} begin_us={} owner_hold_us={} allocs={} alloc_bytes={} heap_peak={}",
+                "WRITE {profile} {mode} rows=8 bytes={bytes} begin_us={} owner_hold_us={} allocs={} alloc_bytes={} poll_heap_peak={}",
                 checkout.as_micros(),
                 held.elapsed().as_micros(),
                 alloc.count,
@@ -57,15 +57,31 @@ pub(crate) async fn measure(
                 alloc.peak
             );
         }
+        let anchor = prepare(event(t, "measure", "anchor", vec![])?, at)?;
+        let after = committed(pg.append(&anchor, control).await)?
+            .record()
+            .position();
+        let mut through = after;
         for row in &rows {
-            committed(pg.append(row, control).await)?;
+            through = committed(pg.append(row, control).await)?
+                .record()
+                .position();
         }
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let mut coordinates = vec![2];
+        coordinates.extend_from_slice(&t.octets());
+        coordinates.extend_from_slice(&after.to_be_bytes());
+        coordinates.extend_from_slice(&through.to_be_bytes());
+        let path = format!(
+            "/api/v2/audit/entries?limit=8&cursor={}",
+            URL_SAFE_NO_PAD.encode(coordinates)
+        );
         let app = router::<Session, _, _>(pg.clone(), Policy, TestClock);
         for required in [false, true] {
-            let audit = prepare(event(t, "query", "attempt", vec![])?, at)?;
             for round in 0..6 {
+                let audit = prepare(event(t, "query", &format!("attempt-{round}"), vec![])?, at)?;
                 let req = request(
-                    "/api/v2/audit/entries?limit=8",
+                    &path,
                     Some(Session {
                         audit: required.then(|| audit.clone()),
                         ..session(t)
@@ -77,9 +93,10 @@ pub(crate) async fn measure(
                 let elapsed = start.elapsed();
                 let (status, body, _) = inspect(response?).await?;
                 assert_eq!(status, 200);
+                assert!(body["nextCursor"].is_null());
                 assert_eq!(body["entries"].as_array().map(Vec::len), Some(8));
                 eprintln!(
-                    "PAGE {profile} required={required} round={round} canonical={bytes} elapsed_us={} allocs={} alloc_bytes={} heap_peak={}",
+                    "PAGE {profile} required={required} round={round} canonical={bytes} elapsed_us={} allocs={} alloc_bytes={} poll_heap_peak={}",
                     elapsed.as_micros(),
                     alloc.count,
                     alloc.bytes,
